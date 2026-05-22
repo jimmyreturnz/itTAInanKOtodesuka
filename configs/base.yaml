@@ -1,0 +1,56 @@
+# configs/base.yaml
+# Training configuration for GTX 1650 (4GB VRAM)
+
+model:
+  vocab_size: null          # auto-filled from vocabulary at runtime
+  n_mels: 128
+  encoder_d_model: 256
+  d_model: 256
+  nhead: 4
+  num_layers: 4
+  dim_feedforward: 1024
+  dropout: 0.1
+  max_seq_len: 512
+  n_cond_tokens: 5
+  cfg_dropout: 0.1
+
+data:
+  train_index: data/processed/train.jsonl
+  val_index:   data/processed/val.jsonl
+  window_ms:   8192
+  max_seq_len: 512
+  num_workers: 0            # 0 for Windows
+
+training:
+  batch_size: 4
+  grad_accumulation: 8      # effective batch = 4 * 8 = 32
+  max_epochs: 50
+  max_steps: null           # if set, overrides max_epochs
+
+  # Optimizer
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.98]
+  eps: 1.0e-9
+  grad_clip: 1.0
+
+  # Scheduler: warmup then cosine decay
+  warmup_steps: 1000
+  lr_min: 1.0e-5
+
+  # Checkpointing
+  checkpoint_dir: checkpoints/
+  save_every_steps: 500
+  keep_last_n: 3            # keep only last 3 checkpoints
+
+  # Validation
+  val_every_steps: 500
+  val_batches: 50           # how many val batches to evaluate
+
+  # Logging
+  log_every_steps: 10
+  tensorboard_dir: runs/
+
+  # Precision
+  precision: fp32           # GTX 1650: no benefit from fp16

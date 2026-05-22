@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.env/
+
+# PyTorch checkpoints
+checkpoints/
+*.pt
+*.pth
+
+# TensorBoard logs
+runs/
+
+# Processed data
+data/processed/
+*.npy
+
+# Dataset caches
+*.json
+
+# OS files
+.DS_Store
+Thumbs.db
