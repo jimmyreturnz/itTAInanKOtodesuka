@@ -1,164 +1,149 @@
 """
 taiko/model/audio_encoder.py
 
-Convolutional audio encoder: mel spectrogram [128, T] → context vectors [T', D]
+MelSpectrogramScaleEncoder1D — directly adapted from Mug-Diffusion's wave.py.
 
-Architecture:
-    - Stack of Conv2d blocks compressing the 128 mel bins down to 1
-    - Temporal downsampling by 4x (10ms frames → 40ms context steps)
-    - Linear projection to model dimension
-    - Sinusoidal positional encoding added
+Key design (from wave.py):
+  - Treats mel as 1D: [B, 128, T] not [B, 1, 128, T]
+  - Dilated convolutions: (1,2) and (4,8) alternating
+  - Attention at coarser resolutions only
+  - Returns multi-scale features for U-Net skip connections
 
-Why CNN not transformer here:
-    - Local receptive field is ideal for onset detection
-    - Much cheaper than self-attention over long audio sequences
-    - The decoder handles long-range reasoning via cross-attention
+Input:  mel [B, 128, T_audio]
+Output: list of tensors at each resolution level
+        [B, C, T], [B, C, T/2], [B, C, T/4], ...
 """
 
 from __future__ import annotations
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
-# Positional encoding
-# ---------------------------------------------------------------------------
+def Normalize(channels: int, num_groups: int = 8) -> nn.GroupNorm:
+    while channels % num_groups != 0:
+        num_groups //= 2
+    return nn.GroupNorm(num_groups, channels, eps=1e-6, affine=True)
 
-class SinusoidalPositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 8192, dropout: float = 0.1):
+
+class ResBlock1D(nn.Module):
+    """1D ResNet block with dilated convolutions — from Mug-Diffusion wave.py."""
+
+    def __init__(self, channels: int, dilation: int = 1, num_groups: int = 8):
         super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
+        self.norm1 = Normalize(channels, num_groups)
+        self.conv1 = nn.Conv1d(channels, channels, 3,
+                               padding=dilation, dilation=dilation)
+        self.norm2 = Normalize(channels, num_groups)
+        self.conv2 = nn.Conv1d(channels, channels, 3, padding=1)
 
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len).unsqueeze(1).float()
-        div = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.conv2(F.silu(self.norm2(h)))
+        return x + h
+
+
+class AudioEncoderLevel(nn.Module):
+    """One resolution level: 2 ResBlocks with alternating dilations."""
+
+    def __init__(self, channels: int, i_block: int, num_groups: int = 8):
+        super().__init__()
+        # Alternating dilation pattern from Mug-Diffusion
+        dilations = (1, 2) if i_block % 2 == 0 else (4, 8)
+        self.blocks = nn.Sequential(
+            ResBlock1D(channels, dilations[0], num_groups),
+            ResBlock1D(channels, dilations[1], num_groups),
         )
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
-        self.register_buffer("pe", pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, D]
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
+        return self.blocks(x)
 
 
-# ---------------------------------------------------------------------------
-# Conv block
-# ---------------------------------------------------------------------------
-
-class ConvBlock(nn.Module):
-    """Conv2d → GroupNorm → GELU, with optional stride for downsampling."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: tuple[int, int] = (3, 3),
-        stride: tuple[int, int] = (1, 1),
-        padding: tuple[int, int] = (1, 1),
-        groups: int = 8,
-    ):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
-        # GroupNorm: num_groups must divide out_channels
-        num_groups = min(groups, out_channels)
-        while out_channels % num_groups != 0:
-            num_groups //= 2
-        self.norm = nn.GroupNorm(num_groups, out_channels)
-        self.act  = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.norm(self.conv(x)))
-
-
-# ---------------------------------------------------------------------------
-# Audio encoder
-# ---------------------------------------------------------------------------
-
-class AudioEncoder(nn.Module):
+class MelEncoder1D(nn.Module):
     """
-    Encodes mel spectrogram into a sequence of context vectors.
+    Multi-scale mel spectrogram encoder.
+    Adapted from Mug-Diffusion MelspectrogramScaleEncoder1D.
 
-    Input:  [B, 1, 128, T]   (unsqueeze channel dim before passing)
-    Output: [B, T//4, d_model]
+    Returns features at each scale for U-Net cross-attention.
+    Smaller model than Mug-Diffusion to fit 4GB VRAM.
 
-    The 4x temporal downsampling means each output frame covers 40ms,
-    giving ~200 frames for an 8-second window — manageable for cross-attention.
-
-    Architecture:
-        Block 1: [1, 128, T]  → [32, 64, T]    (halve mel bins)
-        Block 2: [32, 64, T]  → [64, 32, T]    (halve mel bins)
-        Block 3: [64, 32, T]  → [128, 16, T]   (halve mel bins)
-        Block 4: [128, 16, T] → [256, 8, T//2] (halve mel bins + temporal 2x)
-        Block 5: [256, 8, T//2] → [512, 1, T//4] (collapse mel + temporal 2x)
-        Reshape: [B, 512, 1, T//4] → [B, T//4, 512]
-        Project: [B, T//4, 512] → [B, T//4, d_model]
+    Input:  [B, 128, T]
+    Output: list of [B, C, T], [B, C, T//2], [B, C, T//4], [B, C, T//8]
     """
 
     def __init__(
         self,
         n_mels: int = 128,
-        d_model: int = 512,
-        dropout: float = 0.1,
+        base_channels: int = 64,
+        channel_mult: list[int] = None,
+        num_groups: int = 8,
+        attention_resolutions: set = None,
     ):
         super().__init__()
-        self.d_model = d_model
+        if channel_mult is None:
+            channel_mult = [1, 1, 2, 2]
+        if attention_resolutions is None:
+            attention_resolutions = {2, 3}  # only at coarser scales
 
-        self.blocks = nn.Sequential(
-            # Freq downsampling only
-            ConvBlock(1,   32,  kernel_size=(3,3), stride=(2,1), padding=(1,1)),   # [32, 64, T]
-            ConvBlock(32,  64,  kernel_size=(3,3), stride=(2,1), padding=(1,1)),   # [64, 32, T]
-            ConvBlock(64,  128, kernel_size=(3,3), stride=(2,1), padding=(1,1)),   # [128, 16, T]
-            # Freq + temporal downsampling
-            ConvBlock(128, 256, kernel_size=(3,3), stride=(2,2), padding=(1,1)),   # [256, 8, T//2]
-            # Collapse freq, temporal downsampling
-            ConvBlock(256, 512, kernel_size=(8,3), stride=(8,2), padding=(0,1)),   # [512, 1, T//4]
-        )
+        self.conv_in = nn.Conv1d(n_mels, base_channels, kernel_size=3, padding=1)
 
-        self.proj    = nn.Linear(512, d_model)
-        self.pos_enc = SinusoidalPositionalEncoding(d_model, dropout=dropout)
+        self.levels    = nn.ModuleList()
+        self.downsamps = nn.ModuleList()
+        self.attns     = nn.ModuleList()
 
-        # Lightweight transformer encoder for global context
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=8,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,   # pre-norm (more stable)
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        in_ch = base_channels
+        for i, mult in enumerate(channel_mult):
+            out_ch = base_channels * mult
+            proj   = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+            level  = nn.ModuleDict({
+                "proj":  proj,
+                "block": AudioEncoderLevel(out_ch, i, num_groups),
+            })
+            self.levels.append(level)
 
-        self._init_weights()
+            if i in attention_resolutions:
+                self.attns.append(nn.MultiheadAttention(
+                    out_ch, num_heads=max(1, out_ch // 32),
+                    batch_first=True, dropout=0.0,
+                ))
+            else:
+                self.attns.append(None)
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+            if i < len(channel_mult) - 1:
+                self.downsamps.append(
+                    nn.Conv1d(out_ch, out_ch, kernel_size=4, stride=2, padding=1)
+                )
+            else:
+                self.downsamps.append(None)
 
-    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+            in_ch = out_ch
+
+        self.out_channels = [base_channels * m for m in channel_mult]
+
+    def forward(self, mel: torch.Tensor) -> list[torch.Tensor]:
         """
         Args:
-            mel: [B, 128, T]  float32, values in [-1, 1]
+            mel: [B, 128, T]
         Returns:
-            context: [B, T//4, d_model]
+            list of feature tensors at each scale
         """
-        x = mel.unsqueeze(1)          # [B, 1, 128, T]
-        x = self.blocks(x)            # [B, 512, 1, T//4]
-        x = x.squeeze(2)              # [B, 512, T//4]
-        x = x.permute(0, 2, 1)        # [B, T//4, 512]
-        x = self.proj(x)              # [B, T//4, d_model]
-        x = self.pos_enc(x)           # [B, T//4, d_model]
-        x = self.transformer(x)       # [B, T//4, d_model]
-        return x
+        h = self.conv_in(mel)
+        hs = []
+
+        for i, level in enumerate(self.levels):
+            h = level["proj"](h)
+            h = level["block"](h)
+
+            # Attention at coarse scales
+            if self.attns[i] is not None:
+                B, C, T = h.shape
+                h_t = h.permute(0, 2, 1)          # [B, T, C]
+                h_t, _ = self.attns[i](h_t, h_t, h_t)
+                h = h_t.permute(0, 2, 1)           # [B, C, T]
+
+            hs.append(h)
+
+            if self.downsamps[i] is not None:
+                h = self.downsamps[i](h)
+
+        return hs
