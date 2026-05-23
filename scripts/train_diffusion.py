@@ -65,7 +65,7 @@ LOG_DIR          = str(WORK_DIR / "runs" / "diffusion")
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE       = 4        # per GPU — with 2x T4 effective = 8
+BATCH_SIZE       = 8        # per GPU — with 2x T4 effective = 8
 LR               = 1e-4
 MAX_EPOCHS       = 100
 VAL_EVERY        = 500
@@ -312,10 +312,13 @@ def train(resume_path=None):
 
     # num_workers=2 works on Kaggle
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=2, drop_last=True,
-        pin_memory=True, persistent_workers=True,
-    )
+    train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=4,          # was 2, T4 has more CPU cores
+    drop_last=True,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,      # add this — prefetches next batch while GPU trains
+)
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=2, pin_memory=True, persistent_workers=True,
