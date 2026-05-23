@@ -111,13 +111,18 @@ class PreprocessedDataset(Dataset):
             try:
                 rec = self.records[idx]
 
-                # Load mel
-                mel_path = self.mels_dir / Path(rec["mel_path"]).name
-                mel = np.load(str(mel_path))["mel"].astype(np.float32)  # [128, T]
+                # Resolve paths — handle Windows backslashes and double-prefix
+                def resolve(base: Path, field: str) -> Path:
+                    # Strip leading mels\ or tensors\ prefix if present
+                    p = Path(field.replace("\\", "/").replace("\", "/"))
+                    name = p.name  # just the filename, no subdirs
+                    return base / name
 
-                # Load beatmap tensor
-                tensor_path = self.tensors_dir / Path(rec["tensor_path"]).name
-                tensor = np.load(str(tensor_path))["tensor"].astype(np.float32)  # [7, T]
+                mel_path    = resolve(self.mels_dir,    rec["mel_path"])
+                tensor_path = resolve(self.tensors_dir, rec["tensor_path"])
+
+                mel    = np.load(str(mel_path))["mel"].astype(np.float32)
+                tensor = np.load(str(tensor_path))["tensor"].astype(np.float32)
 
                 T_tensor = tensor.shape[1]
                 T_mel    = mel.shape[1]
