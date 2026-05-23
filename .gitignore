@@ -27,3 +27,6 @@ Thumbs.db
 
 # Environment variables
 .env
+
+# Downloading More Maps
+scripts/download_maps.py

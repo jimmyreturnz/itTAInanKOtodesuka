@@ -100,7 +100,7 @@ class NoiseScheduler:
         sqrt_alpha  = self._extract(self.sqrt_alphas_cumprod,           t, x_start.shape)
         sqrt_1alpha = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
         x_noisy = sqrt_alpha * x_start + sqrt_1alpha * noise
-        return x_noisy, noise
+        return x_noisy
 
     @torch.no_grad()
     def p_sample(

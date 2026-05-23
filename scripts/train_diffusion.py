@@ -4,11 +4,6 @@ scripts/train_diffusion.py
 Phase 3 — Train the diffusion model.
 Autoencoder is frozen. Trains audio encoder + U-Net.
 
-Fixes applied:
-  1. MEL_FRAMES = PAD_FRAMES * 2  (10ms hop vs 20ms beatmap frames)
-  2. valid_mask passed correctly and used in masked loss inside diffusion.py
-  3. log mask_ratio to confirm padding is being excluded
-
 Usage:
     python scripts/train_diffusion.py
     python scripts/train_diffusion.py --resume checkpoints/diffusion/best.pt
@@ -47,7 +42,7 @@ CACHE_FILE       = "taiko_files_filtered.json"
 CKPT_DIR         = Path("checkpoints/diffusion")
 LOG_DIR          = "runs/diffusion"
 
-BATCH_SIZE       = 4
+BATCH_SIZE       = 4       # smaller than autoencoder due to audio encoder
 LR               = 1e-4
 MAX_EPOCHS       = 100
 VAL_EVERY        = 500
@@ -57,11 +52,11 @@ WARMUP_STEPS     = 1000
 VAL_BATCHES      = 20
 KEEP_LAST_N      = 3
 VAL_RATIO        = 0.05
+PAD_FRAMES       = 18_000  # beatmap tensor frames @ 20ms
+MEL_FRAMES       = PAD_FRAMES  # mel frames @ 20ms hop — same as beatmap
+COMPRESSION      = 16      # autoencoder compression ratio
 
-PAD_FRAMES       = 18_000   # beatmap tensor frames  (18000 × 20ms = 360s = 6 min)
-MEL_FRAMES       = PAD_FRAMES * 2  # FIX: mel at 10ms hop = 2× the frame count
-COMPRESSION      = 16       # autoencoder compression ratio
-
+# Style mapping
 STYLE_MAP = {"standard": 0, "stream": 1, "speed": 2, "tech": 3}
 
 
@@ -70,11 +65,14 @@ STYLE_MAP = {"standard": 0, "stream": 1, "speed": 2, "tech": 3}
 # ---------------------------------------------------------------------------
 
 class DiffusionDataset(Dataset):
+    """
+    Returns paired (mel, beatmap_tensor, difficulty, style) samples.
+    Loads audio and .osu on-the-fly.
+    """
 
     def __init__(self, osu_files: list[Path], pad_frames: int = PAD_FRAMES):
         self.files      = osu_files
         self.pad_frames = pad_frames
-        self.mel_frames = pad_frames * 2   # FIX: 2× because 10ms hop
         self.parser     = OsuTaikoParser()
         self.extractor  = MelExtractor()
 
@@ -92,41 +90,44 @@ class DiffusionDataset(Dataset):
                 # Find audio
                 audio_path = osu_path.parent / bm.audio_filename
                 if not audio_path.exists():
+                    # Try case-insensitive search
                     candidates = list(osu_path.parent.glob("*.mp3")) + \
                                  list(osu_path.parent.glob("*.ogg"))
                     if not candidates:
                         raise FileNotFoundError("no audio")
                     audio_path = candidates[0]
 
-                # Mel spectrogram  [128, T_mel]
-                mel   = self.extractor.extract(audio_path)
-                T_mel = mel.shape[1]
+                # Mel spectrogram
+                mel = self.extractor.extract(audio_path)   # [128, T_audio]
 
-                # FIX: pad/truncate to MEL_FRAMES (= PAD_FRAMES * 2)
-                if T_mel < self.mel_frames:
+                # Pad/truncate mel to MEL_FRAMES
+                # mel hop = 20ms, same as beatmap tensor — so same frame count
+                T_mel = mel.shape[1]
+                if T_mel < MEL_FRAMES:
                     mel = np.concatenate([
                         mel,
-                        np.zeros((128, self.mel_frames - T_mel), dtype=np.float32)
+                        np.zeros((128, MEL_FRAMES - T_mel), dtype=np.float32)
                     ], axis=1)
                 else:
-                    mel = mel[:, :self.mel_frames]
+                    mel = mel[:, :MEL_FRAMES]
 
-                # Beatmap tensor  [7, T]
-                tensor    = beatmap_to_tensor(bm, pad_to=None)
-                T         = tensor.shape[1]
+                # Beatmap tensor
+                tensor = beatmap_to_tensor(bm, pad_to=None)
+                T = tensor.shape[1]
                 valid_len = min(T, self.pad_frames)
-
                 valid_mask = np.zeros(self.pad_frames, dtype=np.float32)
                 valid_mask[:valid_len] = 1.0
 
                 if T < self.pad_frames:
-                    pad    = np.zeros((N_CHANNELS, self.pad_frames - T), dtype=np.float32)
+                    pad = np.zeros((N_CHANNELS, self.pad_frames - T), dtype=np.float32)
                     tensor = np.concatenate([tensor, pad], axis=1)
                 else:
                     tensor = tensor[:, :self.pad_frames]
 
+                # Difficulty and style
                 difficulty = float(bm.star_rating) if bm.star_rating > 0 else float(bm.overall_difficulty)
-                style      = STYLE_MAP[_infer_style(bm)]
+                style_name = _infer_style(bm)
+                style      = STYLE_MAP[style_name]
 
                 return {
                     "mel":        torch.from_numpy(mel),
@@ -148,6 +149,7 @@ class DiffusionDataset(Dataset):
 
 
 def _infer_style(bm) -> str:
+    """Infer map style from statistics."""
     nps = bm.notes_per_second
     if nps > 10:
         return "stream"
@@ -233,11 +235,17 @@ def train(resume_path=None):
         print(f"ERROR: Autoencoder checkpoint not found: {AUTOENCODER_CKPT}")
         return
 
+    # ---- Frame count sanity check --------------------------------------- #
+    from taiko.data.audio import HOP_LENGTH, SAMPLE_RATE
+    ms_per_frame = HOP_LENGTH / SAMPLE_RATE * 1000
+    print(f'Frame resolution: {ms_per_frame:.1f}ms/frame')
+    print(f'Beatmap frames:   PAD_FRAMES={PAD_FRAMES} = {PAD_FRAMES * ms_per_frame / 1000:.0f}s')
+    print(f'Mel frames:       MEL_FRAMES={MEL_FRAMES} = {MEL_FRAMES * ms_per_frame / 1000:.0f}s')
+    assert PAD_FRAMES == MEL_FRAMES, "PAD_FRAMES must equal MEL_FRAMES at same hop rate"
+
     # ---- Data ----------------------------------------------------------- #
     train_files, val_files = load_split(CACHE_FILE)
     print(f"Train: {len(train_files)} | Val: {len(val_files)}")
-    print(f"Beatmap frames : {PAD_FRAMES}  ({PAD_FRAMES * 20 / 1000:.0f}s)")
-    print(f"Mel frames     : {MEL_FRAMES}  ({MEL_FRAMES * 10 / 1000:.0f}s)  [10ms hop]")
 
     train_ds = DiffusionDataset(train_files)
     val_ds   = DiffusionDataset(val_files)
@@ -262,10 +270,11 @@ def train(resume_path=None):
         n_styles=4,
     ).to(device)
 
-    unet_params = sum(p.numel() for p in model.unet_model.parameters()) / 1e6
-    wave_params = sum(p.numel() for p in model.wave_model.parameters()) / 1e6
+    unet_params  = sum(p.numel() for p in model.unet_model.parameters()) / 1e6
+    wave_params  = sum(p.numel() for p in model.wave_model.parameters()) / 1e6
     print(f"U-Net: {unet_params:.1f}M | Audio encoder: {wave_params:.1f}M")
 
+    # Only train U-Net + audio encoder (autoencoder is frozen)
     optimizer = torch.optim.AdamW(
         list(model.unet_model.parameters()) +
         list(model.wave_model.parameters()),
@@ -290,7 +299,7 @@ def train(resume_path=None):
         print(f"Resumed from step {step}")
 
     # ---- Training ------------------------------------------------------- #
-    print(f"\nStarting diffusion training (fixed mel frames + masked loss)")
+    print(f"\nStarting diffusion training")
     print(f"TensorBoard: tensorboard --logdir {LOG_DIR}\n")
 
     model.train()
@@ -321,16 +330,15 @@ def train(resume_path=None):
             step += 1
 
             if step % LOG_EVERY == 0:
-                writer.add_scalar("train/loss",       log_dict["loss"],       step)
-                writer.add_scalar("train/mae",        log_dict["mae"],        step)
-                writer.add_scalar("train/mask_ratio", log_dict["mask_ratio"], step)
-                writer.add_scalar("train/lr",         lr,                     step)
+                writer.add_scalar("train/loss", log_dict["loss"], step)
+                writer.add_scalar("train/mae",  log_dict["mae"],  step)
+                writer.add_scalar("train/lr",   lr,               step)
                 print(
                     f"epoch {epoch+1:3d} | step {step:6d} | "
                     f"loss {log_dict['loss']:.4f} | "
                     f"mae {log_dict['mae']:.4f} | "
-                    f"mask {log_dict['mask_ratio']:.2f} | "
-                    f"t_mean {log_dict['t_mean']:.0f} | "
+                    f"mask {log_dict.get('mask_ratio', 1.0):.2f} | "
+                    f"t {log_dict['t_mean']:.0f} | "
                     f"lr {lr:.2e} | {time.time()-t0:.0f}s"
                 )
 

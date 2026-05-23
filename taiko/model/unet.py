@@ -7,6 +7,8 @@ Conditioned on:
   - timestep embedding
   - difficulty + style (added to timestep embedding)
 
+Architecture follows Mug-Diffusion's UNet1DModel but adapted for 1D taiko latents.
+
 Input:  noisy latent [B, z_channels, T_latent]
 Output: predicted noise [B, z_channels, T_latent]
 """
@@ -29,6 +31,8 @@ def Normalize(channels: int, num_groups: int = 8) -> nn.GroupNorm:
 # ---------------------------------------------------------------------------
 
 class TimestepEmbedding(nn.Module):
+    """Sinusoidal timestep embedding + MLP projection."""
+
     def __init__(self, d_model: int, dim: int):
         super().__init__()
         self.d_model = d_model
@@ -49,17 +53,26 @@ class TimestepEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Conditioning embedding
+# Conditioning embedding (difficulty + style)
 # ---------------------------------------------------------------------------
 
 class CondEmbedding(nn.Module):
+    """Embeds difficulty (float) and style (int) into a vector."""
+
     def __init__(self, n_styles: int, dim: int):
         super().__init__()
-        self.diff_proj = nn.Linear(1, dim // 2)
-        self.style_emb = nn.Embedding(n_styles, dim // 2)
-        self.out_proj  = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim))
+        self.diff_proj  = nn.Linear(1, dim // 2)
+        self.style_emb  = nn.Embedding(n_styles, dim // 2)
+        self.out_proj   = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
 
-    def forward(self, difficulty: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        difficulty: torch.Tensor,   # [B] float, 0-10
+        style: torch.Tensor,        # [B] int
+    ) -> torch.Tensor:
         d = self.diff_proj(difficulty.unsqueeze(-1) / 10.0)
         s = self.style_emb(style)
         return self.out_proj(torch.cat([d, s], dim=-1))
@@ -70,16 +83,18 @@ class CondEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ResBlock(nn.Module):
+    """ResNet block conditioned on timestep + conditioning embedding."""
+
     def __init__(self, in_ch: int, out_ch: int, emb_dim: int,
                  num_groups: int = 8, dropout: float = 0.1):
         super().__init__()
-        self.norm1    = Normalize(in_ch,  num_groups)
-        self.conv1    = nn.Conv1d(in_ch,  out_ch, 3, padding=1)
-        self.emb_proj = nn.Linear(emb_dim, out_ch)
-        self.norm2    = Normalize(out_ch, num_groups)
-        self.dropout  = nn.Dropout(dropout)
-        self.conv2    = nn.Conv1d(out_ch, out_ch, 3, padding=1)
-        self.skip     = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        self.norm1   = Normalize(in_ch,  num_groups)
+        self.conv1   = nn.Conv1d(in_ch,  out_ch, 3, padding=1)
+        self.emb_proj= nn.Linear(emb_dim, out_ch)
+        self.norm2   = Normalize(out_ch, num_groups)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2   = nn.Conv1d(out_ch, out_ch, 3, padding=1)
+        self.skip    = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         h = self.conv1(F.silu(self.norm1(x)))
@@ -89,22 +104,25 @@ class ResBlock(nn.Module):
 
 
 class CrossAttention1D(nn.Module):
+    """Cross-attention to audio features at matching scale."""
+
     def __init__(self, channels: int, context_dim: int,
                  n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
-        self.norm = Normalize(channels)
-        self.attn = nn.MultiheadAttention(
+        self.norm    = Normalize(channels)
+        self.attn    = nn.MultiheadAttention(
             channels, n_heads, dropout=dropout, batch_first=True,
             kdim=context_dim, vdim=context_dim,
         )
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         """
-        x:       [B, C,       T_latent]
-        context: [B, C_audio, T_audio]  — interpolated to T_latent before call
+        x:       [B, C, T_latent]
+        context: [B, C_audio, T_audio]
         """
-        h = self.norm(x).permute(0, 2, 1)       # [B, T, C]
-        ctx = context.permute(0, 2, 1)           # [B, T_audio, C_audio]
+        B, C, T = x.shape
+        h = self.norm(x).permute(0, 2, 1)                    # [B, T, C]
+        ctx = context.permute(0, 2, 1)                        # [B, T_audio, C_audio]
         h, _ = self.attn(h, ctx, ctx)
         return x + h.permute(0, 2, 1)
 
@@ -132,9 +150,9 @@ class TaikoDiffusionUNet(nn.Module):
     """
     1D Diffusion U-Net for taiko latent generation.
 
-    FIX: encoder/decoder level structure is now explicit — one entry per
-    *level* (not per block), so audio_idx advances exactly once per level
-    and always matches the correct audio_channels entry.
+    Sized for GTX 1650 (4GB VRAM):
+      z_channels=16, base_channels=64, channel_mult=[1,2,4]
+      ~15M parameters
     """
 
     def __init__(
@@ -146,96 +164,77 @@ class TaikoDiffusionUNet(nn.Module):
         num_groups:     int        = 8,
         dropout:        float      = 0.1,
         timestep_dim:   int        = 256,
-        n_styles:       int        = 4,
-        audio_channels: list[int]  = None,  # must match MelEncoder1D.out_channels
+        n_styles:       int        = 4,    # standard, stream, speed, tech
+        audio_channels: list[int]  = None, # output channels from audio encoder
         cfg_dropout:    float      = 0.1,
     ):
         super().__init__()
         if channel_mult is None:
-            channel_mult  = [1, 2, 4]
+            channel_mult = [1, 2, 4]
         if audio_channels is None:
-            audio_channels = [64, 64, 128, 128]
+            audio_channels = [64, 64, 128, 128]  # matches MelEncoder1D defaults
 
-        self.num_levels    = len(channel_mult)
-        self.num_res_blocks = num_res_blocks
-        self.cfg_dropout   = cfg_dropout
+        self.cfg_dropout = cfg_dropout
 
+        # Timestep + conditioning embedding
         emb_dim = timestep_dim
         self.time_emb = TimestepEmbedding(d_model=128, dim=emb_dim)
         self.cond_emb = CondEmbedding(n_styles=n_styles, dim=emb_dim)
-        self.conv_in  = nn.Conv1d(z_channels, base_channels, 3, padding=1)
 
-        # ------------------------------------------------------------------
-        # Encoder — one ModuleList of lists per level
-        # enc_res[lvl]  : nn.ModuleList of ResBlocks for that level
-        # enc_attn[lvl] : CrossAttention1D for that level
-        # enc_down[lvl] : Downsample (or None for last level)
-        # ------------------------------------------------------------------
-        self.enc_res  = nn.ModuleList()
-        self.enc_attn = nn.ModuleList()
-        self.enc_down = nn.ModuleList()
-        self.skip_channels = []   # out_ch at each level (for decoder)
+        # Input projection
+        self.conv_in = nn.Conv1d(z_channels, base_channels, 3, padding=1)
+
+        # Encoder path
+        self.enc_blocks  = nn.ModuleList()
+        self.enc_attns   = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        self.skip_channels = []
 
         in_ch = base_channels
-        for lvl, mult in enumerate(channel_mult):
+        for i, mult in enumerate(channel_mult):
             out_ch   = base_channels * mult
-            aud_ch   = audio_channels[min(lvl, len(audio_channels) - 1)]
+            audio_ch = int(audio_channels[min(i, len(audio_channels) - 1)])
 
-            res_list = nn.ModuleList()
-            cur_in   = in_ch
             for _ in range(num_res_blocks):
-                res_list.append(ResBlock(cur_in, out_ch, emb_dim, num_groups, dropout))
-                cur_in = out_ch
-            self.enc_res.append(res_list)
-            self.enc_attn.append(CrossAttention1D(out_ch, aud_ch, n_heads=max(1, out_ch // 64)))
+                self.enc_blocks.append(ResBlock(in_ch, out_ch, emb_dim, num_groups, dropout))
+                self.enc_attns.append(CrossAttention1D(out_ch, audio_ch))
+                self.skip_channels.append(out_ch)
+                in_ch = out_ch
 
-            if lvl < self.num_levels - 1:
-                self.enc_down.append(Downsample(out_ch))
+            if i < len(channel_mult) - 1:
+                self.downsamples.append(Downsample(in_ch))
+                self.downsamples.append(None)  # placeholder for level tracking
             else:
-                self.enc_down.append(None)   # last level: no downsample
+                self.downsamples.append(None)
 
-            self.skip_channels.append(out_ch)
-            in_ch = out_ch
-
-        # ------------------------------------------------------------------
         # Middle
-        # ------------------------------------------------------------------
         self.mid_block1 = ResBlock(in_ch, in_ch, emb_dim, num_groups)
-        self.mid_attn   = CrossAttention1D(in_ch, audio_channels[min(self.num_levels - 1,
-                                                                       len(audio_channels) - 1)],
-                                           n_heads=max(1, in_ch // 64))
+        self.mid_attn   = CrossAttention1D(in_ch, audio_channels[-1])
         self.mid_block2 = ResBlock(in_ch, in_ch, emb_dim, num_groups)
 
-        # ------------------------------------------------------------------
-        # Decoder — mirrors encoder in reverse
-        # dec_res[lvl]  : nn.ModuleList of ResBlocks (first takes skip concat)
-        # dec_attn[lvl] : CrossAttention1D
-        # dec_up[lvl]   : Upsample (or None for last level = finest)
-        # ------------------------------------------------------------------
-        self.dec_res  = nn.ModuleList()
-        self.dec_attn = nn.ModuleList()
-        self.dec_up   = nn.ModuleList()
+        # Decoder path
+        self.dec_blocks  = nn.ModuleList()
+        self.dec_attns   = nn.ModuleList()
+        self.upsamples   = nn.ModuleList()
 
-        for lvl, mult in enumerate(reversed(channel_mult)):
-            enc_lvl  = self.num_levels - 1 - lvl          # corresponding encoder level
+        skip_ch_list = list(reversed(self.skip_channels))
+        skip_idx = 0
+
+        for i, mult in enumerate(reversed(channel_mult)):
             out_ch   = base_channels * mult
-            skip_ch  = self.skip_channels[enc_lvl]
-            aud_ch   = audio_channels[min(enc_lvl, len(audio_channels) - 1)]
+            audio_ch = audio_channels[min(len(channel_mult) - 1 - i, len(audio_channels) - 1)]
 
-            res_list = nn.ModuleList()
-            cur_in   = in_ch + skip_ch                     # first block gets skip concat
-            for i in range(num_res_blocks):
-                res_list.append(ResBlock(cur_in, out_ch, emb_dim, num_groups, dropout))
-                cur_in = out_ch
-            self.dec_res.append(res_list)
-            self.dec_attn.append(CrossAttention1D(out_ch, aud_ch, n_heads=max(1, out_ch // 64)))
+            for j in range(num_res_blocks):
+                skip_ch = skip_ch_list[skip_idx] if skip_idx < len(skip_ch_list) else 0
+                self.dec_blocks.append(ResBlock(in_ch + skip_ch, out_ch, emb_dim, num_groups, dropout))
+                self.dec_attns.append(CrossAttention1D(out_ch, audio_ch))
+                in_ch = out_ch
+                skip_idx += 1
 
-            if lvl < self.num_levels - 1:
-                self.dec_up.append(Upsample(out_ch))
+            if i < len(channel_mult) - 1:
+                self.upsamples.append(Upsample(in_ch))
             else:
-                self.dec_up.append(None)
-
-            in_ch = out_ch
+                self.upsamples.append(None)
 
         # Output
         self.norm_out = Normalize(in_ch, num_groups)
@@ -243,67 +242,75 @@ class TaikoDiffusionUNet(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
 
-    def _interpolate_audio(self, af: torch.Tensor, t_len: int) -> torch.Tensor:
-        if af.shape[2] == t_len:
-            return af
-        return F.interpolate(af, size=t_len, mode="linear", align_corners=False)
-
     def forward(
         self,
-        x:              torch.Tensor,
-        t:              torch.Tensor,
-        audio_features: list[torch.Tensor],
-        difficulty:     torch.Tensor,
-        style:          torch.Tensor,
-        drop_cond:      bool = False,
+        x: torch.Tensor,                    # [B, z_channels, T_latent]
+        t: torch.Tensor,                    # [B] int timesteps
+        audio_features: list[torch.Tensor], # multi-scale from MelEncoder1D
+        difficulty: torch.Tensor,           # [B] float
+        style: torch.Tensor,                # [B] int
+        drop_cond: bool = False,            # for CFG: drop conditioning
     ) -> torch.Tensor:
 
-        # CFG dropout
+        # CFG dropout during training
         if self.training and not drop_cond:
-            mask       = torch.rand(x.shape[0], device=x.device) < self.cfg_dropout
+            mask = torch.rand(x.shape[0], device=x.device) < self.cfg_dropout
             difficulty = torch.where(mask, torch.zeros_like(difficulty), difficulty)
-            style      = torch.where(mask, torch.zeros_like(style), style)
+            style      = torch.where(mask, torch.zeros_like(style),      style)
 
+        # Embeddings
         emb = self.time_emb(t) + self.cond_emb(difficulty, style)
-        h   = self.conv_in(x)
 
-        # ---- Encoder ----
+        h = self.conv_in(x)
+
+        # Encoder
         skips = []
-        for lvl in range(self.num_levels):
-            for blk in self.enc_res[lvl]:
-                h = blk(h, emb)
-            af = self._interpolate_audio(
-                audio_features[min(lvl, len(audio_features) - 1)], h.shape[2]
-            )
-            h = self.enc_attn[lvl](h, af)
-            skips.append(h)
-            if self.enc_down[lvl] is not None:
-                h = self.enc_down[lvl](h)
+        audio_idx = 0
+        down_idx  = 0
+        block_idx = 0
 
-        # ---- Middle ----
+        for i in range(len(self.enc_blocks)):
+            h = self.enc_blocks[i](h, emb)
+            # Interpolate audio features to match latent length
+            af = audio_features[min(audio_idx, len(audio_features) - 1)]
+            af = F.interpolate(af, size=h.shape[2], mode="linear", align_corners=False)
+            h = self.enc_attns[i](h, af)
+            skips.append(h)
+
+            # Downsample at end of each level (every num_res_blocks blocks)
+            if (i + 1) % 2 == 0 and down_idx < len(self.downsamples):
+                if self.downsamples[down_idx] is not None:
+                    h = self.downsamples[down_idx](h)
+                    audio_idx = min(audio_idx + 1, len(audio_features) - 1)
+                down_idx += 1
+
+        # Middle
         h = self.mid_block1(h, emb)
-        af = self._interpolate_audio(audio_features[-1], h.shape[2])
+        af = audio_features[-1]
+        af = F.interpolate(af, size=h.shape[2], mode="linear", align_corners=False)
         h = self.mid_attn(h, af)
         h = self.mid_block2(h, emb)
 
-        # ---- Decoder ----
-        for lvl in range(self.num_levels):
-            enc_lvl = self.num_levels - 1 - lvl
-            skip = skips[enc_lvl]
-            # Align T dim in case of odd-length sequences
-            if h.shape[2] != skip.shape[2]:
-                h = F.pad(h, (0, skip.shape[2] - h.shape[2]))
-            h = torch.cat([h, skip], dim=1)
-            for blk in self.dec_res[lvl]:
-                h = blk(h, emb)
-            af = self._interpolate_audio(
-                audio_features[min(enc_lvl, len(audio_features) - 1)], h.shape[2]
-            )
-            h = self.dec_attn[lvl](h, af)
-            if self.dec_up[lvl] is not None:
-                h = self.dec_up[lvl](h)
+        # Decoder
+        up_idx    = 0
+        audio_idx = len(audio_features) - 1
 
-        return self.conv_out(F.silu(self.norm_out(h)))
+        for i in range(len(self.dec_blocks)):
+            skip = skips.pop()
+            h = torch.cat([h, skip], dim=1)
+            h = self.dec_blocks[i](h, emb)
+            af = audio_features[min(audio_idx, len(audio_features) - 1)]
+            af = F.interpolate(af, size=h.shape[2], mode="linear", align_corners=False)
+            h = self.dec_attns[i](h, af)
+
+            if (i + 1) % 2 == 0 and up_idx < len(self.upsamples):
+                if self.upsamples[up_idx] is not None:
+                    h = self.upsamples[up_idx](h)
+                    audio_idx = max(audio_idx - 1, 0)
+                up_idx += 1
+
+        h = self.conv_out(F.silu(self.norm_out(h)))
+        return h
 
     def count_parameters(self) -> str:
         n = sum(p.numel() for p in self.parameters())
