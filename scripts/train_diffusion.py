@@ -97,8 +97,17 @@ class DiffusionDataset(Dataset):
                         raise FileNotFoundError("no audio")
                     audio_path = candidates[0]
 
-                # Mel spectrogram
-                mel = self.extractor.extract(audio_path)   # [128, T_audio]
+                # Mel spectrogram — try cached .npz first, then extract from audio
+                mel = None
+
+                # Check for cached mel (saved by process_dataset.py)
+                safe_name = osu_path.parent.name[:120].replace("\\", "_").replace("/", "_")
+                mel_cache = Path("data/processed/mels") / f"{safe_name}.npz"
+                if mel_cache.exists():
+                    from taiko.data.audio import load_mel
+                    mel = load_mel(mel_cache)   # [128, T]
+                else:
+                    mel = self.extractor.extract(audio_path)   # [128, T_audio]
 
                 # Pad/truncate mel to MEL_FRAMES
                 # mel hop = 20ms, same as beatmap tensor — so same frame count
@@ -328,6 +337,13 @@ def train(resume_path=None):
             )
             optimizer.step()
             step += 1
+
+            # First batch sanity check
+            if step == 1:
+                print(f"  [sanity] mask_ratio={log_dict.get('mask_ratio',0):.3f}  loss={log_dict['loss']:.4f}")
+                if log_dict.get('mask_ratio', 0) < 0.01:
+                    print("  WARNING: mask is all zeros — mel cache not found or audio missing")
+                    print("  Check that data/processed/mels/ is accessible in Colab")
 
             if step % LOG_EVERY == 0:
                 writer.add_scalar("train/loss", log_dict["loss"], step)
