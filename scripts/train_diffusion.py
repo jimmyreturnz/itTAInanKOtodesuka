@@ -1,22 +1,24 @@
-from pathlib import Path
-
-code = r'''
 """
 scripts/train_diffusion.py
 
-Phase 3 — Train the diffusion model.
-Autoencoder is frozen. Trains audio encoder + U-Net.
+Phase 3 — Diffusion model training, Kaggle T4x2 edition.
 
-fp16 mixed precision via torch.cuda.amp — ~2x speedup, ~half VRAM.
+Features:
+  - fp16 mixed precision (GradScaler)
+  - DataParallel for T4x2
+  - Loads from Kaggle input datasets (read-only)
+  - Saves checkpoints to /kaggle/working
 
-Single GPU:
+Usage on Kaggle:
     python scripts/train_diffusion.py
-    python scripts/train_diffusion.py --resume checkpoints/diffusion/best.pt
+    python scripts/train_diffusion.py --resume /kaggle/working/checkpoints/diffusion/best.pt
 """
 
 from __future__ import annotations
 import argparse
+import json
 import math
+import os
 import random
 import sys
 import time
@@ -24,27 +26,46 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from taiko.data.preprocessed_dataset import PreprocessedDataset, load_index, print_index_stats
 from taiko.model.diffusion import TaikoDiffusion
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Environment detection
 # ---------------------------------------------------------------------------
 
-AUTOENCODER_CKPT = "checkpoints/autoencoder/best.pt"
-INDEX_FILE       = "data/processed/colab_index.jsonl"
-DATA_ROOT        = Path("data/processed")
-CKPT_DIR         = Path("checkpoints/diffusion")
-LOG_DIR          = "runs/diffusion"
+IS_KAGGLE = os.path.exists("/kaggle/working")
 
-BATCH_SIZE       = 4
+if IS_KAGGLE:
+    REPO_DIR   = Path("/kaggle/working/itTAInanKOtodesuka")
+    DATA_DIR   = Path("/kaggle/input/datasets/jimmyreturnz/taiko-dataset")
+    CKPT_INPUT = Path("/kaggle/input/datasets/jimmyreturnz/autoencoder")
+    WORK_DIR   = Path("/kaggle/working")
+else:
+    REPO_DIR   = Path(".")
+    DATA_DIR   = Path("data/processed")
+    CKPT_INPUT = Path("checkpoints/autoencoder")
+    WORK_DIR   = Path(".")
+
+AUTOENCODER_CKPT = CKPT_INPUT / "best.pt"
+INDEX_FILE       = DATA_DIR   / "colab_index.jsonl"
+MELS_DIR         = DATA_DIR   / "mels"
+TENSORS_DIR      = DATA_DIR   / "tensors"
+CKPT_DIR         = WORK_DIR   / "checkpoints" / "diffusion"
+LOG_DIR          = str(WORK_DIR / "runs" / "diffusion")
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameters
+# ---------------------------------------------------------------------------
+
+BATCH_SIZE       = 4        # per GPU — with 2x T4 effective = 8
 LR               = 1e-4
 MAX_EPOCHS       = 100
 VAL_EVERY        = 500
@@ -54,7 +75,131 @@ WARMUP_STEPS     = 1000
 VAL_BATCHES      = 20
 KEEP_LAST_N      = 3
 VAL_RATIO        = 0.05
+PAD_FRAMES       = 18_000   # beatmap + mel frames @ 20ms hop
 USE_FP16         = True
+
+
+# ---------------------------------------------------------------------------
+# Dataset — loads precomputed .npz files only, no .osu needed
+# ---------------------------------------------------------------------------
+
+class PreprocessedDataset(Dataset):
+    """
+    Loads paired (mel.npz, tensor.npz) from precomputed files.
+    No .osu files needed — everything is precomputed.
+    """
+
+    def __init__(
+        self,
+        records: list[dict],
+        mels_dir: Path,
+        tensors_dir: Path,
+        pad_frames: int = PAD_FRAMES,
+        augment: bool = False,
+    ):
+        self.records     = records
+        self.mels_dir    = mels_dir
+        self.tensors_dir = tensors_dir
+        self.pad_frames  = pad_frames
+        self.augment     = augment
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> dict:
+        for _ in range(5):
+            try:
+                rec = self.records[idx]
+
+                # Load mel
+                mel_path = self.mels_dir / Path(rec["mel_path"]).name
+                mel = np.load(str(mel_path))["mel"].astype(np.float32)  # [128, T]
+
+                # Load beatmap tensor
+                tensor_path = self.tensors_dir / Path(rec["tensor_path"]).name
+                tensor = np.load(str(tensor_path))["tensor"].astype(np.float32)  # [7, T]
+
+                T_tensor = tensor.shape[1]
+                T_mel    = mel.shape[1]
+
+                # Valid mask from tensor length
+                valid_len  = min(T_tensor, self.pad_frames)
+                valid_mask = np.zeros(self.pad_frames, dtype=np.float32)
+                valid_mask[:valid_len] = 1.0
+
+                # Pad / truncate tensor
+                if T_tensor < self.pad_frames:
+                    pad = np.zeros((tensor.shape[0], self.pad_frames - T_tensor), dtype=np.float32)
+                    tensor = np.concatenate([tensor, pad], axis=1)
+                else:
+                    tensor = tensor[:, :self.pad_frames]
+
+                # Pad / truncate mel — same frame count as tensor (20ms hop)
+                if T_mel < self.pad_frames:
+                    pad = np.zeros((mel.shape[0], self.pad_frames - T_mel), dtype=np.float32)
+                    mel = np.concatenate([mel, pad], axis=1)
+                else:
+                    mel = mel[:, :self.pad_frames]
+
+                # Augmentation: random time shift
+                if self.augment and random.random() < 0.5:
+                    shift = random.randint(0, max(0, valid_len - 1000))
+                    tensor = np.roll(tensor, -shift, axis=1)
+                    mel    = np.roll(mel,    -shift, axis=1)
+                    tensor[:, -shift:] = 0
+                    mel[:, -shift:]    = 0
+                    valid_mask = np.roll(valid_mask, -shift)
+                    valid_mask[-shift:] = 0
+
+                difficulty = float(rec.get("star_rating", rec.get("difficulty", 5.0)))
+                style      = int(rec.get("style", 0))
+
+                return {
+                    "mel":        torch.from_numpy(mel),
+                    "tensor":     torch.from_numpy(tensor),
+                    "valid_mask": torch.from_numpy(valid_mask),
+                    "difficulty": torch.tensor(difficulty, dtype=torch.float32),
+                    "style":      torch.tensor(style,      dtype=torch.long),
+                }
+
+            except Exception as e:
+                idx = random.randint(0, len(self.records) - 1)
+
+        return {
+            "mel":        torch.zeros(128,          self.pad_frames),
+            "tensor":     torch.zeros(7,            self.pad_frames),
+            "valid_mask": torch.zeros(              self.pad_frames),
+            "difficulty": torch.tensor(5.0,         dtype=torch.float32),
+            "style":      torch.tensor(0,           dtype=torch.long),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Index loader
+# ---------------------------------------------------------------------------
+
+def load_index(index_file: Path, val_ratio: float = VAL_RATIO):
+    records = []
+    with open(index_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+    random.seed(42)
+    random.shuffle(records)
+    n_val = max(1, int(len(records) * val_ratio))
+    return records[n_val:], records[:n_val]
+
+
+def print_stats(records: list[dict], name: str):
+    diffs = [r.get("star_rating", r.get("difficulty", 0)) for r in records]
+    styles = [r.get("style", 0) for r in records]
+    style_names = {0: "standard", 1: "stream", 2: "speed", 3: "tech"}
+    style_counts = {v: styles.count(k) for k, v in style_names.items()}
+    print(f"{name}: {len(records)} maps | "
+          f"SR {min(diffs):.1f}-{max(diffs):.1f} avg {sum(diffs)/len(diffs):.1f} | "
+          f"styles: {style_counts}")
 
 
 # ---------------------------------------------------------------------------
@@ -71,17 +216,17 @@ def get_lr(step, warmup, max_steps, lr, lr_min=1e-6):
 
 
 def unwrap(model):
-    return model.module if isinstance(model, nn.DataParallel) else model
+    return model.module if hasattr(model, "module") else model
 
 
-def save_ckpt(path, model, optimizer, scaler, step, epoch, best_val):
+def save_ckpt(path: Path, model, optimizer, scaler, step, epoch, best_val):
     path.parent.mkdir(parents=True, exist_ok=True)
     m = unwrap(model)
     torch.save({
         "unet":      m.unet_model.state_dict(),
         "wave":      m.wave_model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "scaler":    scaler.state_dict(),
+        "scaler":    scaler.state_dict() if scaler else None,
         "step":      step,
         "epoch":     epoch,
         "best_val":  best_val,
@@ -89,7 +234,7 @@ def save_ckpt(path, model, optimizer, scaler, step, epoch, best_val):
     print(f"  Saved: {path}")
 
 
-def cleanup_old(ckpt_dir, keep):
+def cleanup_old(ckpt_dir: Path, keep: int):
     ckpts = sorted(ckpt_dir.glob("step_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
     for old in ckpts[:-keep]:
         old.unlink()
@@ -121,28 +266,46 @@ def validate(model, loader, device, max_batches, use_fp16):
 # ---------------------------------------------------------------------------
 
 def train(resume_path=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    n_gpus = torch.cuda.device_count()
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_gpus   = torch.cuda.device_count()
     use_fp16 = USE_FP16 and device.type == "cuda"
 
+    print(f"{'='*60}")
     print(f"Device  : {device}")
+    print(f"GPUs    : {n_gpus}")
     print(f"fp16    : {use_fp16}")
+    print(f"Kaggle  : {IS_KAGGLE}")
     for i in range(n_gpus):
         vram = torch.cuda.get_device_properties(i).total_memory / 1024**3
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}  ({vram:.1f} GB)")
+    print(f"{'='*60}")
 
-    if not Path(AUTOENCODER_CKPT).exists():
-        print(f"ERROR: Autoencoder checkpoint not found: {AUTOENCODER_CKPT}")
+    # Verify paths
+    for name, path in [
+        ("Autoencoder", AUTOENCODER_CKPT),
+        ("Index",       INDEX_FILE),
+        ("Mels dir",    MELS_DIR),
+        ("Tensors dir", TENSORS_DIR),
+    ]:
+        status = "✓" if Path(path).exists() else "✗ MISSING"
+        print(f"  {name}: {path} {status}")
+
+    if not AUTOENCODER_CKPT.exists():
+        print("ERROR: Autoencoder checkpoint not found.")
+        return
+    if not INDEX_FILE.exists():
+        print("ERROR: Index file not found.")
         return
 
     # ---- Data ----------------------------------------------------------- #
-    train_records, val_records = load_index(INDEX_FILE, val_ratio=VAL_RATIO)
-    print_index_stats(train_records, "Train")
-    print_index_stats(val_records,   "Val")
+    train_records, val_records = load_index(INDEX_FILE)
+    print_stats(train_records, "Train")
+    print_stats(val_records,   "Val")
 
-    train_ds = PreprocessedDataset(train_records, DATA_ROOT, augment=True)
-    val_ds   = PreprocessedDataset(val_records,   DATA_ROOT, augment=False)
+    train_ds = PreprocessedDataset(train_records, MELS_DIR, TENSORS_DIR, augment=True)
+    val_ds   = PreprocessedDataset(val_records,   MELS_DIR, TENSORS_DIR, augment=False)
 
+    # num_workers=2 works on Kaggle
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=2, drop_last=True,
@@ -155,7 +318,7 @@ def train(resume_path=None):
 
     # ---- Model ---------------------------------------------------------- #
     model = TaikoDiffusion(
-        autoencoder_ckpt    = AUTOENCODER_CKPT,
+        autoencoder_ckpt    = str(AUTOENCODER_CKPT),
         timesteps           = 1000,
         beta_schedule       = "linear",
         z_channels          = 16,
@@ -169,7 +332,7 @@ def train(resume_path=None):
     )
 
     if n_gpus > 1:
-        print(f"Wrapping with DataParallel ({n_gpus} GPUs)")
+        print(f"Using DataParallel with {n_gpus} GPUs")
         model = nn.DataParallel(model)
 
     model = model.to(device)
@@ -178,17 +341,15 @@ def train(resume_path=None):
     unet_p = sum(p.numel() for p in m.unet_model.parameters()) / 1e6
     wave_p = sum(p.numel() for p in m.wave_model.parameters()) / 1e6
     print(f"U-Net: {unet_p:.1f}M | Audio enc: {wave_p:.1f}M")
-    print(f"Effective batch size: {BATCH_SIZE * max(n_gpus, 1)} ({BATCH_SIZE} × {max(n_gpus,1)} GPU)")
+    print(f"Batch: {BATCH_SIZE} per GPU × {n_gpus} GPU = {BATCH_SIZE * n_gpus} effective")
 
     optimizer = torch.optim.AdamW(
         list(m.unet_model.parameters()) +
         list(m.wave_model.parameters()),
         lr=LR, weight_decay=1e-4,
     )
-
-    scaler = GradScaler(enabled=use_fp16)
-
-    writer = SummaryWriter(LOG_DIR)
+    scaler   = GradScaler(enabled=use_fp16)
+    writer   = SummaryWriter(LOG_DIR)
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
     step, start_epoch, best_val = 0, 0, float("inf")
@@ -200,7 +361,7 @@ def train(resume_path=None):
         m.unet_model.load_state_dict(ckpt["unet"])
         m.wave_model.load_state_dict(ckpt["wave"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        if "scaler" in ckpt:
+        if ckpt.get("scaler") and scaler:
             scaler.load_state_dict(ckpt["scaler"])
         step        = ckpt["step"]
         start_epoch = ckpt["epoch"]
@@ -208,7 +369,7 @@ def train(resume_path=None):
         print(f"Resumed from step {step} (val_loss={best_val:.4f})")
 
     # ---- Training ------------------------------------------------------- #
-    print(f"\nDiffusion training started")
+    print(f"\nStarting diffusion training — {MAX_EPOCHS} epochs")
     print(f"TensorBoard: tensorboard --logdir {LOG_DIR}\n")
 
     model.train()
@@ -232,13 +393,11 @@ def train(resume_path=None):
             optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-
             nn.utils.clip_grad_norm_(
                 list(m.unet_model.parameters()) +
                 list(m.wave_model.parameters()),
-                1.0
+                1.0,
             )
-
             scaler.step(optimizer)
             scaler.update()
             step += 1
@@ -249,41 +408,31 @@ def train(resume_path=None):
                 writer.add_scalar("train/mask_ratio", log_dict["mask_ratio"], step)
                 writer.add_scalar("train/lr",         lr,                     step)
                 writer.add_scalar("train/grad_scale", scaler.get_scale(),     step)
-
                 print(
                     f"epoch {epoch+1:3d} | step {step:6d} | "
                     f"loss {log_dict['loss']:.4f} | "
                     f"mae {log_dict['mae']:.4f} | "
                     f"mask {log_dict['mask_ratio']:.2f} | "
-                    f"t_mean {log_dict['t_mean']:.0f} | "
+                    f"t {log_dict['t_mean']:.0f} | "
+                    f"scale {scaler.get_scale():.0f} | "
                     f"lr {lr:.2e} | {time.time()-t0:.0f}s"
                 )
 
             if step % VAL_EVERY == 0:
                 val_loss = validate(model, val_loader, device, VAL_BATCHES, use_fp16)
                 writer.add_scalar("val/loss", val_loss, step)
-
                 print(f"  → val loss: {val_loss:.4f}  (best: {best_val:.4f})")
-
                 if val_loss < best_val:
                     best_val = val_loss
-
-                    save_ckpt(
-                        CKPT_DIR / "best.pt",
-                        model, optimizer, scaler,
-                        step, epoch, best_val
-                    )
+                    save_ckpt(CKPT_DIR / "best.pt", model, optimizer, scaler,
+                              step, epoch, best_val)
 
             if step % SAVE_EVERY == 0:
-                save_ckpt(
-                    CKPT_DIR / f"step_{step:07d}.pt",
-                    model, optimizer, scaler,
-                    step, epoch, best_val
-                )
-
+                save_ckpt(CKPT_DIR / f"step_{step:07d}.pt", model, optimizer, scaler,
+                          step, epoch, best_val)
                 cleanup_old(CKPT_DIR, KEEP_LAST_N)
 
-        print(f"--- End of epoch {epoch+1} ---\\n")
+        print(f"--- End of epoch {epoch+1} ---\n")
 
     writer.close()
     print("Done.")
@@ -294,12 +443,3 @@ if __name__ == "__main__":
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
     train(args.resume)
-'''
-
-output_path = Path("/mnt/user-data/outputs/train_diffusion.py")
-output_path.parent.mkdir(parents=True, exist_ok=True)
-
-with open(output_path, "w", encoding="utf-8") as f:
-    f.write(code)
-
-print(f"Saved to: {output_path}")
