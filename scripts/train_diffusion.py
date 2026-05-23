@@ -54,7 +54,7 @@ else:
     WORK_DIR   = Path(".")
 
 AUTOENCODER_CKPT = CKPT_INPUT / "best.pt"
-INDEX_FILE       = DATA_DIR   / "colab_index.jsonl"
+INDEX_FILE       = DATA_DIR   / "colab_index.jsonl"  # also at DATA_DIR/colab_index.jsonl
 MELS_DIR         = DATA_DIR   / "mels"
 TENSORS_DIR      = DATA_DIR   / "tensors"
 CKPT_DIR         = WORK_DIR   / "checkpoints" / "diffusion"
@@ -65,7 +65,7 @@ LOG_DIR          = str(WORK_DIR / "runs" / "diffusion")
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE       = 8        # per GPU — with 2x T4 effective = 8
+BATCH_SIZE       = 4        # per GPU — with 2x T4 effective = 8
 LR               = 1e-4
 MAX_EPOCHS       = 100
 VAL_EVERY        = 500
@@ -113,10 +113,10 @@ class PreprocessedDataset(Dataset):
 
                 # Resolve paths — handle Windows backslashes and double-prefix
                 def resolve(base: Path, field: str) -> Path:
-                    # Strip leading mels\ or tensors\ prefix if present
-                    p = Path(field.replace("\\", "/").replace("\", "/"))
-                    name = p.name  # just the filename, no subdirs
+                    parts = field.replace("\\\\", "/").replace("\\", "/").split("/")
+                    name  = parts[-1]
                     return base / name
+
 
                 mel_path    = resolve(self.mels_dir,    rec["mel_path"])
                 tensor_path = resolve(self.tensors_dir, rec["tensor_path"])
@@ -312,13 +312,10 @@ def train(resume_path=None):
 
     # num_workers=2 works on Kaggle
     train_loader = DataLoader(
-    train_ds, batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=4,          # was 2, T4 has more CPU cores
-    drop_last=True,
-    pin_memory=True,
-    persistent_workers=True,
-    prefetch_factor=2,      # add this — prefetches next batch while GPU trains
-)
+        train_ds, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=2, drop_last=True,
+        pin_memory=True, persistent_workers=True,
+    )
     val_loader = DataLoader(
         val_ds, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=2, pin_memory=True, persistent_workers=True,
