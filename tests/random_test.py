@@ -1,14 +1,15 @@
-import torch
-from taiko.model.decoder import TaikoDecoder
-from taiko.model.model import build_model
+import json
+from pathlib import Path
 
-model = build_model(vocab_size=4000)
+INDEX_PATH = Path("data/processed/colab_index.jsonl")
+BASE       = Path("data/processed")
 
-mel = torch.randn(2, 128, 800)
-tokens = torch.randint(0, 4000, (2, 128))
-cond = torch.randint(0, 100, (2, 5))
-mask = torch.ones(2, 128, dtype=torch.bool)
+records = [json.loads(l) for l in INDEX_PATH.read_text(encoding="utf-8").splitlines() if l.strip()]
+before  = len(records)
 
-loss = model(mel, tokens, cond, mask)
+valid = [r for r in records
+        if (BASE / r["mel_path"]).exists()
+        and (BASE / r["tensor_path"]).exists()]
 
-print(loss)
+INDEX_PATH.write_text("\n".join(json.dumps(r) for r in valid) + "\n")
+print(f"Removed {before - len(valid)} incomplete records, {len(valid)} remain")
