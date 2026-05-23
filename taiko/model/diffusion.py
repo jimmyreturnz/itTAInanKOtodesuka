@@ -74,7 +74,9 @@ class TaikoDiffusion(nn.Module):
             base_channels=audio_base_channels,
             channel_mult=audio_channel_mult,
         )
-        audio_out_channels = self.wave_model.out_channels
+        # Derive audio_channels directly from the encoder — always correct
+        audio_out_channels = [int(c) for c in self.wave_model.out_channels]
+        print(f"Audio encoder output channels: {audio_out_channels}")
 
         # ---- U-Net ------------------------------------------------------ #
         if unet_channel_mult is None:

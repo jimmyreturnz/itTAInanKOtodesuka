@@ -172,7 +172,9 @@ class TaikoDiffusionUNet(nn.Module):
         if channel_mult is None:
             channel_mult = [1, 2, 4]
         if audio_channels is None:
-            audio_channels = [64, 64, 128, 128]  # matches MelEncoder1D defaults
+            audio_channels = [64, 64, 128, 128]  # matches MelEncoder1D with base_channels=64
+        # Always cast to int to avoid PyTorch type errors
+        audio_channels = [int(c) for c in audio_channels]
 
         self.cfg_dropout = cfg_dropout
 

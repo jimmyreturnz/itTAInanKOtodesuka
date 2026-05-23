@@ -30,3 +30,6 @@ Thumbs.db
 
 # Downloading More Maps
 scripts/download_maps.py
+
+# Diffusion Training Notebook
+taiko_diffusion_colab.ipynb
