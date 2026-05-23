@@ -275,6 +275,9 @@ class TaikoDiffusionUNet(nn.Module):
         for level_idx in range(self.n_levels):
             for _ in range(self.num_res_blocks):
                 skip = skips.pop()
+                # Match spatial size before concat (off-by-one from strided conv)
+                if h.shape[2] != skip.shape[2]:
+                    h = F.interpolate(h, size=skip.shape[2], mode="nearest")
                 h    = torch.cat([h, skip], dim=1)
                 h    = self.dec_blocks[block_idx](h, emb)
                 af   = self._get_audio(audio_features, self.dec_audio_level[block_idx], h.shape[2])
