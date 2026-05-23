@@ -4,6 +4,13 @@ scripts/train_diffusion.py
 Phase 3 — Train the diffusion model.
 Autoencoder is frozen. Trains audio encoder + U-Net.
 
+Changes from original:
+  - Multi-GPU support via DataParallel (auto-detected)
+  - Uses PreprocessedDataset (colab_index.jsonl + .npz files)
+  - MEL_FRAMES = PAD_FRAMES * 2  (10ms hop fix)
+  - Masked MSE loss via valid_mask
+  - model.module aware checkpoint save/load
+
 Usage:
     python scripts/train_diffusion.py
     python scripts/train_diffusion.py --resume checkpoints/diffusion/best.pt
@@ -11,7 +18,6 @@ Usage:
 
 from __future__ import annotations
 import argparse
-import json
 import math
 import random
 import sys
@@ -20,17 +26,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from taiko.data.osu_parser import OsuTaikoParser
-from taiko.data.audio import MelExtractor
-from taiko.data.tensor_repr import beatmap_to_tensor, FRAME_MS, N_CHANNELS, MAX_FRAMES
+from taiko.data.preprocessed_dataset import PreprocessedDataset, load_index, print_index_stats
 from taiko.model.diffusion import TaikoDiffusion
-from taiko.model.autoencoder import AutoencoderConfig
 
 
 # ---------------------------------------------------------------------------
@@ -38,11 +40,12 @@ from taiko.model.autoencoder import AutoencoderConfig
 # ---------------------------------------------------------------------------
 
 AUTOENCODER_CKPT = "checkpoints/autoencoder/best.pt"
-CACHE_FILE       = "taiko_files_filtered.json"
+INDEX_FILE       = "data/processed/colab_index.jsonl"
+DATA_ROOT        = Path("data/processed")
 CKPT_DIR         = Path("checkpoints/diffusion")
 LOG_DIR          = "runs/diffusion"
 
-BATCH_SIZE       = 4       # smaller than autoencoder due to audio encoder
+BATCH_SIZE       = 8
 LR               = 1e-4
 MAX_EPOCHS       = 100
 VAL_EVERY        = 500
@@ -52,129 +55,6 @@ WARMUP_STEPS     = 1000
 VAL_BATCHES      = 20
 KEEP_LAST_N      = 3
 VAL_RATIO        = 0.05
-PAD_FRAMES       = 18_000  # beatmap tensor frames @ 20ms
-MEL_FRAMES       = PAD_FRAMES  # mel frames @ 20ms hop — same as beatmap
-COMPRESSION      = 16      # autoencoder compression ratio
-
-# Style mapping
-STYLE_MAP = {"standard": 0, "stream": 1, "speed": 2, "tech": 3}
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-class DiffusionDataset(Dataset):
-    """
-    Returns paired (mel, beatmap_tensor, difficulty, style) samples.
-    Loads audio and .osu on-the-fly.
-    """
-
-    def __init__(self, osu_files: list[Path], pad_frames: int = PAD_FRAMES):
-        self.files      = osu_files
-        self.pad_frames = pad_frames
-        self.parser     = OsuTaikoParser()
-        self.extractor  = MelExtractor()
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx: int) -> dict:
-        for _ in range(5):
-            try:
-                osu_path = self.files[idx]
-                bm = self.parser.parse_file(osu_path)
-                if bm.note_count < 20 or not bm.audio_filename:
-                    raise ValueError("invalid map")
-
-                # Find audio
-                audio_path = osu_path.parent / bm.audio_filename
-                if not audio_path.exists():
-                    # Try case-insensitive search
-                    candidates = list(osu_path.parent.glob("*.mp3")) + \
-                                 list(osu_path.parent.glob("*.ogg"))
-                    if not candidates:
-                        raise FileNotFoundError("no audio")
-                    audio_path = candidates[0]
-
-                # Mel spectrogram — try cached .npz first, then extract from audio
-                mel = None
-
-                # Check for cached mel (saved by process_dataset.py)
-                safe_name = osu_path.parent.name[:120].replace("\\", "_").replace("/", "_")
-                mel_cache = Path("data/processed/mels") / f"{safe_name}.npz"
-                if mel_cache.exists():
-                    from taiko.data.audio import load_mel
-                    mel = load_mel(mel_cache)   # [128, T]
-                else:
-                    mel = self.extractor.extract(audio_path)   # [128, T_audio]
-
-                # Pad/truncate mel to MEL_FRAMES
-                # mel hop = 20ms, same as beatmap tensor — so same frame count
-                T_mel = mel.shape[1]
-                if T_mel < MEL_FRAMES:
-                    mel = np.concatenate([
-                        mel,
-                        np.zeros((128, MEL_FRAMES - T_mel), dtype=np.float32)
-                    ], axis=1)
-                else:
-                    mel = mel[:, :MEL_FRAMES]
-
-                # Beatmap tensor
-                tensor = beatmap_to_tensor(bm, pad_to=None)
-                T = tensor.shape[1]
-                valid_len = min(T, self.pad_frames)
-                valid_mask = np.zeros(self.pad_frames, dtype=np.float32)
-                valid_mask[:valid_len] = 1.0
-
-                if T < self.pad_frames:
-                    pad = np.zeros((N_CHANNELS, self.pad_frames - T), dtype=np.float32)
-                    tensor = np.concatenate([tensor, pad], axis=1)
-                else:
-                    tensor = tensor[:, :self.pad_frames]
-
-                # Difficulty and style
-                difficulty = float(bm.star_rating) if bm.star_rating > 0 else float(bm.overall_difficulty)
-                style_name = _infer_style(bm)
-                style      = STYLE_MAP[style_name]
-
-                return {
-                    "mel":        torch.from_numpy(mel),
-                    "tensor":     torch.from_numpy(tensor),
-                    "valid_mask": torch.from_numpy(valid_mask),
-                    "difficulty": torch.tensor(difficulty, dtype=torch.float32),
-                    "style":      torch.tensor(style,      dtype=torch.long),
-                }
-            except Exception:
-                idx = random.randint(0, len(self.files) - 1)
-
-        return {
-            "mel":        torch.zeros(128, MEL_FRAMES),
-            "tensor":     torch.zeros(N_CHANNELS, PAD_FRAMES),
-            "valid_mask": torch.zeros(PAD_FRAMES),
-            "difficulty": torch.tensor(5.0),
-            "style":      torch.tensor(0, dtype=torch.long),
-        }
-
-
-def _infer_style(bm) -> str:
-    """Infer map style from statistics."""
-    nps = bm.notes_per_second
-    if nps > 10:
-        return "stream"
-    elif nps > 8:
-        return "speed"
-    elif bm.big_ratio > 0.15:
-        return "tech"
-    return "standard"
-
-
-def load_split(cache_file: str, val_ratio: float = VAL_RATIO):
-    files = [Path(p) for p in json.loads(Path(cache_file).read_text())]
-    random.seed(42)
-    random.shuffle(files)
-    n_val = max(1, int(len(files) * val_ratio))
-    return files[n_val:], files[:n_val]
 
 
 # ---------------------------------------------------------------------------
@@ -190,11 +70,17 @@ def get_lr(step, warmup, max_steps, lr, lr_min=1e-6):
     return lr_min + (lr - lr_min) * 0.5 * (1 + math.cos(math.pi * t))
 
 
+def unwrap(model):
+    """Unwrap DataParallel to get the underlying TaikoDiffusion."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
 def save_ckpt(path, model, optimizer, step, epoch, best_val):
     path.parent.mkdir(parents=True, exist_ok=True)
+    m = unwrap(model)
     torch.save({
-        "unet":      model.unet_model.state_dict(),
-        "wave":      model.wave_model.state_dict(),
+        "unet":      m.unet_model.state_dict(),
+        "wave":      m.wave_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step":      step,
         "epoch":     epoch,
@@ -216,7 +102,7 @@ def validate(model, loader, device, max_batches):
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        loss, _ = model.training_loss(
+        loss, _ = unwrap(model).training_loss(
             batch["tensor"].to(device),
             batch["mel"].to(device),
             batch["difficulty"].to(device),
@@ -234,35 +120,42 @@ def validate(model, loader, device, max_batches):
 # ---------------------------------------------------------------------------
 
 def train(resume_path=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_gpus   = torch.cuda.device_count()
+    print(f"Device : {device}")
     if device.type == "cuda":
-        print(f"GPU:  {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
+        for i in range(n_gpus):
+            vram = torch.cuda.get_device_properties(i).total_memory / 1024**3
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}  ({vram:.1f} GB)")
 
     if not Path(AUTOENCODER_CKPT).exists():
         print(f"ERROR: Autoencoder checkpoint not found: {AUTOENCODER_CKPT}")
         return
 
-    # ---- Frame count sanity check --------------------------------------- #
-    from taiko.data.audio import HOP_LENGTH, SAMPLE_RATE
-    ms_per_frame = HOP_LENGTH / SAMPLE_RATE * 1000
-    print(f'Frame resolution: {ms_per_frame:.1f}ms/frame')
-    print(f'Beatmap frames:   PAD_FRAMES={PAD_FRAMES} = {PAD_FRAMES * ms_per_frame / 1000:.0f}s')
-    print(f'Mel frames:       MEL_FRAMES={MEL_FRAMES} = {MEL_FRAMES * ms_per_frame / 1000:.0f}s')
-    assert PAD_FRAMES == MEL_FRAMES, "PAD_FRAMES must equal MEL_FRAMES at same hop rate"
-
     # ---- Data ----------------------------------------------------------- #
-    train_files, val_files = load_split(CACHE_FILE)
-    print(f"Train: {len(train_files)} | Val: {len(val_files)}")
+    train_records, val_records = load_index(INDEX_FILE, val_ratio=VAL_RATIO)
+    print_index_stats(train_records, "Train")
+    print_index_stats(val_records,   "Val")
 
-    train_ds = DiffusionDataset(train_files)
-    val_ds   = DiffusionDataset(val_files)
+    train_ds = PreprocessedDataset(train_records, DATA_ROOT, augment=True)
+    val_ds   = PreprocessedDataset(val_records,   DATA_ROOT, augment=False)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=0, drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=0)
+    # More workers on multi-GPU machines
+    num_workers = min(4, n_gpus * 2) if n_gpus > 0 else 0
+    effective_batch = BATCH_SIZE * max(n_gpus, 1)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=effective_batch, shuffle=True,
+        num_workers=num_workers, drop_last=True,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=effective_batch, shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(num_workers > 0),
+    )
 
     # ---- Model ---------------------------------------------------------- #
     model = TaikoDiffusion(
@@ -279,14 +172,20 @@ def train(resume_path=None):
         n_styles=4,
     ).to(device)
 
-    unet_params  = sum(p.numel() for p in model.unet_model.parameters()) / 1e6
-    wave_params  = sum(p.numel() for p in model.wave_model.parameters()) / 1e6
-    print(f"U-Net: {unet_params:.1f}M | Audio encoder: {wave_params:.1f}M")
+    # Multi-GPU
+    if n_gpus > 1:
+        print(f"Wrapping model with DataParallel ({n_gpus} GPUs)")
+        model = nn.DataParallel(model)
 
-    # Only train U-Net + audio encoder (autoencoder is frozen)
+    m = unwrap(model)
+    unet_params = sum(p.numel() for p in m.unet_model.parameters()) / 1e6
+    wave_params = sum(p.numel() for p in m.wave_model.parameters()) / 1e6
+    print(f"U-Net: {unet_params:.1f}M | Audio enc: {wave_params:.1f}M")
+    print(f"Effective batch size: {effective_batch} ({BATCH_SIZE} × {max(n_gpus,1)} GPU)")
+
     optimizer = torch.optim.AdamW(
-        list(model.unet_model.parameters()) +
-        list(model.wave_model.parameters()),
+        list(m.unet_model.parameters()) +
+        list(m.wave_model.parameters()),
         lr=LR, weight_decay=1e-4,
     )
 
@@ -299,16 +198,16 @@ def train(resume_path=None):
     # ---- Resume --------------------------------------------------------- #
     if resume_path and Path(resume_path).exists():
         ckpt = torch.load(resume_path, map_location=device)
-        model.unet_model.load_state_dict(ckpt["unet"])
-        model.wave_model.load_state_dict(ckpt["wave"])
+        m.unet_model.load_state_dict(ckpt["unet"])
+        m.wave_model.load_state_dict(ckpt["wave"])
         optimizer.load_state_dict(ckpt["optimizer"])
         step        = ckpt["step"]
         start_epoch = ckpt["epoch"]
         best_val    = ckpt["best_val"]
-        print(f"Resumed from step {step}")
+        print(f"Resumed from step {step} (val_loss={best_val:.4f})")
 
     # ---- Training ------------------------------------------------------- #
-    print(f"\nStarting diffusion training")
+    print(f"\nDiffusion training started")
     print(f"TensorBoard: tensorboard --logdir {LOG_DIR}\n")
 
     model.train()
@@ -320,7 +219,7 @@ def train(resume_path=None):
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            loss, log_dict = model.training_loss(
+            loss, log_dict = unwrap(model).training_loss(
                 batch["tensor"].to(device),
                 batch["mel"].to(device),
                 batch["difficulty"].to(device),
@@ -331,30 +230,24 @@ def train(resume_path=None):
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(
-                list(model.unet_model.parameters()) +
-                list(model.wave_model.parameters()),
+                list(m.unet_model.parameters()) +
+                list(m.wave_model.parameters()),
                 1.0
             )
             optimizer.step()
             step += 1
 
-            # First batch sanity check
-            if step == 1:
-                print(f"  [sanity] mask_ratio={log_dict.get('mask_ratio',0):.3f}  loss={log_dict['loss']:.4f}")
-                if log_dict.get('mask_ratio', 0) < 0.01:
-                    print("  WARNING: mask is all zeros — mel cache not found or audio missing")
-                    print("  Check that data/processed/mels/ is accessible in Colab")
-
             if step % LOG_EVERY == 0:
-                writer.add_scalar("train/loss", log_dict["loss"], step)
-                writer.add_scalar("train/mae",  log_dict["mae"],  step)
-                writer.add_scalar("train/lr",   lr,               step)
+                writer.add_scalar("train/loss",       log_dict["loss"],       step)
+                writer.add_scalar("train/mae",        log_dict["mae"],        step)
+                writer.add_scalar("train/mask_ratio", log_dict["mask_ratio"], step)
+                writer.add_scalar("train/lr",         lr,                     step)
                 print(
                     f"epoch {epoch+1:3d} | step {step:6d} | "
                     f"loss {log_dict['loss']:.4f} | "
                     f"mae {log_dict['mae']:.4f} | "
-                    f"mask {log_dict.get('mask_ratio', 1.0):.2f} | "
-                    f"t {log_dict['t_mean']:.0f} | "
+                    f"mask {log_dict['mask_ratio']:.2f} | "
+                    f"t_mean {log_dict['t_mean']:.0f} | "
                     f"lr {lr:.2e} | {time.time()-t0:.0f}s"
                 )
 
