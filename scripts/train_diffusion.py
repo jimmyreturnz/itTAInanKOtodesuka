@@ -54,7 +54,7 @@ else:
     WORK_DIR   = Path(".")
 
 AUTOENCODER_CKPT = CKPT_INPUT / "best.pt"
-INDEX_FILE       = DATA_DIR   / "colab_index.jsonl"
+INDEX_FILE       = DATA_DIR   / "colab_index.jsonl"  # also at DATA_DIR/colab_index.jsonl
 MELS_DIR         = DATA_DIR   / "mels"
 TENSORS_DIR      = DATA_DIR   / "tensors"
 CKPT_DIR         = WORK_DIR   / "checkpoints" / "diffusion"
@@ -113,10 +113,10 @@ class PreprocessedDataset(Dataset):
 
                 # Resolve paths — handle Windows backslashes and double-prefix
                 def resolve(base: Path, field: str) -> Path:
-                    # Strip leading mels\ or tensors\ prefix if present
-                    p = Path(field.replace("\\", "/").replace("\", "/"))
-                    name = p.name  # just the filename, no subdirs
+                    parts = field.replace("\\\\", "/").replace("\\", "/").split("/")
+                    name  = parts[-1]
                     return base / name
+
 
                 mel_path    = resolve(self.mels_dir,    rec["mel_path"])
                 tensor_path = resolve(self.tensors_dir, rec["tensor_path"])
