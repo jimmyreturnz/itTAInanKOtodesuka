@@ -129,7 +129,8 @@ class TaikoDiffusion(nn.Module):
 
         # Add noise
         noise  = torch.randn_like(z)
-        z_noisy = self.scheduler.add_noise(z, t, noise)
+        sched_device = self.scheduler.sqrt_alphas_cumprod.device
+        z_noisy = self.scheduler.add_noise(z, t.to(sched_device), noise)
 
         # Get audio features
         audio_features = self.wave_model(mel)
