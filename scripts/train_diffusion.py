@@ -1,14 +1,15 @@
+from pathlib import Path
+
+code = r'''
 """
 scripts/train_diffusion.py
 
 Phase 3 — Train the diffusion model.
 Autoencoder is frozen. Trains audio encoder + U-Net.
 
-Single GPU:
-    python scripts/train_diffusion.py
-    python scripts/train_diffusion.py --resume checkpoints/diffusion/best.pt
+fp16 mixed precision via torch.cuda.amp — ~2x speedup, ~half VRAM.
 
-Multi GPU (Kaggle T4x2) — DataParallel, no torchrun needed:
+Single GPU:
     python scripts/train_diffusion.py
     python scripts/train_diffusion.py --resume checkpoints/diffusion/best.pt
 """
@@ -25,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -42,7 +44,7 @@ DATA_ROOT        = Path("data/processed")
 CKPT_DIR         = Path("checkpoints/diffusion")
 LOG_DIR          = "runs/diffusion"
 
-BATCH_SIZE       = 4       # total batch — DataParallel splits across GPUs
+BATCH_SIZE       = 4
 LR               = 1e-4
 MAX_EPOCHS       = 100
 VAL_EVERY        = 500
@@ -52,6 +54,7 @@ WARMUP_STEPS     = 1000
 VAL_BATCHES      = 20
 KEEP_LAST_N      = 3
 VAL_RATIO        = 0.05
+USE_FP16         = True
 
 
 # ---------------------------------------------------------------------------
@@ -71,13 +74,14 @@ def unwrap(model):
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
-def save_ckpt(path, model, optimizer, step, epoch, best_val):
+def save_ckpt(path, model, optimizer, scaler, step, epoch, best_val):
     path.parent.mkdir(parents=True, exist_ok=True)
     m = unwrap(model)
     torch.save({
         "unet":      m.unet_model.state_dict(),
         "wave":      m.wave_model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "scaler":    scaler.state_dict(),
         "step":      step,
         "epoch":     epoch,
         "best_val":  best_val,
@@ -92,19 +96,20 @@ def cleanup_old(ckpt_dir, keep):
 
 
 @torch.no_grad()
-def validate(model, loader, device, max_batches):
+def validate(model, loader, device, max_batches, use_fp16):
     model.eval()
     total, n = 0.0, 0
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        loss, _ = unwrap(model).training_loss(
-            batch["tensor"].to(device),
-            batch["mel"].to(device),
-            batch["difficulty"].to(device),
-            batch["style"].to(device),
-            batch["valid_mask"].to(device),
-        )
+        with autocast(enabled=use_fp16):
+            loss, _ = unwrap(model).training_loss(
+                batch["tensor"].to(device),
+                batch["mel"].to(device),
+                batch["difficulty"].to(device),
+                batch["style"].to(device),
+                batch["valid_mask"].to(device),
+            )
         total += loss.item()
         n += 1
     model.train()
@@ -118,9 +123,10 @@ def validate(model, loader, device, max_batches):
 def train(resume_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_gpus = torch.cuda.device_count()
+    use_fp16 = USE_FP16 and device.type == "cuda"
 
-    print(f"Device : {device}")
-    print(f"GPUs   : {n_gpus}")
+    print(f"Device  : {device}")
+    print(f"fp16    : {use_fp16}")
     for i in range(n_gpus):
         vram = torch.cuda.get_device_properties(i).total_memory / 1024**3
         print(f"  GPU {i}: {torch.cuda.get_device_name(i)}  ({vram:.1f} GB)")
@@ -148,7 +154,6 @@ def train(resume_path=None):
     )
 
     # ---- Model ---------------------------------------------------------- #
-    # IMPORTANT: wrap with DataParallel BEFORE .to(device)
     model = TaikoDiffusion(
         autoencoder_ckpt    = AUTOENCODER_CKPT,
         timesteps           = 1000,
@@ -173,13 +178,15 @@ def train(resume_path=None):
     unet_p = sum(p.numel() for p in m.unet_model.parameters()) / 1e6
     wave_p = sum(p.numel() for p in m.wave_model.parameters()) / 1e6
     print(f"U-Net: {unet_p:.1f}M | Audio enc: {wave_p:.1f}M")
-    print(f"Effective batch size: {BATCH_SIZE} across {n_gpus} GPU(s)")
+    print(f"Effective batch size: {BATCH_SIZE * max(n_gpus, 1)} ({BATCH_SIZE} × {max(n_gpus,1)} GPU)")
 
     optimizer = torch.optim.AdamW(
         list(m.unet_model.parameters()) +
         list(m.wave_model.parameters()),
         lr=LR, weight_decay=1e-4,
     )
+
+    scaler = GradScaler(enabled=use_fp16)
 
     writer = SummaryWriter(LOG_DIR)
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
@@ -193,6 +200,8 @@ def train(resume_path=None):
         m.unet_model.load_state_dict(ckpt["unet"])
         m.wave_model.load_state_dict(ckpt["wave"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
         step        = ckpt["step"]
         start_epoch = ckpt["epoch"]
         best_val    = ckpt["best_val"]
@@ -211,22 +220,27 @@ def train(resume_path=None):
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            loss, log_dict = m.training_loss(
-                batch["tensor"].to(device),
-                batch["mel"].to(device),
-                batch["difficulty"].to(device),
-                batch["style"].to(device),
-                batch["valid_mask"].to(device),
-            )
+            with autocast(enabled=use_fp16):
+                loss, log_dict = m.training_loss(
+                    batch["tensor"].to(device),
+                    batch["mel"].to(device),
+                    batch["difficulty"].to(device),
+                    batch["style"].to(device),
+                    batch["valid_mask"].to(device),
+                )
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
             nn.utils.clip_grad_norm_(
                 list(m.unet_model.parameters()) +
                 list(m.wave_model.parameters()),
                 1.0
             )
-            optimizer.step()
+
+            scaler.step(optimizer)
+            scaler.update()
             step += 1
 
             if step % LOG_EVERY == 0:
@@ -234,6 +248,8 @@ def train(resume_path=None):
                 writer.add_scalar("train/mae",        log_dict["mae"],        step)
                 writer.add_scalar("train/mask_ratio", log_dict["mask_ratio"], step)
                 writer.add_scalar("train/lr",         lr,                     step)
+                writer.add_scalar("train/grad_scale", scaler.get_scale(),     step)
+
                 print(
                     f"epoch {epoch+1:3d} | step {step:6d} | "
                     f"loss {log_dict['loss']:.4f} | "
@@ -244,19 +260,30 @@ def train(resume_path=None):
                 )
 
             if step % VAL_EVERY == 0:
-                val_loss = validate(model, val_loader, device, VAL_BATCHES)
+                val_loss = validate(model, val_loader, device, VAL_BATCHES, use_fp16)
                 writer.add_scalar("val/loss", val_loss, step)
+
                 print(f"  → val loss: {val_loss:.4f}  (best: {best_val:.4f})")
+
                 if val_loss < best_val:
                     best_val = val_loss
-                    save_ckpt(CKPT_DIR / "best.pt", model, optimizer, step, epoch, best_val)
+
+                    save_ckpt(
+                        CKPT_DIR / "best.pt",
+                        model, optimizer, scaler,
+                        step, epoch, best_val
+                    )
 
             if step % SAVE_EVERY == 0:
-                save_ckpt(CKPT_DIR / f"step_{step:07d}.pt", model, optimizer,
-                          step, epoch, best_val)
+                save_ckpt(
+                    CKPT_DIR / f"step_{step:07d}.pt",
+                    model, optimizer, scaler,
+                    step, epoch, best_val
+                )
+
                 cleanup_old(CKPT_DIR, KEEP_LAST_N)
 
-        print(f"--- End of epoch {epoch+1} ---\n")
+        print(f"--- End of epoch {epoch+1} ---\\n")
 
     writer.close()
     print("Done.")
@@ -267,3 +294,12 @@ if __name__ == "__main__":
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
     train(args.resume)
+'''
+
+output_path = Path("/mnt/user-data/outputs/train_diffusion.py")
+output_path.parent.mkdir(parents=True, exist_ok=True)
+
+with open(output_path, "w", encoding="utf-8") as f:
+    f.write(code)
+
+print(f"Saved to: {output_path}")
