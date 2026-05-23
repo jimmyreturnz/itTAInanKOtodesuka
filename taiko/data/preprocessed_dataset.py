@@ -67,7 +67,7 @@ class PreprocessedDataset(Dataset):
             rec = self.records[idx]
             try:
                 # ---- Load mel ------------------------------------------ #
-                mel_path = self.data_root / rec["mel_path"]
+                mel_path = self.data_root / rec["mel_path"].replace("\\", "/")
                 mel_npz  = np.load(mel_path)
                 # Support both key names
                 mel = mel_npz["mel"] if "mel" in mel_npz else mel_npz["arr_0"]
@@ -84,7 +84,7 @@ class PreprocessedDataset(Dataset):
                     mel = mel[:, :self.mel_frames]
 
                 # ---- Load tensor --------------------------------------- #
-                tensor_path = self.data_root / rec["tensor_path"]
+                tensor_path = self.data_root / rec["tensor_path"].replace("\\", "/")
                 tensor_npz  = np.load(tensor_path)
                 tensor = tensor_npz["tensor"] if "tensor" in tensor_npz else tensor_npz["arr_0"]
                 tensor = tensor.astype(np.float32)           # [7, T_raw]
