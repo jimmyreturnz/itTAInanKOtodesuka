@@ -26,6 +26,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+import torch.nn.functional as F
+
 from taiko.data.tensor_repr import N_CHANNELS
 
 # ---------------------------------------------------------------------------
@@ -52,12 +54,20 @@ class PreprocessedDataset(Dataset):
                  pad_frames: int = PAD_FRAMES,
                  mel_frames: int = MEL_FRAMES,
                  augment:    bool = False,
+                 rate_p:     float = 0.2,
+                 rate_range: tuple[float, float] = (0.9, 1.1),
+                 freq_mask_p: float = 0.15,
+                 freq_mask_bands: int = 12,
                  ):
         self.records    = records
         self.data_root  = Path(data_root)
         self.pad_frames = pad_frames
         self.mel_frames = mel_frames
         self.augment    = augment
+        self.rate_p     = rate_p
+        self.rate_range = rate_range
+        self.freq_mask_p = freq_mask_p
+        self.freq_mask_bands = freq_mask_bands
 
     def __len__(self):
         return len(self.records)
@@ -102,11 +112,47 @@ class PreprocessedDataset(Dataset):
                 else:
                     tensor = tensor[:, :self.pad_frames]
 
+                # ---- Augmentation (Mug-style: rate + freq mask) -------- #
+                if self.augment:
+                    if random.random() < self.rate_p:
+                        rate = random.uniform(*self.rate_range)
+                        t_mel = max(64, int(mel.shape[1] / rate))
+                        t_bm  = max(32, int(tensor.shape[1] / rate))
+                        mel_t = torch.from_numpy(mel).unsqueeze(0)
+                        mel = F.interpolate(
+                            mel_t, size=t_mel, mode="linear", align_corners=False
+                        )[0].numpy()
+                        ten_t = torch.from_numpy(tensor).unsqueeze(0)
+                        tensor = F.interpolate(
+                            ten_t, size=t_bm, mode="nearest"
+                        )[0].numpy()
+                        valid_len = min(int(valid_len / rate), self.pad_frames)
+                        valid_mask = np.zeros(self.pad_frames, dtype=np.float32)
+                        valid_mask[:valid_len] = 1.0
+                        if mel.shape[1] < self.mel_frames:
+                            mel = np.concatenate([
+                                mel,
+                                np.zeros((128, self.mel_frames - mel.shape[1]), np.float32),
+                            ], axis=1)
+                        else:
+                            mel = mel[:, :self.mel_frames]
+                        if tensor.shape[1] < self.pad_frames:
+                            tensor = np.concatenate([
+                                tensor,
+                                np.zeros((N_CHANNELS, self.pad_frames - tensor.shape[1]), np.float32),
+                            ], axis=1)
+                        else:
+                            tensor = tensor[:, :self.pad_frames]
+
+                    if random.random() < self.freq_mask_p:
+                        f = random.randint(1, self.freq_mask_bands)
+                        f0 = random.randint(0, 127 - f)
+                        mel[f0:f0 + f, :] = 0.0
+
                 # ---- Conditioning -------------------------------------- #
                 difficulty = float(rec["difficulty"])
                 style      = int(rec["style"])
 
-                # Optional: mild difficulty jitter during training
                 if self.augment:
                     difficulty = difficulty + random.gauss(0, 0.1)
                     difficulty = max(0.0, min(10.0, difficulty))

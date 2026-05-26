@@ -1,14 +1,15 @@
 """
 scripts/preprocess_for_colab.py
 
-Run this LOCALLY before training on Colab.
+Run this LOCALLY before training on Colab/Kaggle.
 Generates beatmap tensors + metadata index from .osu files.
 
-- Star rating fetched from osu! API v1 (legacy) using beatmap_id
+- Ranked status + SR: beatmapset_cache.json first, then osu! API v1 on cache miss
+- Works with --no-api as long as beatmapset_cache.json is populated
 - Style labeled from snap analysis of hit objects vs timing points
-- API results cached locally so reruns don't re-fetch
+- sr_cache.json kept as SR fallback for old beatmap_id entries
 
-Output (upload these to Google Drive):
+Output (upload these to Google Drive/Kaggle):
   data/processed/tensors/          <- beatmap tensor .npz files
   data/processed/colab_index.jsonl <- metadata per map
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -40,97 +42,151 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 # Config
 # ---------------------------------------------------------------------------
 
-CACHE_FILE   = "taiko_files_filtered.json"
-TENSORS_DIR  = Path("data/processed/tensors")
-MELS_DIR     = Path("data/processed/mels")
-INDEX_PATH   = Path("data/processed/colab_index.jsonl")
-SR_CACHE     = Path("data/processed/sr_cache.json")   # beatmap_id -> star_rating
+CACHE_FILE        = "taiko_files_filtered.json"
+TENSORS_DIR       = Path("data/processed/tensors")
+MELS_DIR          = Path("data/processed/mels")
+INDEX_PATH        = Path("data/processed/colab_index.jsonl")
+SR_CACHE          = Path("data/processed/sr_cache.json")          # old: beatmap_id -> sr
+BEATMAPSET_CACHE  = Path("data/processed/beatmapset_cache.json")  # new: set_id -> {ranked, difficulties}
 
-OSU_API_KEY  = os.getenv("OSU_API_KEY")
-OSU_API_V1   = "https://osu.ppy.sh/api/get_beatmaps"
+OSU_API_KEY       = os.getenv("OSU_API_KEY")
+OSU_API_V1        = "https://osu.ppy.sh/api/get_beatmaps"
+API_DELAY         = 0.5   # seconds between API calls (2 req/sec)
 
-# Style labels
-STYLE_NAMES  = {0: "standard", 1: "stream", 2: "speed", 3: "tech"}
-
-# Snap fractions to check (in fractions of a beat)
-# Key = fraction denominator, Value = label category
-SNAP_DENOM = {
-    1:  "whole",
-    2:  "half",
-    4:  "quarter",    # normal / stream
-    3:  "third",      # tech
-    6:  "sixth",      # tech
-    8:  "eighth",     # speed / tech
-    5:  "fifth",      # tech
-    7:  "seventh",    # tech
-    9:  "ninth",      # tech
-    12: "twelfth",    # tech
-    16: "sixteenth",  # tech
+# Approved status mapping
+APPROVED_MAP = {
+    "4": "loved",
+    "3": "qualified",
+    "2": "approved",
+    "1": "ranked",
+    "0": "pending",
+    "-1": "wip",
+    "-2": "graveyard",
 }
 
-# Snap tolerance: how close (in ms) a note must be to a snap grid line
-SNAP_TOLERANCE_MS = 8.0
+STYLE_NAMES  = {0: "standard", 1: "stream", 2: "speed", 3: "tech"}
 
-# Style thresholds
-STREAM_MIN_CONSECUTIVE = 8     # min consecutive 1/4 notes to count as stream run
-SPEED_EFFECTIVE_BPM    = 270   # effective BPM threshold for speed label
-TECH_WEIRD_RATIO       = 0.12  # fraction of notes on weird snaps (3/5/6/7/9/12/16)
+# Snap analysis constants
+SNAP_TOLERANCE_MS      = 8.0
+STREAM_MIN_CONSECUTIVE = 8
+SPEED_EFFECTIVE_BPM    = 270
+TECH_WEIRD_RATIO       = 0.12
+SNAP_DENOM             = {1, 2, 4, 3, 6, 8, 5, 7, 9, 12, 16}
 
 
 # ---------------------------------------------------------------------------
-# Star rating — osu! API v1
+# Cache helpers
 # ---------------------------------------------------------------------------
 
-def load_sr_cache() -> dict[int, float]:
+def load_sr_cache() -> dict[str, float]:
     if SR_CACHE.exists():
-        return {int(k): v for k, v in json.loads(SR_CACHE.read_text()).items()}
+        return {str(k): float(v) for k, v in json.loads(SR_CACHE.read_text()).items()}
     return {}
 
 
-def save_sr_cache(cache: dict[int, float]):
-    SR_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    SR_CACHE.write_text(json.dumps(cache))
+def load_beatmapset_cache() -> dict[str, dict | None]:
+    if BEATMAPSET_CACHE.exists():
+        return json.loads(BEATMAPSET_CACHE.read_text(encoding="utf-8"))
+    return {}
 
 
-def fetch_star_rating(beatmap_id: int,
-                      cache: dict[int, float],
-                      session: requests.Session,
-                      ) -> float:
+def save_beatmapset_cache(cache: dict):
+    BEATMAPSET_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    BEATMAPSET_CACHE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+
+
+def lookup_beatmapset(beatmapset_id: int, cache: dict) -> dict | None:
+    """Read ranked status + per-difficulty SR from beatmapset_cache.json."""
+    if beatmapset_id <= 0:
+        return None
+    entry = cache.get(str(beatmapset_id))
+    if not isinstance(entry, dict):
+        return None
+    return entry
+
+
+def metadata_from_set_data(set_data: dict, beatmap_id: int) -> tuple[float, str, str, bool]:
+    """Extract SR, approved, approved_str, ranked from a cache/API set entry."""
+    approved     = str(set_data.get("approved", "0"))
+    approved_str = set_data.get("approved_str") or APPROVED_MAP.get(approved, "unknown")
+    is_ranked    = bool(set_data.get("ranked", approved in ("1", "2", "3", "4")))
+
+    star_rating = 0.0
+    difficulties = set_data.get("difficulties") or {}
+    bid_key = str(beatmap_id)
+    if bid_key in difficulties:
+        star_rating = float(difficulties[bid_key].get("sr", 0.0))
+    return star_rating, approved, approved_str, is_ranked
+
+
+# ---------------------------------------------------------------------------
+# osu! API v1 — fetch by beatmapset
+# ---------------------------------------------------------------------------
+
+def fetch_beatmapset(beatmapset_id: int,
+                     cache: dict,
+                     session: requests.Session,
+                     ) -> dict | None:
     """
-    Fetch star rating from osu! API v1.
-    Returns 0.0 if not found or API unavailable.
+    Fetch all difficulties in a beatmapset from osu! API v1.
+    Returns dict with ranked status + per-difficulty SR.
+    Caches result in beatmapset_cache.
     """
-    if beatmap_id in cache:
-        return cache[beatmap_id]
-    if not OSU_API_KEY or beatmap_id <= 0:
-        return 0.0
+    key = str(beatmapset_id)
+
+    if key in cache:
+        return cache[key]
+
+    if not OSU_API_KEY or beatmapset_id <= 0:
+        return None
 
     try:
         resp = session.get(OSU_API_V1, params={
             "k": OSU_API_KEY,
-            "b": beatmap_id,
+            "s": beatmapset_id,
             "m": 1,   # taiko
         }, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        if data:
-            sr = float(data[0].get("difficultyrating", 0.0))
-            cache[beatmap_id] = sr
-            return sr
-    except Exception:
-        pass
 
-    cache[beatmap_id] = 0.0
-    return 0.0
+        if not data:
+            cache[key] = None
+            return None
+
+        # Build result from first entry (all diffs share same approved status)
+        approved     = str(data[0].get("approved", "0"))
+        approved_str = APPROVED_MAP.get(approved, "unknown")
+        is_ranked    = approved in ("1", "2", "3", "4")  # ranked/approved/qualified/loved
+
+        difficulties = {}
+        for d in data:
+            bid = str(d.get("beatmap_id", ""))
+            if bid:
+                difficulties[bid] = {
+                    "sr":      float(d.get("difficultyrating", 0.0)),
+                    "version": d.get("version", ""),
+                }
+
+        result = {
+            "approved":     approved,
+            "approved_str": approved_str,
+            "ranked":       is_ranked,
+            "difficulties": difficulties,
+        }
+        cache[key] = result
+        return result
+
+    except Exception as e:
+        print(f"  [API error] beatmapset {beatmapset_id}: {e}")
+        cache[key] = None
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Snap analysis
+# Snap analysis — style labeling
 # ---------------------------------------------------------------------------
 
-def get_active_timing(timing_points: list[TimingPoint],
-                      time_ms: int) -> TimingPoint | None:
-    """Return the last uninherited timing point active at time_ms."""
+def get_active_timing(timing_points, time_ms):
     active = None
     for tp in timing_points:
         if tp.time > time_ms:
@@ -140,33 +196,21 @@ def get_active_timing(timing_points: list[TimingPoint],
     return active
 
 
-def snap_of_note(note_time: int,
-                 timing_points: list[TimingPoint],
-                 ) -> int | None:
-    """
-    Determine the snap denominator of a note.
-    Returns the denominator (4 = 1/4, 3 = 1/3, etc.) or None if unsnapped.
-
-    Method:
-      1. Find active BPM at note time
-      2. Compute beat position = (note_time - tp.time) / ms_per_beat
-      3. Check which snap grid the fractional beat position falls on
-    """
+def snap_of_note(note_time, timing_points):
     tp = get_active_timing(timing_points, note_time)
     if tp is None or tp.beat_length <= 0:
         return None
 
-    ms_per_beat  = tp.beat_length
-    offset_ms    = (note_time - tp.time) % ms_per_beat   # position within beat [0, ms_per_beat)
+    ms_per_beat = tp.beat_length
+    offset_ms   = (note_time - tp.time) % ms_per_beat
 
     best_denom = None
     best_error = SNAP_TOLERANCE_MS
 
-    for denom in sorted(SNAP_DENOM.keys()):
-        grid_ms  = ms_per_beat / denom
-        # Find nearest grid line
-        nearest  = round(offset_ms / grid_ms) * grid_ms
-        error    = abs(offset_ms - nearest)
+    for denom in sorted(SNAP_DENOM):
+        grid_ms = ms_per_beat / denom
+        nearest = round(offset_ms / grid_ms) * grid_ms
+        error   = abs(offset_ms - nearest)
         if error < best_error:
             best_error = error
             best_denom = denom
@@ -174,96 +218,56 @@ def snap_of_note(note_time: int,
     return best_denom
 
 
-def effective_bpm(timing_points: list[TimingPoint],
-                  notes: list,
-                  ) -> float:
-    """
-    Compute the effective BPM — the BPM that covers the most notes,
-    weighted by the density of notes in that timing section.
-    """
+def effective_bpm(timing_points, notes):
     if not timing_points or not notes:
         return 0.0
-
-    # Find the uninherited timing point that covers the most notes
     uninherited = [tp for tp in timing_points if tp.uninherited and tp.bpm]
     if not uninherited:
         return 0.0
-
     note_times = [n.time for n in notes if not n.is_long]
-
-    best_bpm   = 0.0
-    best_count = 0
-
+    best_bpm, best_count = 0.0, 0
     for i, tp in enumerate(uninherited):
         end_time = uninherited[i + 1].time if i + 1 < len(uninherited) else float("inf")
         count    = sum(1 for t in note_times if tp.time <= t < end_time)
         if count > best_count:
             best_count = count
             best_bpm   = tp.bpm
-
     return best_bpm
 
 
-def count_stream_runs(notes: list,
-                      timing_points: list[TimingPoint],
-                      min_run: int = STREAM_MIN_CONSECUTIVE,
-                      ) -> int:
-    """
-    Count the number of stream runs — sequences of consecutive 1/4 notes
-    with at least min_run notes each.
-    """
-    hit_notes  = [n for n in notes if not n.is_long]
+def count_stream_runs(notes, timing_points, min_run=STREAM_MIN_CONSECUTIVE):
+    hit_notes = [n for n in notes if not n.is_long]
     if len(hit_notes) < min_run:
         return 0
-
-    runs       = 0
-    run_len    = 1
-
+    runs, run_len = 0, 1
     for i in range(1, len(hit_notes)):
         prev = hit_notes[i - 1]
         curr = hit_notes[i]
-
-        tp = get_active_timing(timing_points, curr.time)
+        tp   = get_active_timing(timing_points, curr.time)
         if tp is None or tp.beat_length <= 0:
             run_len = 1
             continue
-
         ms_per_quarter = tp.beat_length / 4.0
         gap            = curr.time - prev.time
-        # Allow ±SNAP_TOLERANCE_MS around a 1/4 note gap
         if abs(gap - ms_per_quarter) <= SNAP_TOLERANCE_MS:
             run_len += 1
         else:
             if run_len >= min_run:
                 runs += 1
             run_len = 1
-
     if run_len >= min_run:
         runs += 1
-
     return runs
 
 
 def infer_style(bm: TaikoBeatmap) -> int:
-    """
-    Classify map style from snap analysis.
-
-    Priority order (a map gets the first label that fits):
-      tech   → high use of weird snaps (1/3, 1/5, 1/6, 1/7, 1/8, 1/9, 1/12, 1/16)
-      speed  → effective BPM >= 270  (e.g. 180bpm 1/8 = 360 effective, or 330bpm song)
-      stream → long consecutive 1/4 runs (8+ notes)
-      standard → everything else
-
-    Returns int: 0=standard, 1=stream, 2=speed, 3=tech
-    """
     hit_notes = [n for n in bm.notes if not n.is_long]
     if not hit_notes or not bm.timing_points:
-        return 0  # standard
+        return 0
 
-    # --- Compute snaps for all hit notes ---
-    weird_snaps  = {3, 5, 6, 7, 9, 12, 16}
-    snap_counts  = {d: 0 for d in SNAP_DENOM}
-    weird_count  = 0
+    weird_snaps   = {3, 5, 6, 7, 9, 12, 16}
+    snap_counts   = {d: 0 for d in SNAP_DENOM}
+    weird_count   = 0
     total_snapped = 0
 
     for note in hit_notes:
@@ -277,25 +281,17 @@ def infer_style(bm: TaikoBeatmap) -> int:
     if total_snapped == 0:
         return 0
 
-    weird_ratio = weird_count / total_snapped
-
-    # --- Tech: high use of weird snaps ---
+    weird_ratio  = weird_count / total_snapped
     if weird_ratio >= TECH_WEIRD_RATIO:
         return 3  # tech
 
-    # --- Speed: high effective BPM ---
-    eff_bpm = effective_bpm(bm.timing_points, bm.notes)
-
-    # Also consider 1/8 snap notes — each 1/8 note doubles effective BPM
+    eff_bpm      = effective_bpm(bm.timing_points, bm.notes)
     eighth_ratio = snap_counts.get(8, 0) / total_snapped
     if eighth_ratio > 0.10:
-        # Significant 1/8 usage → effective BPM doubles
-        eff_bpm = eff_bpm * 2
-
+        eff_bpm *= 2
     if eff_bpm >= SPEED_EFFECTIVE_BPM:
         return 2  # speed
 
-    # --- Stream: long consecutive 1/4 runs ---
     stream_runs = count_stream_runs(bm.notes, bm.timing_points)
     if stream_runs >= 3:
         return 1  # stream
@@ -307,8 +303,50 @@ def infer_style(bm: TaikoBeatmap) -> int:
 # Filename helpers
 # ---------------------------------------------------------------------------
 
+def read_beatmapset_id_fast(osu_path: Path) -> int:
+    """Read BeatmapSetID from file header (no full parse)."""
+    try:
+        with open(osu_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("BeatmapSetID:"):
+                    v = line.split(":", 1)[1].strip()
+                    return int(v) if v.isdigit() else 0
+    except OSError:
+        pass
+    return 0
+
+
+def print_cache_coverage(files: list[Path], cache: dict) -> None:
+    """Explain how many sets/diffs can get ranked status from cache."""
+    set_ids: set[int] = set()
+    for fp in files:
+        sid = read_beatmapset_id_fast(fp)
+        if sid > 0:
+            set_ids.add(sid)
+
+    in_cache = [sid for sid in set_ids if str(sid) in cache]
+    ranked_sets = sum(
+        1 for sid in in_cache
+        if isinstance(cache[str(sid)], dict) and cache[str(sid)].get("ranked")
+    )
+    missing = len(set_ids) - len(in_cache)
+
+    print(f"Beatmapsets in filter file : {len(set_ids)} unique")
+    print(f"  in beatmapset_cache      : {len(in_cache)}")
+    print(f"  ranked sets in cache     : {ranked_sets}")
+    print(f"  missing from cache       : {missing}")
+    if missing and not OSU_API_KEY:
+        print("  → Run: python scripts/populate_beatmapset_cache.py")
+        print("    (or preprocess without --no-api to fetch on the fly)")
+    print("Index is one row per .osu difficulty; ranked=True applies to ALL")
+    print("difficulties when their beatmapset is ranked in the cache.")
+
+
 def safe_name(s: str, max_len: int = 120) -> str:
-    return s[:max_len].replace("\\", "_").replace("/", "_")
+    cleaned = re.sub(r'[\[\]\(\)\'"!@#$%^&*+=|\\/<>?:;,~`]', '', s)
+    cleaned = cleaned.replace('.', '')
+    cleaned = re.sub(r'[ _]{2,}', ' ', cleaned).strip()
+    return cleaned[:max_len]
 
 
 # ---------------------------------------------------------------------------
@@ -320,24 +358,34 @@ def main(use_api: bool = True):
         print(f"ERROR: {CACHE_FILE} not found. Run fast_scan.py first.")
         return
 
-    files = [Path(p) for p in json.loads(Path(CACHE_FILE).read_text())]
+    files = [Path(p) for p in json.loads(Path(CACHE_FILE).read_text(encoding="utf-8"))]
     print(f"Loaded {len(files)} filtered maps.")
 
     TENSORS_DIR.mkdir(parents=True, exist_ok=True)
 
-    parser   = OsuTaikoParser()
-    sr_cache = load_sr_cache()
-    session  = requests.Session()
+    parser          = OsuTaikoParser()
+    sr_cache        = load_sr_cache()            # old beatmap_id cache
+    beatmapset_cache = load_beatmapset_cache()   # new beatmapset cache
+    session         = requests.Session()
 
     if use_api and not OSU_API_KEY:
-        print("WARNING: OSU_API_KEY not found in .env — star ratings will be 0.0")
+        print("WARNING: OSU_API_KEY not found in .env — will use beatmapset_cache only (no new API fetches)")
         use_api = False
 
-    records  = []
-    errors   = []
-    skipped  = 0
-    api_calls = 0
-    t_start  = time.time()
+    if beatmapset_cache:
+        print(f"Loaded beatmapset cache: {len(beatmapset_cache)} entries")
+    elif not use_api:
+        print("WARNING: beatmapset_cache.json missing and --no-api set — ranked status will be unknown")
+
+    print_cache_coverage(files, beatmapset_cache)
+
+    records      = []
+    errors       = []
+    skipped      = 0
+    api_calls    = 0
+    cache_hits   = 0
+    cache_misses = 0
+    t_start      = time.time()
 
     for i, osu_path in enumerate(files):
         if i % 200 == 0:
@@ -355,7 +403,7 @@ def main(use_api: bool = True):
             skipped += 1
             continue
 
-        # Tensor path — one per difficulty
+        # Tensor path
         diff_safe   = safe_name(osu_path.stem)
         tensor_path = TENSORS_DIR / f"{folder_safe}__{diff_safe}.npz"
 
@@ -379,24 +427,45 @@ def main(use_api: bool = True):
                 errors.append(f"{osu_path.name}: tensor error: {e}")
                 continue
 
-        # Star rating — from API or fallback to overall_difficulty
-        if use_api and bm.beatmap_id > 0:
-            if bm.beatmap_id not in sr_cache:
+        # ---- Star rating + ranked status --------------------------------- #
+        # 1) beatmapset_cache.json (no API needed)
+        # 2) osu! API on cache miss (if use_api)
+        # 3) sr_cache.json / OD fallback
+        star_rating  = 0.0
+        approved     = "0"
+        approved_str = "unknown"
+        is_ranked    = False
+
+        set_data = lookup_beatmapset(bm.beatmap_set_id, beatmapset_cache)
+
+        if set_data is not None:
+            cache_hits += 1
+        elif bm.beatmap_set_id > 0:
+            cache_misses += 1
+
+        if set_data is None and use_api and bm.beatmap_set_id > 0:
+            set_key = str(bm.beatmap_set_id)
+            if set_key not in beatmapset_cache:
                 api_calls += 1
-                # Save cache every 100 new API calls
                 if api_calls % 100 == 0:
-                    save_sr_cache(sr_cache)
-                # Rate limit: ~1 req/sec to be safe
-                time.sleep(1.0)
-            star_rating = fetch_star_rating(bm.beatmap_id, sr_cache, session)
-        else:
-            star_rating = bm.star_rating if bm.star_rating > 0 else 0.0
+                    save_beatmapset_cache(beatmapset_cache)
+                time.sleep(API_DELAY)
+            set_data = fetch_beatmapset(bm.beatmap_set_id, beatmapset_cache, session)
 
-        # Fallback if API returned 0
+        if set_data:
+            star_rating, approved, approved_str, is_ranked = metadata_from_set_data(
+                set_data, bm.beatmap_id
+            )
+
+        # Fallback to old sr_cache
+        if star_rating == 0.0 and str(bm.beatmap_id) in sr_cache:
+            star_rating = sr_cache[str(bm.beatmap_id)]
+
+        # Final fallback
         if star_rating == 0.0:
-            star_rating = bm.overall_difficulty   # rough proxy
+            star_rating = bm.overall_difficulty
 
-        # Style label
+        # ---- Style label ------------------------------------------------- #
         style = infer_style(bm)
 
         records.append({
@@ -410,12 +479,16 @@ def main(use_api: bool = True):
             "title":       bm.title,
             "version":     bm.version,
             "beatmap_id":  bm.beatmap_id,
+            "beatmapset_id": bm.beatmap_set_id,
+            "approved":    approved,
+            "approved_str": approved_str,
+            "ranked":      is_ranked,
+            "creator":     bm.creator,
         })
 
-    # Final cache save
-    save_sr_cache(sr_cache)
+    # Final saves
+    save_beatmapset_cache(beatmapset_cache)
 
-    # Write index
     with open(INDEX_PATH, "w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -423,15 +496,24 @@ def main(use_api: bool = True):
     # Summary
     total_time = time.time() - t_start
     style_dist = {name: 0 for name in STYLE_NAMES.values()}
+    ranked_count   = sum(1 for r in records if r["ranked"])
+    unranked_count = len(records) - ranked_count
+
     for rec in records:
         style_dist[rec["style_name"]] += 1
 
     print(f"\n{'='*50}")
     print(f"Done in {total_time/60:.1f} minutes")
     print(f"Records  : {len(records)}")
+    print(f"Ranked   : {ranked_count}")
+    print(f"Unranked : {unranked_count}")
     print(f"Errors   : {len(errors)}")
-    print(f"Skipped  : {skipped} (no mel or too few notes)")
-    print(f"API calls: {api_calls}")
+    print(f"Skipped  : {skipped}")
+    print(f"Cache hits  : {cache_hits} (ranked/SR from beatmapset_cache.json)")
+    print(f"Cache misses: {cache_misses} (left ranked=False unless API filled them)")
+    print(f"API calls   : {api_calls}")
+    if cache_misses and not use_api:
+        print("  → Low ranked count? Run populate_beatmapset_cache.py then re-preprocess.")
     print(f"\nStyle distribution:")
     for name, count in style_dist.items():
         pct = count / max(len(records), 1) * 100
@@ -440,19 +522,16 @@ def main(use_api: bool = True):
     tensor_files = list(TENSORS_DIR.glob("*.npz"))
     total_mb = sum(f.stat().st_size for f in tensor_files) / 1024**2
     print(f"\nTensor folder size: {total_mb:.0f} MB ({total_mb/1024:.2f} GB)")
-    print(f"\nFiles to upload to Google Drive:")
-    print(f"  data/processed/tensors/          ({len(records)} .npz files)")
-    print(f"  data/processed/colab_index.jsonl")
 
     if errors:
         err_path = Path("data/processed/tensor_errors.txt")
-        err_path.write_text("\n".join(errors))
-        print(f"\nErrors saved to: {err_path}")
+        err_path.write_text("\n".join(errors), encoding="utf-8")
+        print(f"Errors saved to: {err_path}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-api", action="store_true",
-                    help="Skip osu! API star rating fetch (faster, uses OD as proxy)")
+                    help="Skip osu! API fetch; still read ranked/SR from beatmapset_cache.json")
     args = ap.parse_args()
     main(use_api=not args.no_api)

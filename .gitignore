@@ -21,6 +21,7 @@ data/processed/
 # Dataset caches
 *.json
 
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -33,3 +34,7 @@ scripts/download_maps.py
 
 # Diffusion Training Notebook
 taiko_diffusion_colab.ipynb
+
+# notes
+CLAUDE.md
+Mug-Diffusion.md

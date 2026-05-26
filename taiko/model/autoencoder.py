@@ -257,8 +257,8 @@ class TaikoReconstructLoss(nn.Module):
         3.0,   # kat
         4.0,   # big_don  (rare, upweight)
         4.0,   # big_kat
-        2.0,   # roll
-        2.0,   # denden
+        3.0,   # roll onset
+        3.0,   # denden onset
         0.5,   # beat     (reference channel, low weight)
     ]
 
@@ -290,6 +290,13 @@ class TaikoReconstructLoss(nn.Module):
 
         # Apply channel weights
         loss = loss * self.weights
+
+        # Upweight sustained roll/denden frames (Mug LN holding style)
+        hold_w = torch.ones_like(loss)
+        for ch in (4, 5):
+            active = (target[:, ch] > 0.5).float()
+            hold_w[:, ch] = hold_w[:, ch] + 1.5 * active
+        loss = loss * hold_w
 
         # Apply valid mask (ignore padding)
         mask = valid_mask.unsqueeze(1)   # [B, 1, T]

@@ -1,327 +1,234 @@
 """
 scripts/generate.py
 
-Phase 4 — Inference.
-Generates a taiko .osz file from an audio file using a trained checkpoint.
+Generate a taiko beatmap from an audio file using trained models.
 
 Usage:
-    python scripts/generate.py \
-        --audio "path/to/song.mp3" \
-        --output output/ \
-        --checkpoint checkpoints/best.pt \
-        --difficulty 5.0 \
-        --style standard
+    python scripts/generate.py --audio path/to/song.mp3
+    python scripts/generate.py --audio path/to/song.mp3 --difficulty 5.5 --style stream
+    python scripts/generate.py --audio path/to/song.mp3 --cfg-scale 2.0 --steps 100
+    python scripts/generate.py --audio path/to/song.mp3 --no-refine   # skip grid snap
 """
 
 from __future__ import annotations
 import argparse
-import shutil
 import sys
-import time
 import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import numpy as np
 import torch
 
 from taiko.data.audio import MelExtractor
-from taiko.data.tokenizer import TaikoVocabulary, OsuTaikoSerializer
-from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
-from taiko.data.beat_snap import detect_bpm, snap_note_events, build_timing_points_from_bpm
-from taiko.model.model import TaikoMapper, TaikoModelConfig
+from taiko.data.beat_snap import detect_bpm
+from taiko.data.tensor_repr import tensor_to_beatmap, FRAME_MS
+from taiko.data.timing_refine import apply_timing_refinement
+from taiko.data.tokenizer import OsuTaikoSerializer
+from taiko.model.diffusion import TaikoDiffusion
+from taiko.model.model_config import PROFILES, get_profile
 
 
 # ---------------------------------------------------------------------------
-# Style presets
+# Config
 # ---------------------------------------------------------------------------
 
-STYLE_PRESETS = {
-    "standard": {"nps": 6.0,  "don_ratio": 0.50, "big_ratio": 0.05},
-    "stream":   {"nps": 12.0, "don_ratio": 0.55, "big_ratio": 0.03},
-    "speed":    {"nps": 10.0, "don_ratio": 0.50, "big_ratio": 0.04},
-    "tech":     {"nps": 7.0,  "don_ratio": 0.45, "big_ratio": 0.08},
-}
+AE_CKPT        = "checkpoints/autoencoder/best.pt"
+DIFF_CKPT      = "checkpoints/diffusion/best.pt"
+OUTPUT_DIR     = Path("outputs")
 
-
-def build_conditioning(vocab, difficulty, style, device):
-    preset   = STYLE_PRESETS.get(style, STYLE_PRESETS["standard"])
-    cond_ids = vocab.conditioning_ids(
-        star_rating=difficulty,
-        notes_per_second=preset["nps"],
-        don_ratio=preset["don_ratio"],
-        big_ratio=preset["big_ratio"],
-        overall_difficulty=min(10.0, difficulty),
-    )
-    return torch.tensor(cond_ids, dtype=torch.long, device=device).unsqueeze(0)
-
-
-# ---------------------------------------------------------------------------
-# Segment generation
-# ---------------------------------------------------------------------------
-
-def generate_full_map(model, mel, cond_ids, vocab, device,
-                      window_ms=8192, overlap_ms=1000,
-                      bpm_beat_length=500.0, bpm_offset=0.0,
-                      temperature=0.95, top_p=0.92, cfg_scale=1.5):
-    from taiko.data.audio import SAMPLE_RATE, HOP_LENGTH
-
-    ms_per_frame   = HOP_LENGTH / SAMPLE_RATE * 1000.0
-    total_frames   = mel.shape[1]
-    total_ms       = total_frames * ms_per_frame
-    window_frames  = int(window_ms  / ms_per_frame)
-    step_ms        = window_ms - overlap_ms
-    step_frames    = int(step_ms / ms_per_frame)
-    n_windows      = max(1, int((total_ms - overlap_ms) / step_ms) + 1)
-
-    print(f"Song:    {total_ms/1000:.1f}s | Windows: {n_windows} × {window_ms/1000:.0f}s")
-
-    NOTE_TOKENS = {
-        "HIT_DON", "HIT_KAT", "BIG_DON", "BIG_KAT",
-        "ROLL_START", "ROLL_END", "DENDEN_START", "DENDEN_END"
-    }
-
-    all_notes = []
-    model.eval()
-
-    for i in range(n_windows):
-        start_ms    = i * step_ms
-        end_ms      = start_ms + window_ms
-        start_frame = int(start_ms / ms_per_frame)
-        end_frame   = min(start_frame + window_frames, total_frames)
-
-        mel_window = mel[:, start_frame:end_frame]
-        if mel_window.shape[1] < window_frames:
-            pad = torch.zeros(mel.shape[0], window_frames - mel_window.shape[1])
-            mel_window = torch.cat([mel_window, pad], dim=1)
-
-        mel_window = mel_window.unsqueeze(0).to(device)
-
-        print(f"  [{i+1}/{n_windows}] {start_ms/1000:.1f}s-{end_ms/1000:.1f}s ...", end=" ", flush=True)
-        t0 = time.time()
-
-        tokens = model.generate(
-            mel_window, cond_ids,
-            max_new_tokens=512,
-            temperature=temperature,
-            top_p=top_p,
-            cfg_scale=cfg_scale,
-        )
-        print(f"{len(tokens)} tokens ({time.time()-t0:.1f}s)")
-
-        # Decode beat-relative tokens to (abs_time_ms, token_str)
-        from taiko.data.tokenizer import steps_to_ms, ms_to_steps
-        # abs_steps starts at window start so times decode to absolute song positions
-        abs_steps = ms_to_steps(start_ms, bpm_beat_length, bpm_offset)
-        keep_from = start_ms + (overlap_ms / 2 if i > 0 else 0)
-        keep_to   = end_ms   - (overlap_ms / 2 if i < n_windows - 1 else 0)
-
-        j = 0
-        while j < len(tokens):
-            tid = tokens[j]
-            if tid in (vocab.SOS_ID, vocab.PAD_ID):
-                j += 1; continue
-            if tid == vocab.EOS_ID:
-                break
-            if tid == vocab.SILENCE_ID:
-                j += 1; continue
-            if vocab.is_beat_token(tid):
-                abs_steps += vocab.beat_token_to_steps(tid)
-                abs_time_ms = steps_to_ms(abs_steps, bpm_beat_length, bpm_offset)
-                if j + 1 < len(tokens):
-                    note_tok = vocab.decode(tokens[j + 1])
-                    if keep_from <= abs_time_ms < keep_to and note_tok in NOTE_TOKENS:
-                        all_notes.append((int(abs_time_ms), note_tok))
-                j += 2; continue
-            j += 1
-
-    # Sort + deduplicate within 10ms
-    all_notes.sort(key=lambda x: x[0])
-    deduped, last_t = [], -999
-    for t, tok in all_notes:
-        if t - last_t >= 10:
-            deduped.append((t, tok)); last_t = t
-
-    print(f"Raw notes: {len(deduped)}")
-    return deduped
-
-
-# ---------------------------------------------------------------------------
-# Notes → TaikoBeatmap
-# ---------------------------------------------------------------------------
-
-def notes_to_beatmap(note_events, audio_path, bpm, offset_ms,
-                     difficulty, style, title, artist):
-    bm = TaikoBeatmap()
-    bm.title          = title
-    bm.artist         = artist
-    bm.creator        = "TaikoAI"
-    bm.version        = f"AI {style.capitalize()} {difficulty:.1f}*"
-    bm.audio_filename = audio_path.name
-    bm.overall_difficulty = min(10.0, difficulty)
-    bm.hp_drain           = min(10.0, difficulty * 0.8)
-    bm.slider_multiplier  = 1.4
-    bm.slider_tick_rate   = 1.0
-
-    beat_length = 60_000.0 / bpm
-    bm.timing_points = [TimingPoint(
-        time=int(offset_ms),
-        beat_length=beat_length,
-        meter=4,
-        uninherited=True,
-    )]
-
-    note_map = {
-        "HIT_DON": "don", "HIT_KAT": "kat",
-        "BIG_DON": "big_don", "BIG_KAT": "big_kat",
-        "ROLL_START": "roll", "DENDEN_START": "denden",
-    }
-
-    notes = []
-    for abs_time, tok in note_events:
-        if tok in note_map:
-            note_type = note_map[tok]
-            end_time  = abs_time + int(beat_length * 2) if note_type in ("roll", "denden") else 0
-            notes.append(TaikoNote(time=abs_time, note_type=note_type, end_time=end_time))
-        elif tok == "ROLL_END":
-            for n in reversed(notes):
-                if n.note_type == "roll":
-                    n.end_time = max(abs_time, n.time + int(beat_length))
-                    break
-        elif tok == "DENDEN_END":
-            for n in reversed(notes):
-                if n.note_type == "denden":
-                    n.end_time = max(abs_time, n.time + int(beat_length * 2))
-                    break
-
-    bm.notes = notes
-    bm.compute_stats()
-    return bm
-
-
-# ---------------------------------------------------------------------------
-# Write .osz
-# ---------------------------------------------------------------------------
-
-def write_osz(bm: TaikoBeatmap, audio_path: Path, output_path: Path):
-    """Package .osu + audio into a .osz file."""
-    from taiko.data.tokenizer import OsuTaikoSerializer
-    osu_text = OsuTaikoSerializer().serialize(bm, audio_path.name)
-
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(
-            f"{bm.title} [{bm.version}].osu",
-            osu_text.encode("utf-8")
-        )
-        z.write(audio_path, audio_path.name)
-
-    print(f"Saved .osz: {output_path}")
-    print(f"  → Double-click to import into osu!")
+STYLE_MAP      = {"standard": 0, "stream": 1, "speed": 2, "tech": 3}
+COMPRESSION    = 16   # autoencoder compression ratio
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--audio",       required=True)
-    parser.add_argument("--output",      default="output/")
-    parser.add_argument("--checkpoint",  default="checkpoints/best.pt")
-    parser.add_argument("--difficulty",  type=float, default=5.0)
-    parser.add_argument("--style",       default="standard",
-                        choices=["standard", "stream", "speed", "tech"])
-    parser.add_argument("--temperature", type=float, default=0.95)
-    parser.add_argument("--top-p",       type=float, default=0.92)
-    parser.add_argument("--cfg-scale",   type=float, default=1.5)
-    parser.add_argument("--title",       default="")
-    parser.add_argument("--artist",      default="")
-    parser.add_argument("--snap-tolerance", type=float, default=20.0,
-                        help="Max ms distance to snap note to beat grid")
-    args = parser.parse_args()
-
+def generate(
+    audio_path:  str,
+    ae_ckpt:     str = AE_CKPT,
+    diff_ckpt:   str = DIFF_CKPT,
+    difficulty:  float = 5.0,
+    style:       str = "standard",
+    cfg_scale:   float = 1.5,
+    ddim_steps:  int = 50,
+    output_dir:  Path = OUTPUT_DIR,
+    refine_timing: bool = True,
+    profile:       str = "p1",
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ---- Load checkpoint ----------------------------------------------- #
-    print(f"Loading: {args.checkpoint}")
-    ckpt   = torch.load(args.checkpoint, map_location=device)
-    vocab  = TaikoVocabulary()
-    cfg    = ckpt["config"]
-    m_cfg  = cfg["model"]
-
-    model_config = TaikoModelConfig(
-        vocab_size=len(vocab),
-        n_mels=m_cfg["n_mels"],
-        encoder_d_model=m_cfg["encoder_d_model"],
-        d_model=m_cfg["d_model"],
-        nhead=m_cfg["nhead"],
-        num_layers=m_cfg["num_layers"],
-        dim_feedforward=m_cfg["dim_feedforward"],
-        dropout=0.0,
-        max_seq_len=m_cfg["max_seq_len"],
-        n_cond_tokens=m_cfg["n_cond_tokens"],
-    )
-    model = TaikoMapper(model_config).to(device)
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
-    print(f"Model ready (step {ckpt['step']}, val_loss {ckpt['best_val_loss']:.4f})")
-
-    # ---- Extract mel ---------------------------------------------------- #
-    audio_path = Path(args.audio)
-    print(f"Extracting mel...")
-    mel = torch.from_numpy(MelExtractor().extract(audio_path))
-
-    # ---- Detect BPM ----------------------------------------------------- #
-    print(f"Detecting BPM...")
-    bpm, beat_times = detect_bpm(audio_path)
-    offset_ms = float(beat_times[0]) * 1000.0 if len(beat_times) > 0 else 0.0
-    print(f"BPM: {bpm:.1f} | First beat: {offset_ms:.0f}ms")
-
-    # ---- Conditioning --------------------------------------------------- #
-    cond_ids = build_conditioning(vocab, args.difficulty, args.style, device)
-    print(f"Difficulty: {args.difficulty}★  Style: {args.style}")
-
-    # ---- Generate ------------------------------------------------------- #
-    bpm_beat_length = 60_000.0 / bpm
-    note_events = generate_full_map(
-        model, mel, cond_ids, vocab, device,
-        bpm_beat_length=bpm_beat_length,
-        bpm_offset=offset_ms,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        cfg_scale=args.cfg_scale,
-    )
-
-    if not note_events:
-        print("WARNING: No notes generated.")
+    audio_path = Path(audio_path)
+    if not audio_path.exists():
+        print(f"ERROR: Audio file not found: {audio_path}")
         return
 
-    # ---- Snap to BPM grid ----------------------------------------------- #
-    print(f"Snapping to BPM grid (tolerance={args.snap_tolerance}ms)...")
-    note_events = snap_note_events(
-        note_events,
-        bpm=bpm,
-        offset_ms=offset_ms,
-        tolerance_ms=args.snap_tolerance,
-        discard_unsnapped=False,
+    if not Path(ae_ckpt).exists():
+        print(f"ERROR: Autoencoder checkpoint not found: {ae_ckpt}")
+        return
+
+    if not Path(diff_ckpt).exists():
+        print(f"ERROR: Diffusion checkpoint not found: {diff_ckpt}")
+        return
+
+    style_int = STYLE_MAP.get(style, 0)
+
+    # ---- Load model -------------------------------------------------------- #
+    ckpt = torch.load(diff_ckpt, map_location="cpu")
+    profile_name = ckpt.get("profile", profile)
+    prof = get_profile(profile_name)
+    print(f"Loading model (profile={profile_name})...")
+
+    model = TaikoDiffusion(
+        autoencoder_ckpt    = ae_ckpt,
+        timesteps           = 1000,
+        beta_schedule       = "linear",
+        z_channels          = 16,
+        n_mels              = 128,
+        audio_base_channels = prof.audio_base_channels,
+        audio_channel_mult  = list(prof.audio_channel_mult),
+        unet_base_channels  = prof.unet_base_channels,
+        unet_channel_mult   = list(prof.unet_channel_mult),
+        unet_num_res_blocks = prof.unet_num_res_blocks,
+        n_styles            = 4,
+        cfg_dropout         = prof.cfg_dropout,
+        use_checkpoint      = False,
+        use_s4              = prof.use_s4,
+    ).to(device)
+
+    model.unet_model.load_state_dict(ckpt["unet"], strict=False)
+    model.wave_model.load_state_dict(ckpt["wave"], strict=False)
+    model.eval()
+    print(f"Loaded diffusion checkpoint: step={ckpt['step']}, val_loss={ckpt['best_val']:.4f}")
+
+    # ---- Extract mel ------------------------------------------------------- #
+    print(f"Extracting mel from {audio_path.name}...")
+    extractor = MelExtractor()
+    mel = extractor.extract(str(audio_path))        # [128, T_mel]
+    mel_tensor = torch.from_numpy(mel).unsqueeze(0).to(device)  # [1, 128, T_mel]
+    print(f"Mel shape: {tuple(mel_tensor.shape)}")
+
+    # ---- Audio BPM hint (used after decode for timing refinement) ---------- #
+    print("Detecting BPM (audio hint)...")
+    bpm, beat_times = detect_bpm(audio_path)
+    audio_offset_ms = float(beat_times[0] * 1000) if len(beat_times) > 0 else 0.0
+    print(f"Audio BPM: {bpm:.1f}, first beat offset: {audio_offset_ms:.0f} ms")
+
+    # ---- Compute latent length --------------------------------------------- #
+    # mel frames == beatmap frames at 20 ms hop (do not divide by 2)
+    mel_frames      = mel_tensor.shape[2]
+    beatmap_frames  = mel_frames          # convert mel frames to beatmap frames
+    latent_length   = beatmap_frames // COMPRESSION
+    duration_sec    = beatmap_frames * FRAME_MS / 1000
+    print(f"Song duration  : {duration_sec:.1f}s")
+    print(f"Beatmap frames : {beatmap_frames}")
+    print(f"Latent length  : {latent_length}")
+
+    # ---- Generate ---------------------------------------------------------- #
+    print(f"\nGenerating beatmap...")
+    print(f"  Difficulty : {difficulty}")
+    print(f"  Style      : {style} ({style_int})")
+    print(f"  CFG scale  : {cfg_scale}")
+    print(f"  DDIM steps : {ddim_steps}")
+
+    with torch.no_grad():
+        z = model.generate(
+            mel           = mel_tensor,
+            difficulty    = difficulty,
+            style         = style_int,
+            latent_length = latent_length,
+            ddim_steps    = ddim_steps,
+            cfg_scale     = cfg_scale,
+            device        = device,
+        )
+        beatmap_tensor = model.decode(z)[0].cpu().numpy()   # [7, T]
+
+    print(f"Generated tensor shape: {beatmap_tensor.shape}")
+    print(f"Channel sums: {beatmap_tensor.sum(axis=1).round(2).tolist()}")
+
+    # ---- Convert to beatmap ------------------------------------------------ #
+    print("\nConverting to beatmap...")
+    bm = tensor_to_beatmap(
+        beatmap_tensor,
+        bpm                = bpm,
+        offset_ms          = audio_offset_ms,
+        title              = audio_path.stem,
+        artist             = "",
+        version            = f"AI {style.capitalize()} {difficulty:.1f}*",
+        audio_filename     = audio_path.name,
+        overall_difficulty = min(10.0, difficulty),
     )
-    print(f"After snap: {len(note_events)} notes")
 
-    # ---- Build beatmap -------------------------------------------------- #
-    title  = args.title  or audio_path.stem
-    artist = args.artist or "Unknown Artist"
-    bm = notes_to_beatmap(note_events, audio_path, bpm, offset_ms,
-                          args.difficulty, args.style, title, artist)
-    print(f"Stats: {bm.note_count} notes | {bm.notes_per_second:.1f} nps | don {bm.don_ratio:.0%}")
+    if refine_timing and bm.note_count > 0:
+        print("\nRefining timing (Mug-style fit + grid snap)...")
+        apply_timing_refinement(
+            bm,
+            audio_path=audio_path,
+            audio_bpm=bpm,
+            audio_offset_ms=audio_offset_ms,
+            verbose=True,
+        )
 
-    # ---- Write .osz ----------------------------------------------------- #
-    output_dir = Path(args.output)
+    print(f"Notes     : {bm.note_count}")
+    print(f"NPS       : {bm.notes_per_second:.1f}")
+    print(f"Don ratio : {bm.don_ratio:.0%}")
+    print(f"Duration  : {bm.duration_ms/1000:.1f}s")
+
+    if bm.note_count == 0:
+        print("\nWARNING: Generated map has 0 notes.")
+        print("The model may need more training, or try a lower CFG scale.")
+
+    # ---- Export as .osz ---------------------------------------------------- #
     output_dir.mkdir(parents=True, exist_ok=True)
-    safe = "".join(c for c in title if c.isalnum() or c in " -_")[:40].strip()
-    osz_path = output_dir / f"{safe} [AI {args.style} {args.difficulty:.1f}].osz"
-    write_osz(bm, audio_path, osz_path)
+    safe_title = "".join(c for c in audio_path.stem if c.isalnum() or c in " -_")[:40]
+    osu_name   = f"{safe_title} [AI {style.capitalize()} {difficulty:.1f}].osu"
+    osz_path   = output_dir / f"{safe_title} [AI {style.capitalize()} {difficulty:.1f}].osz"
 
+    osu_text = OsuTaikoSerializer().serialize(bm, audio_path.name)
+
+    with zipfile.ZipFile(osz_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(osu_name, osu_text.encode("utf-8"))
+        z.write(str(audio_path), audio_path.name)
+
+    print(f"\nSaved: {osz_path}")
+    print("Double-click the .osz to import into osu!")
+    return osz_path
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="Generate a taiko beatmap from audio")
+    ap.add_argument("--audio",      required=True,        help="Path to audio file (.mp3/.ogg/.wav)")
+    ap.add_argument("--ae-ckpt",    default=AE_CKPT,      help="Autoencoder checkpoint path")
+    ap.add_argument("--diff-ckpt",  default=DIFF_CKPT,    help="Diffusion checkpoint path")
+    ap.add_argument("--difficulty", type=float, default=5.0, help="Target star rating (default: 5.0)")
+    ap.add_argument("--style",      default="standard",
+                    choices=["standard", "stream", "speed", "tech"],
+                    help="Map style (default: standard)")
+    ap.add_argument("--cfg-scale",  type=float, default=1.5, help="CFG scale (default: 1.5)")
+    ap.add_argument("--steps",      type=int,   default=50,  help="DDIM steps (default: 50)")
+    ap.add_argument("--output-dir", default="outputs",    help="Output directory (default: outputs/)")
+    ap.add_argument("--no-refine", action="store_true",
+                    help="Skip post-gen BPM fit + grid snap (Mug gridify)")
+    ap.add_argument("--profile", default="p1", choices=list(PROFILES.keys()),
+                    help="Model profile if checkpoint has no profile field")
+    args = ap.parse_args()
+
+    generate(
+        audio_path      = args.audio,
+        ae_ckpt         = args.ae_ckpt,
+        diff_ckpt       = args.diff_ckpt,
+        difficulty      = args.difficulty,
+        style           = args.style,
+        cfg_scale       = args.cfg_scale,
+        ddim_steps      = args.steps,
+        output_dir      = Path(args.output_dir),
+        refine_timing   = not args.no_refine,
+        profile         = args.profile,
+    )

@@ -1,167 +1,218 @@
 """
-test_autoencoder.py
+scripts/test_reconstruction.py
 
-Sanity check for the beatmap autoencoder.
-No training needed — just checks shapes, forward pass, and VRAM.
+Tests autoencoder reconstruction quality on real maps.
+Shows note-level recall/precision and visual channel comparison.
 
 Run from project root:
-    python test_autoencoder.py
+    python scripts/test_reconstruction.py
+    python scripts/test_reconstruction.py --n-maps 20 --ckpt checkpoints/autoencoder/best.pt
 """
 
+from __future__ import annotations
+import argparse
+import json
+import random
 import sys
-import torch
-import numpy as np
 from pathlib import Path
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import numpy as np
+import torch
+
+from taiko.data.osu_parser import OsuTaikoParser
+from taiko.data.tensor_repr import (
+    beatmap_to_tensor, tensor_to_beatmap,
+    round_trip_accuracy, N_CHANNELS, FRAME_MS
+)
+from taiko.model.autoencoder import BeatmapAutoencoder, AutoencoderConfig
 
 
-def separator(title):
-    print(f"\n{'='*60}\n  {title}\n{'='*60}")
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+AE_CKPT    = "checkpoints/autoencoder/best.pt"
+CACHE_FILE = "taiko_files_filtered.json"
 
 
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    if device.type == "cuda":
-        print(f"GPU:  {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    from taiko.model.autoencoder import BeatmapAutoencoder, AutoencoderConfig
-    from taiko.data.tensor_repr import N_CHANNELS
-
-    B          = 4       # batch size
-    PAD_FRAMES = 18_000  # ~6 min song @ 20ms
-
-    # ------------------------------------------------------------------ #
-    separator("Model structure")
-    # ------------------------------------------------------------------ #
-
+def load_model(ckpt_path: str, device: torch.device) -> BeatmapAutoencoder:
     config = AutoencoderConfig(
-        x_channels=7,
-        middle_channels=32,
-        z_channels=16,
-        channel_mult=[1, 1, 2, 2, 4],
-        num_res_blocks=2,
-        num_groups=8,
-        kl_weight=1e-6,
+        x_channels      = 7,
+        middle_channels  = 32,
+        z_channels       = 16,
+        channel_mult     = [1, 1, 2, 2, 4],
+        num_res_blocks   = 2,
+        num_groups       = 8,
+        kl_weight        = 1e-6,
     )
     model = BeatmapAutoencoder(config).to(device)
-    params = model.count_parameters()
+    ckpt  = torch.load(ckpt_path, map_location=device)
+    state = ckpt.get("model", ckpt)
+    model.load_state_dict(state)
+    model.eval()
+    print(f"Loaded: {ckpt_path}  (step={ckpt.get('step', '?')}, val_loss={ckpt.get('best_val', '?')})")
+    return model
 
-    print(f"Encoder:          {params['encoder']}")
-    print(f"Decoder:          {params['decoder']}")
-    print(f"Total:            {params['total']}")
-    print(f"Compression:      {model.compression_ratio}x")
-    print(f"Latent frames:    {PAD_FRAMES} → {PAD_FRAMES // model.compression_ratio}")
-    print(f"Latent shape:     [B, {config.z_channels}, {PAD_FRAMES // model.compression_ratio}]")
 
-    # ------------------------------------------------------------------ #
-    separator("Forward pass — shapes")
-    # ------------------------------------------------------------------ #
+def visualize_channels(original: np.ndarray,
+                        reconstructed: np.ndarray,
+                        title: str,
+                        n_frames: int = 200):
+    """Print a simple ASCII visualization of the first n_frames."""
+    ch_names = ["don", "kat", "big_don", "big_kat", "roll", "denden", "beat"]
+    print(f"\n  {title} — first {n_frames} frames (threshold 0.5)")
+    print(f"  {'Channel':<10} {'Original':^{n_frames}} {'Recon':^{n_frames}}")
+    print(f"  {'-'*10} {'-'*n_frames} {'-'*n_frames}")
 
-    x    = torch.randn(B, N_CHANNELS, PAD_FRAMES).to(device)
-    mask = torch.ones(B, PAD_FRAMES).to(device)
+    for i, name in enumerate(ch_names):
+        orig  = original[i, :n_frames]
+        recon = reconstructed[i, :n_frames]
 
-    recon, posterior = model(x, sample_posterior=True)
+        orig_str  = "".join("█" if v > 0.5 else "·" for v in orig)
+        recon_str = "".join("█" if v > 0.5 else "·" for v in recon)
 
-    print(f"Input:      {tuple(x.shape)}")
-    print(f"Recon:      {tuple(recon.shape)}  (should match input)")
-    print(f"Latent mean:{tuple(posterior.mean.shape)}")
-    print(f"Latent std: {tuple(posterior.std.shape)}")
+        match = sum(1 for a, b in zip(orig > 0.5, recon > 0.5) if a == b)
+        acc   = match / n_frames * 100
 
-    assert recon.shape == x.shape, "Reconstruction shape mismatch!"
-    print("Shape check ✓")
+        print(f"  {name:<10} {orig_str} {recon_str}  {acc:.0f}%")
 
-    # ------------------------------------------------------------------ #
-    separator("Loss computation")
-    # ------------------------------------------------------------------ #
 
-    loss, log_dict = model.training_loss(x, mask)
-    print(f"Total loss:  {log_dict['total_loss']:.4f}")
-    print(f"Recon loss:  {log_dict['recon_loss']:.4f}")
-    print(f"KL loss:     {log_dict['kl_loss']:.6f}")
-    print(f"Per-channel losses:")
-    for k, v in log_dict.items():
-        if k.startswith("loss_"):
-            print(f"  {k}: {v:.4f}")
-    assert loss.item() > 0
-    print("Loss ✓")
+def test_map(model: BeatmapAutoencoder,
+             osu_path: Path,
+             parser: OsuTaikoParser,
+             device: torch.device,
+             visualize: bool = True) -> dict | None:
+    try:
+        bm = parser.parse_file(osu_path)
+        if bm.note_count < 20:
+            return None
 
-    # ------------------------------------------------------------------ #
-    separator("Backward pass")
-    # ------------------------------------------------------------------ #
+        tensor = beatmap_to_tensor(bm)   # [7, T_raw]
+        T      = tensor.shape[1]
 
-    loss.backward()
-    grads_ok = all(
-        p.grad is not None
-        for p in model.parameters()
-        if p.requires_grad
-    )
-    print(f"All gradients computed: {grads_ok}")
-    assert grads_ok
-    print("Backward ✓")
-
-    # ------------------------------------------------------------------ #
-    separator("VRAM usage")
-    # ------------------------------------------------------------------ #
-
-    if device.type == "cuda":
-        alloc   = torch.cuda.memory_allocated(device)  / 1024**3
-        reserved= torch.cuda.memory_reserved(device)   / 1024**3
-        print(f"Allocated: {alloc:.2f} GB")
-        print(f"Reserved:  {reserved:.2f} GB")
-
-        if alloc < 3.0:
-            print("VRAM usage OK for GTX 1650 ✓")
+        # Pad to multiple of compression ratio
+        ratio = model.compression_ratio
+        T_pad = ((T + ratio - 1) // ratio) * ratio
+        if T_pad > T:
+            pad    = np.zeros((N_CHANNELS, T_pad - T), dtype=np.float32)
+            tensor_padded = np.concatenate([tensor, pad], axis=1)
         else:
-            print("WARNING: High VRAM — may OOM during training with this batch size")
-            print("Try reducing BATCH_SIZE in train_autoencoder.py")
+            tensor_padded = tensor
 
-    # ------------------------------------------------------------------ #
-    separator("Real beatmap round-trip (untrained)")
-    # ------------------------------------------------------------------ #
+        x = torch.from_numpy(tensor_padded).unsqueeze(0).to(device)  # [1, 7, T_pad]
 
-    import json
-    from taiko.data.osu_parser import OsuTaikoParser
-    from taiko.data.tensor_repr import beatmap_to_tensor, tensor_to_beatmap, FRAME_MS
+        with torch.no_grad():
+            recon = model.reconstruct(x)   # [1, 7, T_pad]
 
-    cache = Path("taiko_files_cache.json")
-    if not cache.exists():
-        print("Cache not found — skipping real map test")
+        recon_np = recon[0].cpu().numpy()[:, :T]   # [7, T_raw]
+
+        # Note-level accuracy
+        acc = round_trip_accuracy(bm)
+
+        # Channel-level accuracy (frame by frame, threshold 0.5)
+        ch_names  = ["don", "kat", "big_don", "big_kat", "roll", "denden", "beat"]
+        ch_accs   = {}
+        for i, name in enumerate(ch_names):
+            orig_bin  = (tensor[i]    > 0.5).astype(float)
+            recon_bin = (recon_np[i]  > 0.5).astype(float)
+            ch_accs[name] = float((orig_bin == recon_bin).mean())
+
+        result = {
+            "title":        bm.title,
+            "version":      bm.version,
+            "note_count":   bm.note_count,
+            "duration_s":   bm.duration_ms / 1000,
+            "recall":       acc["recall"],
+            "precision":    acc["precision"],
+            "false_pos":    acc["false_positives"],
+            "ch_accs":      ch_accs,
+        }
+
+        if visualize:
+            print(f"\n{'─'*80}")
+            print(f"  {bm.title} [{bm.version}]")
+            print(f"  Notes: {bm.note_count} | Duration: {bm.duration_ms/1000:.1f}s")
+            print(f"  Recall:    {acc['recall']:.1%}")
+            print(f"  Precision: {acc['precision']:.1%}")
+            print(f"  False positives: {acc['false_positives']}")
+            print(f"  Channel frame accuracy:")
+            for name, a in ch_accs.items():
+                bar = "█" * int(a * 20) + "·" * (20 - int(a * 20))
+                print(f"    {name:<10} [{bar}] {a:.1%}")
+            visualize_channels(tensor, recon_np, bm.title[:30])
+
+        return result
+
+    except Exception as e:
+        print(f"  ERROR: {osu_path.name}: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(n_maps: int = 10, ckpt: str = AE_CKPT, visualize: bool = True):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    model  = load_model(ckpt, device)
+    parser = OsuTaikoParser()
+
+    if not Path(CACHE_FILE).exists():
+        print(f"ERROR: {CACHE_FILE} not found")
         return
 
-    files  = [Path(p) for p in json.loads(cache.read_text())]
-    parser = OsuTaikoParser()
-    bm     = parser.parse_file(files[0])  # just test the first map in cache
+    files = [Path(p) for p in json.loads(Path(CACHE_FILE).read_text(encoding="utf-8"))]
+    random.seed(42)
+    sample = random.sample(files, min(n_maps, len(files)))
 
-    tensor = beatmap_to_tensor(bm)               # [7, T_raw]
-    T      = tensor.shape[1]
+    print(f"\nTesting {len(sample)} maps...\n")
 
-    # Pad to multiple of compression_ratio
-    ratio  = model.compression_ratio
-    T_pad  = math.ceil(T / ratio) * ratio
-    pad    = np.zeros((N_CHANNELS, T_pad - T), dtype=np.float32)
-    tensor_padded = np.concatenate([tensor, pad], axis=1)
+    results = []
+    for path in sample:
+        r = test_map(model, path, parser, device, visualize=visualize)
+        if r:
+            results.append(r)
 
-    x_single = torch.from_numpy(tensor_padded).unsqueeze(0).to(device)  # [1, 7, T_pad]
+    if not results:
+        print("No valid results.")
+        return
 
-    model.eval()
-    with torch.no_grad():
-        recon_single = model.reconstruct(x_single)  # [1, 7, T_pad], sigmoid applied
+    # Summary
+    print(f"\n{'='*80}")
+    print(f"  SUMMARY — {len(results)} maps")
+    print(f"{'='*80}")
+    print(f"  Mean recall    : {np.mean([r['recall']    for r in results]):.1%}")
+    print(f"  Mean precision : {np.mean([r['precision'] for r in results]):.1%}")
+    print(f"  Mean false pos : {np.mean([r['false_pos'] for r in results]):.1f}")
+    print(f"\n  Channel frame accuracy (mean):")
+    ch_names = ["don", "kat", "big_don", "big_kat", "roll", "denden", "beat"]
+    for name in ch_names:
+        mean_acc = np.mean([r["ch_accs"][name] for r in results])
+        bar = "█" * int(mean_acc * 20) + "·" * (20 - int(mean_acc * 20))
+        print(f"    {name:<10} [{bar}] {mean_acc:.1%}")
 
-    recon_np = recon_single[0].cpu().numpy()[:, :T]  # strip padding
-
-    print(f"Map: {bm.title} [{bm.version}]")
-    print(f"Original notes: {bm.note_count}")
-    print(f"Input  channel sums: {tensor.sum(axis=1).round(1).tolist()}")
-    print(f"Output channel sums: {recon_np.sum(axis=1).round(1).tolist()}")
-    print(f"(Untrained model — values will be near 0.5, not meaningful yet)")
-    print("\nRun train_autoencoder.py to train, then retest reconstruction quality.")
-
-    separator("ALL CHECKS PASSED — Autoencoder ready for training")
+    # Flag if quality is too low
+    mean_recall = np.mean([r["recall"] for r in results])
+    if mean_recall < 0.7:
+        print(f"\n  ⚠ WARNING: Mean recall {mean_recall:.1%} is low.")
+        print(f"    The autoencoder may not be trained well enough.")
+        print(f"    This could explain diffusion instability.")
+    else:
+        print(f"\n  ✓ Autoencoder quality looks OK for diffusion training.")
 
 
 if __name__ == "__main__":
-    import math
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n-maps",    type=int, default=10,      help="Number of maps to test")
+    ap.add_argument("--ckpt",      default=AE_CKPT,           help="Autoencoder checkpoint")
+    ap.add_argument("--no-visual", action="store_true",        help="Skip ASCII visualization")
+    args = ap.parse_args()
+    main(n_maps=args.n_maps, ckpt=args.ckpt, visualize=not args.no_visual)
