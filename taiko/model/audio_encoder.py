@@ -1,13 +1,13 @@
 """
 taiko/model/audio_encoder.py
 
-MelSpectrogramScaleEncoder1D — directly adapted from Mug-Diffusion's wave.py.
+MelSpectrogramScaleEncoder1D — adapted from Mug-Diffusion's wave.py.
 
-Key design (from wave.py):
-  - Treats mel as 1D: [B, 128, T] not [B, 1, 128, T]
-  - Dilated convolutions: (1,2) and (4,8) alternating
-  - Attention at coarser resolutions only
-  - Returns multi-scale features for U-Net skip connections
+Changes from previous version:
+  - attention_resolutions now defaults to last 40% of levels instead of
+    hardcoded {2,3} — works correctly for both 4-level and 10-level encoders
+  - num_heads scales with channel count (out_ch // 32, min 1)
+  - Everything else unchanged — arbitrary channel_mult length already worked
 
 Input:  mel [B, 128, T_audio]
 Output: list of tensors at each resolution level
@@ -27,8 +27,6 @@ def Normalize(channels: int, num_groups: int = 8) -> nn.GroupNorm:
 
 
 class ResBlock1D(nn.Module):
-    """1D ResNet block with dilated convolutions — from Mug-Diffusion wave.py."""
-
     def __init__(self, channels: int, dilation: int = 1, num_groups: int = 8):
         super().__init__()
         self.norm1 = Normalize(channels, num_groups)
@@ -44,11 +42,8 @@ class ResBlock1D(nn.Module):
 
 
 class AudioEncoderLevel(nn.Module):
-    """One resolution level: 2 ResBlocks with alternating dilations."""
-
     def __init__(self, channels: int, i_block: int, num_groups: int = 8):
         super().__init__()
-        # Alternating dilation pattern from Mug-Diffusion
         dilations = (1, 2) if i_block % 2 == 0 else (4, 8)
         self.blocks = nn.Sequential(
             ResBlock1D(channels, dilations[0], num_groups),
@@ -62,28 +57,35 @@ class AudioEncoderLevel(nn.Module):
 class MelEncoder1D(nn.Module):
     """
     Multi-scale mel spectrogram encoder.
-    Adapted from Mug-Diffusion MelspectrogramScaleEncoder1D.
 
-    Returns features at each scale for U-Net cross-attention.
-    Smaller model than Mug-Diffusion to fit 4GB VRAM.
+    attention_resolutions:
+      If None, defaults to the last 40% of levels (coarser scales only).
+      For 4 levels  → {2, 3}      (same as before)
+      For 10 levels → {6,7,8,9}   (coarser half)
+      Pass an explicit set to override.
 
     Input:  [B, 128, T]
-    Output: list of [B, C, T], [B, C, T//2], [B, C, T//4], [B, C, T//8]
+    Output: list of feature tensors, one per level
     """
 
     def __init__(
         self,
-        n_mels: int = 128,
-        base_channels: int = 64,
-        channel_mult: list[int] = None,
-        num_groups: int = 8,
-        attention_resolutions: set = None,
+        n_mels:               int       = 128,
+        base_channels:        int       = 64,
+        channel_mult:         list[int] = None,
+        num_groups:           int       = 8,
+        attention_resolutions: set      = None,
     ):
         super().__init__()
         if channel_mult is None:
             channel_mult = [1, 1, 2, 2]
+
+        n_levels = len(channel_mult)
+
+        # Default: attention on the last 40% of levels (coarse scales)
         if attention_resolutions is None:
-            attention_resolutions = {2, 3}  # only at coarser scales
+            attn_start = int(n_levels * 0.6)
+            attention_resolutions = set(range(attn_start, n_levels))
 
         self.conv_in = nn.Conv1d(n_mels, base_channels, kernel_size=3, padding=1)
 
@@ -103,13 +105,15 @@ class MelEncoder1D(nn.Module):
 
             if i in attention_resolutions:
                 self.attns.append(nn.MultiheadAttention(
-                    out_ch, num_heads=max(1, out_ch // 32),
-                    batch_first=True, dropout=0.0,
+                    out_ch,
+                    num_heads=max(1, out_ch // 32),
+                    batch_first=True,
+                    dropout=0.0,
                 ))
             else:
                 self.attns.append(None)
 
-            if i < len(channel_mult) - 1:
+            if i < n_levels - 1:
                 self.downsamps.append(
                     nn.Conv1d(out_ch, out_ch, kernel_size=4, stride=2, padding=1)
                 )
@@ -121,25 +125,18 @@ class MelEncoder1D(nn.Module):
         self.out_channels = [base_channels * m for m in channel_mult]
 
     def forward(self, mel: torch.Tensor) -> list[torch.Tensor]:
-        """
-        Args:
-            mel: [B, 128, T]
-        Returns:
-            list of feature tensors at each scale
-        """
-        h = self.conv_in(mel)
+        h  = self.conv_in(mel)
         hs = []
 
         for i, level in enumerate(self.levels):
             h = level["proj"](h)
             h = level["block"](h)
 
-            # Attention at coarse scales
             if self.attns[i] is not None:
                 B, C, T = h.shape
-                h_t = h.permute(0, 2, 1)          # [B, T, C]
-                h_t, _ = self.attns[i](h_t, h_t, h_t)
-                h = h_t.permute(0, 2, 1)           # [B, C, T]
+                h_t     = h.permute(0, 2, 1)
+                h_t, _  = self.attns[i](h_t, h_t, h_t)
+                h       = h_t.permute(0, 2, 1)
 
             hs.append(h)
 

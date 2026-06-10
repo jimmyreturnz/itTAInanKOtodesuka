@@ -20,7 +20,8 @@ data/processed/
 
 # Dataset caches
 *.json
-
+data/tmp_osz/
+data/unranked_review.csv
 
 # OS files
 .DS_Store
@@ -38,3 +39,6 @@ taiko_diffusion_colab.ipynb
 # notes
 CLAUDE.md
 Mug-Diffusion.md
+
+# github repomix
+node_modules
