@@ -70,6 +70,12 @@ class TaikoNote:
     note_type: str      # "don", "kat", "big_don", "big_kat", "roll", "denden"
     end_time: int = 0   # only for roll/denden
 
+    # Raw slider geometry, kept only between parsing a drumroll and resolving
+    # its duration against the timing points. `resolve_roll_durations()` reads
+    # these and then they are dead weight -- nothing downstream should use them.
+    px_length: float = 0.0   # osu! pixel length of the slider path
+    slides:    int   = 1     # number of times the drumroll repeats
+
     @property
     def duration(self) -> int:
         return max(0, self.end_time - self.time)
@@ -122,7 +128,11 @@ class TaikoBeatmap:
         self.roll_count   = sum(1 for n in self.notes if n.note_type == "roll")
         self.denden_count = sum(1 for n in self.notes if n.note_type == "denden")
         if self.notes:
-            self.duration_ms = self.notes[-1].end_time if self.notes[-1].is_long else self.notes[-1].time
+            # max(), not notes[-1]: a long drumroll can start before the final
+            # hit and still end after it.
+            self.duration_ms = max(
+                (n.end_time if n.is_long else n.time) for n in self.notes
+            )
 
     @property
     def don_ratio(self) -> float:
@@ -138,6 +148,94 @@ class TaikoBeatmap:
         if self.duration_ms <= 0:
             return 0.0
         return self.note_count / (self.duration_ms / 1000.0)
+
+
+# ---------------------------------------------------------------------------
+# Drumroll duration resolution
+# ---------------------------------------------------------------------------
+
+# osu! defines one "slider velocity unit" as 100 pixels per beat, scaled by the
+# beatmap's SliderMultiplier and by the active green line's velocity.
+OSU_PIXELS_PER_BEAT = 100.0
+
+# Guard rails. A drumroll longer than this is always a broken green line or a
+# corrupt file, never a real chart.
+MAX_ROLL_MS = 60_000
+MIN_ROLL_MS = 10
+
+
+def _timing_at(timing_points: list["TimingPoint"], time_ms: int) -> tuple[float, float]:
+    """
+    Resolve the timing state in force at `time_ms`.
+
+    Returns:
+        (ms_per_beat, sv_multiplier)
+
+        ms_per_beat    from the most recent uninherited (red) line
+        sv_multiplier  from the most recent inherited (green) line, where
+                       osu! encodes velocity as a negative number:
+                       sv = -100 / beat_length, so -100 -> 1.0x, -50 -> 2.0x
+
+    A green line's effect ends when a later red line resets it, which is why
+    both are tracked in a single forward pass rather than searched separately.
+    """
+    ms_per_beat = 500.0     # osu!'s own fallback: 120 BPM
+    sv          = 1.0
+
+    for tp in timing_points:
+        if tp.time > time_ms:
+            break
+        if tp.uninherited:
+            if tp.beat_length > 0:
+                ms_per_beat = tp.beat_length
+            sv = 1.0        # a red line clears any active green line
+        else:
+            if tp.beat_length < 0:
+                sv = -100.0 / tp.beat_length
+            # A non-negative inherited value is malformed; osu! ignores it.
+
+    return ms_per_beat, sv
+
+
+def resolve_roll_durations(bm: "TaikoBeatmap") -> None:
+    """
+    Turn each drumroll's raw pixel length into a real end time, in place.
+
+        beats    = px_length / (SliderMultiplier * 100 * sv)
+        duration = beats * ms_per_beat * slides
+
+    Must run after timing points are parsed and sorted. Without it every
+    drumroll in the corpus carries a fabricated end time, which poisons the
+    roll channel of the chart tensor and any duration derived from it.
+    """
+    if not bm.notes:
+        return
+
+    slider_mult = bm.slider_multiplier if bm.slider_multiplier > 0 else 1.4
+
+    for note in bm.notes:
+        if note.note_type != "roll":
+            continue
+
+        if note.px_length <= 0:
+            # No usable geometry. One beat is the least-wrong assumption, and
+            # it keeps the note representable rather than dropping it.
+            ms_per_beat, _ = _timing_at(bm.timing_points, note.time)
+            note.end_time = note.time + int(round(ms_per_beat))
+            continue
+
+        ms_per_beat, sv = _timing_at(bm.timing_points, note.time)
+
+        velocity = slider_mult * OSU_PIXELS_PER_BEAT * sv
+        if velocity <= 0:
+            note.end_time = note.time + int(round(ms_per_beat))
+            continue
+
+        beats    = note.px_length / velocity
+        duration = beats * ms_per_beat * max(1, note.slides)
+
+        duration = min(max(duration, MIN_ROLL_MS), MAX_ROLL_MS)
+        note.end_time = note.time + int(round(duration))
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +284,11 @@ class OsuTaikoParser:
         # Sort by time (some maps have minor ordering issues)
         bm.timing_points.sort(key=lambda t: t.time)
         bm.notes.sort(key=lambda n: n.time)
+
+        # Drumrolls were parsed with raw pixel geometry; only now that the
+        # timing points are known and sorted can they become real durations.
+        resolve_roll_durations(bm)
+
         bm.compute_stats()
         return bm
 
@@ -279,16 +382,30 @@ class OsuTaikoParser:
             return TaikoNote(time=time, note_type=note_type)
 
         elif is_slider:
-            # drumroll: params are "curve_type|...,slides,length"
-            # end_time derived from length and current SV — approximate here
-            # accurate end time needs timing context; store raw for now
-            end_time = time  # will be filled by BPM-aware post-process
-            if len(parts) >= 8:
-                try:
-                    end_time = int(float(parts[7]))  # some formats include end time
-                except (ValueError, IndexError):
-                    pass
-            return TaikoNote(time=time, note_type="roll", end_time=end_time)
+            # Drumroll. Format from index 5 on:
+            #   curveType|curvePoints , slides , length , edgeSounds , ...
+            #
+            # parts[7] is `length` in osu! PIXELS, not a time. Converting it
+            # needs the active red line (ms per beat) and green line (slider
+            # velocity) at this instant, which the caller resolves afterwards
+            # in resolve_roll_durations(). Leave end_time unset until then.
+            slides    = 1
+            px_length = 0.0
+            try:
+                slides = max(1, int(parts[6]))
+            except (ValueError, IndexError):
+                pass
+            try:
+                px_length = max(0.0, float(parts[7]))
+            except (ValueError, IndexError):
+                pass
+            return TaikoNote(
+                time=time,
+                note_type="roll",
+                end_time=time,
+                px_length=px_length,
+                slides=slides,
+            )
 
         elif is_spinner:
             end_time = int(parts[5]) if len(parts) > 5 else time

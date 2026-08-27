@@ -188,14 +188,27 @@ def apply_timing_refinement(
     audio_path: Optional[str] = None,
     audio_bpm: Optional[float] = None,
     audio_offset_ms: Optional[float] = None,
+    trust_given_tempo: bool = True,
+    meter: int = 4,
     verbose: bool = True,
 ) -> TaikoBeatmap:
     """
-    Full post-process: audio BPM hint -> fit from notes -> snap -> update timing points.
+    Snap generated notes onto a beat grid.
+
+    `trust_given_tempo` is the default because the model now *generates against*
+    a supplied grid -- the timing stream is a conditioning input, so the notes
+    are already placed relative to `audio_bpm` and `audio_offset_ms`. Re-fitting
+    a tempo from the generated notes here would throw that away and impose a
+    different grid than the one the chart was written for, which is how a
+    correctly generated chart ends up sounding off-beat.
+
+    Fitting from notes was the right behaviour under the old design, where the
+    model had to invent its own tempo. Keep it only when there is genuinely no
+    tempo to trust; pass trust_given_tempo=False for that.
     """
     if not bm.notes:
         if verbose:
-            print("[timing] no notes — skipping refinement")
+            print("[timing] no notes, nothing to snap")
         return bm
 
     if audio_bpm is None or audio_offset_ms is None:
@@ -205,29 +218,29 @@ def apply_timing_refinement(
         else:
             bpm, beat_times = detect_bpm(audio_path)
             audio_bpm = bpm
-            audio_offset_ms = (
-                float(beat_times[0] * 1000) if len(beat_times) > 0 else 0.0
-            )
+            audio_offset_ms = float(beat_times[0] * 1000) if len(beat_times) > 0 else 0.0
 
-    note_times = [n.time for n in bm.notes if not n.is_long]
-    if not note_times:
-        note_times = [n.time for n in bm.notes]
+    if trust_given_tempo:
+        bpm, offset_ms, source = audio_bpm, audio_offset_ms, "given"
+    else:
+        note_times = [n.time for n in bm.notes if not n.is_long] or [n.time for n in bm.notes]
+        bpm, offset_ms, source = resolve_bpm_offset(note_times, audio_bpm, audio_offset_ms)
 
-    bpm, offset_ms, source = resolve_bpm_offset(
-        note_times, audio_bpm, audio_offset_ms
-    )
     if verbose:
-        print(f"[timing] BPM={bpm:.2f} offset={offset_ms:.1f} ms (from {source})")
-        if source == "notes":
-            print(f"[timing] audio hint was BPM={audio_bpm:.1f} offset={audio_offset_ms:.1f}")
+        before = [n.time for n in bm.notes]
+        print(f"[timing] snapping to {bpm:.2f} BPM, offset {offset_ms:.1f} ms ({source})")
 
     snap_beatmap_notes(bm, bpm, offset_ms)
 
+    if verbose:
+        moved = sum(1 for a, b in zip(before, [n.time for n in bm.notes]) if a != b)
+        print(f"[timing] {moved}/{len(before)} notes moved onto the grid")
+
     bm.timing_points = [
         TimingPoint(
-            time=int(offset_ms),
+            time=int(round(offset_ms)),
             beat_length=60_000.0 / bpm,
-            meter=4,
+            meter=max(1, meter),
             uninherited=True,
         )
     ]

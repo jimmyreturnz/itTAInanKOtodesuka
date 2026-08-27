@@ -1,17 +1,24 @@
 """
 taiko/data/audio.py
 
-Converts audio files (.mp3, .ogg, .wav) → mel spectrogram tensors.
+Audio file -> log-mel spectrogram on the shared time grid.
 
-Design choices:
-  - 22,050 Hz sample rate (sufficient for rhythm; reduces compute vs 44.1kHz)
-  - 128 mel bins  (matches Whisper's encoder input width)
-  - 10ms hop length → 1 frame = 10ms, aligns with TIME token quantization
-  - Window: 25ms (Whisper standard)
-  - Output shape: [128, T] float32, log-scaled, normalized to [-1, 1]
+The hop length comes from `taiko.data.frames`, which is the single source of
+truth for the time grid. It is not repeated here, and nothing in this module
+may override it: one mel frame must equal one chart frame, or training pairs
+charts with the wrong span of audio and the model never learns to follow the
+music. See frames.py for why that failure is invisible in the loss curve.
 
-The 10ms hop is intentional: each mel frame corresponds to exactly one
-TIME_1 token step, making audio-token alignment trivial during training.
+    22050 Hz, hop 441 -> 20 ms per frame, 50 frames per second
+    128 mel bins, 40 ms window
+    log scale, per-clip peak reference, normalised to [-1, 1]
+
+Both backends reference the per-clip maximum. torchaudio's AmplitudeToDB uses a
+fixed reference of 1.0 by default, which makes its output depend on the mix
+loudness -- so a quiet song and a loud one would land in different parts of the
+range for identical musical content. librosa's power_to_db(ref=np.max) is
+per-clip already; this module makes torchaudio match rather than the other way
+round, since the chart should not depend on how hot the master was.
 """
 
 from __future__ import annotations
@@ -19,18 +26,18 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 
+from taiko.data.frames import FRAME_MS, HOP_LENGTH, SAMPLE_RATE
+
 # ---------------------------------------------------------------------------
-# Constants — must stay in sync with tokenizer.py TIME_QUANTIZE_MS = 10
+# Constants -- the time grid comes from frames.py and is not redefined here
 # ---------------------------------------------------------------------------
 
-SAMPLE_RATE     = 22_050          # Hz
-HOP_LENGTH      = 441             # samples = 20ms @ 22050 Hz
-WIN_LENGTH      = 882             # samples ≈ 40ms @ 22050 Hz
-N_FFT           = 1024            # FFT size (next power of 2 above win_length)
-N_MELS          = 128             # mel bins (matches Whisper)
-F_MIN           = 20.0            # Hz
-F_MAX           = 8_000.0         # Hz  (taiko hi-hat/snare energy is < 8kHz)
-TOP_DB          = 80.0            # dynamic range clamp (dB)
+WIN_LENGTH = 882             # samples, about 40 ms at 22050 Hz
+N_FFT      = 1024            # next power of two above win_length
+N_MELS     = 128
+F_MIN      = 20.0            # Hz
+F_MAX      = 8_000.0         # Hz; taiko-relevant percussive energy sits below this
+TOP_DB     = 80.0            # dynamic range clamp
 
 
 # ---------------------------------------------------------------------------
@@ -119,14 +126,17 @@ def _mel_torchaudio(waveform, sr, n_mels, hop_length, win_length, n_fft, f_min, 
     )
     amp_to_db = T.AmplitudeToDB(stype="power", top_db=top_db)
 
-    t = torch.from_numpy(waveform).float().unsqueeze(0)  # [1, samples]
-    mel = mel_transform(t)          # [1, n_mels, T]
-    mel_db = amp_to_db(mel)         # [1, n_mels, T], range ≈ [-top_db, 0]
-    mel_db = mel_db.squeeze(0)      # [n_mels, T]
+    t = torch.from_numpy(waveform).float().unsqueeze(0)   # [1, samples]
+    mel = mel_transform(t)                                # [1, n_mels, T]
+    mel_db = amp_to_db(mel).squeeze(0)                    # [n_mels, T]
 
-    # Normalize to [-1, 1]: shift so max≈0 → divide by (top_db/2) → +1
-    mel_norm = (mel_db / (top_db / 2.0)) + 1.0
-    mel_norm = mel_norm.clamp(-1.0, 1.0)
+    # Re-reference to the clip's own peak. AmplitudeToDB uses a fixed reference
+    # of 1.0, so without this the result tracks mix loudness rather than
+    # musical content, and disagrees with the librosa path.
+    mel_db = mel_db - mel_db.max()
+    mel_db = mel_db.clamp(min=-top_db)
+
+    mel_norm = ((mel_db / (top_db / 2.0)) + 1.0).clamp(-1.0, 1.0)
     return mel_norm.numpy().astype(np.float32)
 
 
@@ -191,7 +201,7 @@ class MelExtractor:
 
         Returns:
             np.ndarray, shape [128, T], float32, values in [-1, 1]
-            T = ceil(num_samples / hop_length)
+            T frames of FRAME_MS each
         """
         waveform, sr = load_audio(audio_path)
         if sr != self.sample_rate:
@@ -218,16 +228,13 @@ class MelExtractor:
             f_min=self.f_min, f_max=self.f_max, top_db=self.top_db)
 
     def frames_to_ms(self, n_frames: int) -> float:
-        """Convert frame count to milliseconds."""
-        return n_frames * self.hop_length / self.sample_rate * 1000.0
+        return n_frames * self.ms_per_frame
 
     def ms_to_frames(self, ms: float) -> int:
-        """Convert milliseconds to frame index."""
-        return int(ms / 1000.0 * self.sample_rate / self.hop_length)
+        return int(round(ms / self.ms_per_frame))
 
     @property
     def ms_per_frame(self) -> float:
-        """How many ms each mel frame represents — should be ~10ms."""
         return self.hop_length / self.sample_rate * 1000.0
 
 

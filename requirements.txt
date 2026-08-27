@@ -3,19 +3,16 @@ torch>=2.0.0
 torchaudio>=2.0.0
 numpy>=1.24.0
 
-# Audio fallback
+# Audio decoding and mel extraction (torchaudio is tried first, librosa is the
+# fallback and provides BPM detection either way)
 librosa>=0.10.0
 soundfile>=0.12.0
 
-# Data downloading
+# Star ratings from the osu! API during packing
 requests>=2.28.0
 
-# Training utilities
+# Reads OSU_API_KEY from a .env file if you keep one
+python-dotenv>=1.0.0
+
+# Progress output
 tqdm>=4.65.0
-wandb>=0.15.0          # optional: training metrics dashboard
-
-# Config
-pyyaml>=6.0
-
-# Inference UI (Phase 5)
-gradio>=4.0.0
