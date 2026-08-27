@@ -25,7 +25,7 @@ from taiko.data.tensor_repr import (
     CH_DON, CH_ROLL, N_CHART_CHANNELS, N_TIMING_CHANNELS,
 )
 
-W = 400
+W = 384          # a multiple of 64, as WindowedDataset requires
 
 
 def _decode_frames(mel: np.ndarray) -> np.ndarray:

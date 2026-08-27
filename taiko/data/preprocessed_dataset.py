@@ -53,9 +53,17 @@ from taiko.data.tensor_repr import (
 )
 
 # Window sizes in frames (20 ms each).
-WINDOW_FRAMES_MIN     = 1_000    # 20 s
-WINDOW_FRAMES_MAX     = 2_000    # 40 s
-WINDOW_FRAMES_DEFAULT = 1_500    # 30 s
+#
+# Every value here is a multiple of 64, so a window round-trips exactly through
+# an autoencoder compressing by 8, 16, 32 or 64. A window that is not a whole
+# number of latent frames loses its remainder on the way back out -- 1500
+# frames returns as 1488 at 16x -- and the missing tail lands on the loss as
+# phantom error at the end of every single sample.
+WINDOW_FRAMES_MIN     = 1_024    # 20.5 s
+WINDOW_FRAMES_MAX     = 2_048    # 41.0 s
+WINDOW_FRAMES_DEFAULT = 1_536    # 30.7 s
+
+WINDOW_ALIGNMENT = 64
 
 
 class WindowedDataset(Dataset):
@@ -110,6 +118,14 @@ class WindowedDataset(Dataset):
 
         if not self.indices:
             raise ValueError("WindowedDataset got an empty split")
+
+        if self.window_frames % WINDOW_ALIGNMENT != 0:
+            raise ValueError(
+                f"window_frames must be a multiple of {WINDOW_ALIGNMENT} so it "
+                f"round-trips through the autoencoder; got {self.window_frames}. "
+                f"Nearest valid: "
+                f"{round(self.window_frames / WINDOW_ALIGNMENT) * WINDOW_ALIGNMENT}"
+            )
 
         self._length = int(samples_per_epoch) if samples_per_epoch else len(self.indices)
         self._checked_alignment = False
