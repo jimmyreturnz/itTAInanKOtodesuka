@@ -1,548 +1,349 @@
 """
 taiko/data/preprocessed_dataset.py
 
-Two dataset classes:
+Windowed dataset over the packed corpus.
 
-  PreprocessedDataset  — original full-map class (kept for compatibility)
-  WindowedDataset      — NEW: samples random 20-40s windows per __getitem__
+THE ALIGNMENT CONTRACT
+----------------------
+For a window starting at frame `s`, every array describes frames [s, s+W):
 
-WindowedDataset differences from PreprocessedDataset:
-  - Random window start each call (training) or fixed (eval)
-  - Tensor and mel are cropped to the window, not padded to full map size
-  - valid_mask is recomputed for the window (all 1s unless at the map tail)
-  - local_nps computed on the fly from onset counts in the window
-  - section_pos = window_start / map_total_frames  (float 0-1)
-  - motif computed from onset + beat channels in the window (16-dim vector)
-  - avg_nps / peak_nps / snap ratios read from the index row
+    mel    [128, W]     the audio
+    chart  [6,   W]     what happened in the chart
+    timing [3,   W]     where the beats are
 
-Motif vector (16 dims):
-  Bins 0-7:  IOI histogram — inter-onset-interval distribution in beat fractions
-             (1/8, 1/6, 1/4, 1/3, 3/8, 1/2, 3/4, 1/1)
-  Bin  8:    don fraction  (don / total onsets in window)
-  Bin  9:    kat fraction
-  Bin  10:   big fraction  (big_don + big_kat) / total
-  Bin  11:   roll fraction (roll onset frames / window)
-  Bin  12:   local_nps normalised by avg_nps  (density relative to map mean)
-  Bin  13:   beat regularity — std of beat channel values (lower = more regular)
-  Bin  14:   snap_1_4 in this window
-  Bin  15:   snap_1_8 in this window
+One frame is one frame is one frame. The previous version cropped the mel at
+`start * 2`, on the belief that mel ran at twice the chart rate -- it does not;
+both are 20 ms. Every training sample therefore paired a chart with a different
+span of the song, and the model could not learn alignment no matter how long it
+trained, while the loss fell exactly as it would if everything were fine.
 
-All values are float32 in [0, 1].
+`taiko.data.frames.assert_aligned` is called on load so a regression of that
+class stops the run instead of quietly wasting a week of GPU time.
 
-Expected index format (one JSON line per map, produced by preprocess_for_colab.py):
-  {
-    "mel_path":    "mels/FolderName.npz",
-    "tensor_path": "tensors/FolderName__DiffName.npz",
-    "difficulty":  5.2,
-    "style":       1,
-    "avg_nps":     7.3,
-    "peak_nps":    12.1,
-    "snap_1_4":    0.72,
-    "snap_1_6":    0.05,
-    "snap_1_8":    0.14,
-    "note_count":  677,
-    "duration_ms": 171400
-  }
+Augmentation
+------------
+Rate augmentation resamples mel, chart and timing together. Stretching time
+stretches the beat grid with it, so the timing stream stays truthful about the
+augmented audio -- resampling the sin/cos phasor is exactly right, which is one
+more reason to carry phase rather than a pulse train.
 """
 
 from __future__ import annotations
-import json
+
 import random
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from taiko.data.tensor_repr import N_CHANNELS
+from taiko.data.conditioning import (
+    MOTIF_DIM_DROPOUT, MOTIF_JITTER, STYLE_NULL,
+    normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
+)
+from taiko.data.frames import FRAME_MS, assert_aligned
+from taiko.data.motif import (
+    MOTIF_DIM, beat_frames_from_timing, compute_motif, corrupt_motif,
+)
+from taiko.data.shards import MEL_BINS, ShardReader
+from taiko.data.tensor_repr import (
+    N_CHART_CHANNELS, N_TIMING_CHANNELS, ONSET_CHANNELS,
+)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# Window sizes in frames (20 ms each).
+WINDOW_FRAMES_MIN     = 1_000    # 20 s
+WINDOW_FRAMES_MAX     = 2_000    # 40 s
+WINDOW_FRAMES_DEFAULT = 1_500    # 30 s
 
-PAD_FRAMES  = 18_000   # full-map tensor pad (360s @ 20ms)
-MEL_FRAMES  = 36_000   # full-map mel pad    (360s @ 10ms — 2× tensor)
-
-# Window sizes in tensor frames (20ms per frame)
-WINDOW_FRAMES_MIN = 1_000   # 20s
-WINDOW_FRAMES_MAX = 2_000   # 40s
-WINDOW_FRAMES_DEFAULT = 1_500  # 30s
-
-MOTIF_DIM   = 16
-FRAME_MS    = 20.0
-
-# Tensor channel indices (must match tensor_repr.py)
-CH_DON     = 0
-CH_KAT     = 1
-CH_BIG_DON = 2
-CH_BIG_KAT = 3
-CH_ROLL    = 4
-CH_DENDEN  = 5
-CH_BEAT    = 6
-
-# IOI histogram bin edges in beat fractions (relative to beat_length)
-# Each bin captures notes spaced approximately that fraction of a beat apart
-IOI_BINS = [1/8, 1/6, 1/4, 1/3, 3/8, 1/2, 3/4, 1.0]
-IOI_TOL  = 0.04   # ±4% tolerance
-
-
-# ---------------------------------------------------------------------------
-# Motif computation
-# ---------------------------------------------------------------------------
-
-def _compute_motif(
-    window: np.ndarray,   # [7, W] float32
-    avg_nps: float,
-    snap_1_4: float,
-    snap_1_8: float,
-    frame_ms: float = FRAME_MS,
-) -> np.ndarray:
-    """
-    Compute a 16-dimensional motif vector from a tensor window.
-    All values are in [0, 1].
-    """
-    W         = window.shape[1]
-    motif     = np.zeros(MOTIF_DIM, dtype=np.float32)
-
-    # ---- Onset channels -------------------------------------------------- #
-    # An onset is a frame where a channel transitions from 0→1
-    def onsets(ch: int) -> np.ndarray:
-        above = window[ch] > 0.5
-        if above.sum() == 0:
-            return np.array([], dtype=np.int32)
-        # First frame counts as onset if active
-        starts = np.where(above & ~np.concatenate([[False], above[:-1]]))[0]
-        return starts.astype(np.int32)
-
-    don_on     = onsets(CH_DON)
-    kat_on     = onsets(CH_KAT)
-    big_don_on = onsets(CH_BIG_DON)
-    big_kat_on = onsets(CH_BIG_KAT)
-    roll_on    = onsets(CH_ROLL)
-
-    all_on = np.sort(np.concatenate([don_on, kat_on, big_don_on, big_kat_on]))
-    total  = max(len(all_on), 1)
-
-    # ---- Beat length estimate from beat channel (CH6) -------------------- #
-    # Beat channel has pulses at each half-beat; estimate spacing from IBI
-    beat_ch    = window[CH_BEAT]
-    beat_peaks = np.where(beat_ch > 0.5)[0]
-    if len(beat_peaks) >= 2:
-        ibi         = np.diff(beat_peaks)       # inter-beat-interval in frames
-        median_ibi  = float(np.median(ibi))
-        beat_frames = max(median_ibi * 2, 1.0)  # half-beat → full beat in frames
-    else:
-        # Fallback: estimate beat length from avg_nps
-        # avg_nps notes/sec at 1/4 density → beat_ms = 1000 / (avg_nps / 4)
-        beat_ms_fallback = 1000.0 / max(avg_nps / 4.0, 0.5)
-        beat_frames = beat_ms_fallback / frame_ms  # convert ms → frames
-
-    # ---- IOI histogram (bins 0-7) ---------------------------------------- #
-    if len(all_on) >= 2:
-        ioi_frames = np.diff(all_on).astype(float)
-        tol = max(1.0, IOI_TOL * beat_frames)   # tolerance in frames
-        for b, frac in enumerate(IOI_BINS):
-            target  = frac * beat_frames
-            matches = int(np.sum(np.abs(ioi_frames - target) <= tol))
-            motif[b] = min(matches / max(len(ioi_frames), 1), 1.0)
-
-    # ---- Note type fractions (bins 8-11) --------------------------------- #
-    motif[8]  = min(len(don_on)     / total, 1.0)   # don fraction
-    motif[9]  = min(len(kat_on)     / total, 1.0)   # kat fraction
-    motif[10] = min(
-        (len(big_don_on) + len(big_kat_on)) / total, 1.0
-    )  # big fraction
-    roll_frames = float((window[CH_ROLL] > 0.5).sum())
-    motif[11] = min(roll_frames / max(W, 1), 1.0)   # roll density
-
-    # ---- Relative density (bin 12) --------------------------------------- #
-    window_sec = W * frame_ms / 1000.0
-    local_nps  = len(all_on) / max(window_sec, 1.0)
-    motif[12]  = min(local_nps / max(avg_nps * 2.0, 1.0), 1.0)
-
-    # ---- Beat regularity (bin 13) ---------------------------------------- #
-    # Low std of beat channel values → more regular beat grid → higher value
-    if beat_ch.max() > 0:
-        regularity = 1.0 - float(np.std(beat_ch[beat_ch > 0.1]))
-        motif[13]  = max(0.0, min(regularity, 1.0))
-
-    # ---- Window-local snap ratios (bins 14-15) --------------------------- #
-    # Approximate from IOI distribution: 1/4 snap ≈ bin index 2, 1/8 ≈ bin 0
-    motif[14] = float(motif[2])   # snap_1_4 proxy
-    motif[15] = float(motif[0])   # snap_1_8 proxy
-
-    return motif
-
-
-# ---------------------------------------------------------------------------
-# WindowedDataset
-# ---------------------------------------------------------------------------
 
 class WindowedDataset(Dataset):
     """
-    Samples random fixed-size windows from pre-computed mel + tensor pairs.
-
-    Each __getitem__ returns:
-        mel        [128, W*2]   — mel crop (2× tensor resolution)
-        tensor     [7,   W]     — beatmap tensor crop
-        valid_mask [W]          — 1=real frame, 0=past map end
-        difficulty float        — star rating
-        style      int          — 0-3 global style label
-        avg_nps    float        — global NPS (from index)
-        peak_nps   float        — peak 5s-window NPS (from index)
-        local_nps  float        — NPS in this specific window
-        section_pos float       — window start / map length (0-1)
-        motif      [16]         — local rhythm fingerprint vector
+    Random fixed-size windows over the packed corpus.
 
     Args:
-        records      — list of index dicts from load_index()
-        data_root    — Path to data/processed/
-        window_frames — window size in tensor frames (default 1500 = 30s)
-        random_window — if True, randomise start each call (training mode)
-                        if False, use fixed start=0 (eval mode)
-        augment      — apply rate + freq-mask augmentation (training only)
+        reader:            an open ShardReader
+        indices:           which maps this split may draw from
+        window_frames:     window size; must stay divisible by the autoencoder's
+                           compression ratio
+        random_window:     True to draw a random start per call (training),
+                           False to start at the first note (evaluation)
+        augment:           rate and frequency-mask augmentation
+        samples_per_epoch: how many windows make an epoch. Without this an
+                           "epoch" is one window per map, so a 13k-map corpus
+                           yields 13k windows and the learning-rate schedule is
+                           calibrated against a near-meaningless unit.
+        motif_dropout:     per-dimension motif dropout. See taiko/data/motif.py
+                           -- this is what stops the model reading the answer
+                           off its own conditioning vector.
     """
 
     def __init__(
         self,
-        records:       list[dict],
-        data_root:     Path,
-        window_frames: int   = WINDOW_FRAMES_DEFAULT,
-        random_window: bool  = True,
-        augment:       bool  = False,
-        rate_p:        float = 0.2,
-        rate_range:    tuple = (0.9, 1.1),
-        freq_mask_p:   float = 0.15,
-        freq_mask_bands: int = 12,
+        reader:            ShardReader,
+        indices:           Sequence[int] | None = None,
+        window_frames:     int   = WINDOW_FRAMES_DEFAULT,
+        random_window:     bool  = True,
+        augment:           bool  = False,
+        samples_per_epoch: Optional[int] = None,
+        motif_dropout:     float = MOTIF_DIM_DROPOUT,
+        motif_jitter:      float = MOTIF_JITTER,
+        rate_p:            float = 0.2,
+        rate_range:        tuple[float, float] = (0.9, 1.1),
+        freq_mask_p:       float = 0.15,
+        freq_mask_bands:   int   = 12,
+        seed:              int   = 0,
     ):
-        self.records        = records
-        self.data_root      = Path(data_root)
-        self.window_frames  = window_frames
-        self.random_window  = random_window
-        self.augment        = augment
-        self.rate_p         = rate_p
-        self.rate_range     = rate_range
-        self.freq_mask_p    = freq_mask_p
+        self.reader        = reader
+        self.indices       = list(indices) if indices is not None else list(range(len(reader)))
+        self.window_frames = int(window_frames)
+        self.random_window = random_window
+        self.augment       = augment
+        self.motif_dropout = motif_dropout
+        self.motif_jitter  = motif_jitter
+        self.rate_p        = rate_p
+        self.rate_range    = rate_range
+        self.freq_mask_p   = freq_mask_p
         self.freq_mask_bands = freq_mask_bands
+        self.seed          = seed
+
+        if not self.indices:
+            raise ValueError("WindowedDataset got an empty split")
+
+        self._length = int(samples_per_epoch) if samples_per_epoch else len(self.indices)
+        self._checked_alignment = False
 
     def __len__(self) -> int:
-        return len(self.records)
+        return self._length
 
-    def __getitem__(self, idx: int) -> dict:
-        for attempt in range(5):
-            rec = self.records[idx]
+    # ---------------------------------------------------------------- #
+
+    def __getitem__(self, i: int) -> dict:
+        # Each worker and each epoch needs its own stream, or every worker
+        # draws the same windows.
+        rng = np.random.default_rng(
+            (self.seed, i, torch.initial_seed() & 0xFFFF_FFFF)
+        )
+        py_rng = random.Random(int(rng.integers(0, 2**31 - 1)))
+
+        if self._length == len(self.indices) and not self.random_window:
+            idx = self.indices[i % len(self.indices)]
+        else:
+            idx = self.indices[int(rng.integers(0, len(self.indices)))]
+
+        for _ in range(4):
             try:
-                return self._load(rec)
-            except Exception as e:
-                print(f"[WindowedDataset] failed idx={idx} attempt={attempt}: {e}")
-                idx = random.randint(0, len(self.records) - 1)
+                return self._load(idx, rng, py_rng)
+            except Exception as exc:                       # noqa: BLE001
+                print(f"[WindowedDataset] map {idx} failed: {exc!r}")
+                idx = self.indices[int(rng.integers(0, len(self.indices)))]
 
-        # Fallback empty sample
-        W = self.window_frames
-        return {
-            "mel":         torch.zeros(128, W * 2),
-            "tensor":      torch.zeros(N_CHANNELS, W),
-            "valid_mask":  torch.zeros(W),
-            "difficulty":  torch.tensor(5.0),
-            "style":       torch.tensor(0, dtype=torch.long),
-            "avg_nps":     torch.tensor(5.0),
-            "peak_nps":    torch.tensor(8.0),
-            "local_nps":   torch.tensor(5.0),
-            "section_pos": torch.tensor(0.0),
-            "motif":       torch.zeros(MOTIF_DIM),
-        }
+        return self._empty()
 
-    def _load(self, rec: dict) -> dict:
-        W = self.window_frames
+    # ---------------------------------------------------------------- #
 
-        # ---- Load raw files ---------------------------------------------- #
-        mel_path    = self.data_root / rec["mel_path"].replace("\\", "/")
-        tensor_path = self.data_root / rec["tensor_path"].replace("\\", "/")
+    def _load(self, idx: int, rng: np.random.Generator, py_rng: random.Random) -> dict:
+        reader = self.reader
+        W      = self.window_frames
 
-        mel_npz    = np.load(mel_path)
-        tensor_npz = np.load(tensor_path)
+        chart_len = reader.chart_length(idx)
+        mel_len   = reader.mel_length(idx)
 
-        mel    = (mel_npz["mel"]    if "mel"    in mel_npz    else mel_npz["arr_0"]).astype(np.float32)
-        tensor = (tensor_npz["tensor"] if "tensor" in tensor_npz else tensor_npz["arr_0"]).astype(np.float32)
+        if not self._checked_alignment:
+            assert_aligned(mel_len, chart_len, context=f"map {idx}")
+            self._checked_alignment = True
 
-        T_tensor = tensor.shape[1]   # actual map length in frames
-        T_mel    = mel.shape[1]      # actual mel length (≈ 2× T_tensor)
+        # The chart may legitimately end before the audio; never sample a window
+        # that starts past the last note.
+        max_start = max(0, chart_len - W)
+        start = int(rng.integers(0, max_start + 1)) if (self.random_window and max_start > 0) else 0
 
-        # ---- Pick window start ------------------------------------------- #
-        # Leave at least W frames from the start; allow partial windows at tail
-        max_start = max(0, T_tensor - W)
+        # One start, three reads. This is the whole alignment contract.
+        mel    = reader.mel_window(idx,    start, W)
+        chart  = reader.chart_window(idx,  start, W)
+        timing = reader.timing_window(idx, start, W)
 
-        if self.random_window and max_start > 0:
-            start = random.randint(0, max_start)
-        else:
-            start = 0
+        valid_len  = max(0, min(W, chart_len - start))
+        valid_mask = np.zeros(W, dtype=np.float32)
+        valid_mask[:valid_len] = 1.0
 
-        end = start + W
+        if self.augment and py_rng.random() < self.rate_p:
+            rate = py_rng.uniform(*self.rate_range)
+            mel, chart, timing, valid_mask = _rate_augment(mel, chart, timing, valid_mask, rate)
 
-        # ---- Crop tensor -------------------------------------------------- #
-        if end <= T_tensor:
-            t_crop     = tensor[:, start:end].copy()
-            valid_mask = np.ones(W, dtype=np.float32)
-        else:
-            # Partial window at map tail — pad with zeros
-            t_crop     = np.zeros((N_CHANNELS, W), dtype=np.float32)
-            valid_len  = T_tensor - start
-            t_crop[:, :valid_len] = tensor[:, start:T_tensor]
-            valid_mask = np.zeros(W, dtype=np.float32)
-            valid_mask[:valid_len] = 1.0
+        if self.augment and py_rng.random() < self.freq_mask_p:
+            bands = py_rng.randint(1, self.freq_mask_bands)
+            lo    = py_rng.randint(0, MEL_BINS - bands)
+            mel[lo:lo + bands, :] = 0.0
 
-        # ---- Crop mel (2× resolution) ------------------------------------- #
-        mel_start = start * 2
-        mel_end   = end   * 2
+        record = reader.records[idx]
 
-        if mel_end <= T_mel:
-            m_crop = mel[:, mel_start:mel_end].copy()
-        else:
-            m_crop = np.zeros((128, W * 2), dtype=np.float32)
-            avail  = max(0, T_mel - mel_start)
-            if avail > 0:
-                m_crop[:, :avail] = mel[:, mel_start:mel_start + avail]
-
-        # ---- Rate augmentation (applied jointly to tensor + mel) ---------- #
-        if self.augment and random.random() < self.rate_p:
-            rate  = random.uniform(*self.rate_range)
-            new_W = max(32, int(W / rate))
-            new_M = new_W * 2
-
-            t_t = torch.from_numpy(t_crop).unsqueeze(0)
-            m_t = torch.from_numpy(m_crop).unsqueeze(0)
-
-            t_crop = F.interpolate(t_t, size=new_W, mode="nearest")[0].numpy()
-            m_crop = F.interpolate(m_t, size=new_M, mode="linear", align_corners=False)[0].numpy()
-
-            # Re-pad / truncate back to W and W*2
-            if new_W < W:
-                pad_t  = np.zeros((N_CHANNELS, W - new_W), dtype=np.float32)
-                t_crop = np.concatenate([t_crop, pad_t], axis=1)
-                pad_m  = np.zeros((128, W * 2 - new_M), dtype=np.float32)
-                m_crop = np.concatenate([m_crop, pad_m], axis=1)
-                vm_len = int(valid_mask.sum() / rate)
-                valid_mask = np.zeros(W, dtype=np.float32)
-                valid_mask[:min(vm_len, W)] = 1.0
-            else:
-                t_crop = t_crop[:, :W]
-                m_crop = m_crop[:, :W * 2]
-
-        # ---- Freq-mask augmentation (mel only) ---------------------------- #
-        if self.augment and random.random() < self.freq_mask_p:
-            f  = random.randint(1, self.freq_mask_bands)
-            f0 = random.randint(0, 127 - f)
-            m_crop[f0:f0 + f, :] = 0.0
-
-        # ---- Conditioning fields ----------------------------------------- #
-        difficulty = float(rec["difficulty"])
-        style      = int(rec["style"])
-        avg_nps    = float(rec.get("avg_nps",  0.0))
-        peak_nps   = float(rec.get("peak_nps", 0.0))
+        difficulty = float(record.get("difficulty", 0.0))
+        avg_nps    = float(record.get("avg_nps", 0.0))
+        peak_nps   = float(record.get("peak_nps", 0.0))
+        style      = int(record.get("style", STYLE_NULL))
 
         if self.augment:
-            difficulty = max(0.0, min(10.0, difficulty + random.gauss(0, 0.1)))
-            avg_nps    = max(0.0, avg_nps + random.gauss(0, 0.2))
-            peak_nps   = max(0.0, peak_nps + random.gauss(0, 0.3))
+            # Small jitter so the model does not treat these as exact lookups.
+            difficulty = max(0.0, difficulty + py_rng.gauss(0, 0.1))
+            avg_nps    = max(0.0, avg_nps    + py_rng.gauss(0, 0.2))
+            peak_nps   = max(0.0, peak_nps   + py_rng.gauss(0, 0.3))
 
-        # ---- Per-window signals ------------------------------------------ #
-        # local_nps: count onset frames in window onset channels
-        onset_active = (t_crop[CH_DON] > 0.5) | (t_crop[CH_KAT] > 0.5) | \
-                       (t_crop[CH_BIG_DON] > 0.5) | (t_crop[CH_BIG_KAT] > 0.5)
-        # Only count transitions (0→1), not sustained frames
-        onset_count = int(np.sum(onset_active & ~np.concatenate([[False], onset_active[:-1]])))
-        window_sec  = float(valid_mask.sum()) * FRAME_MS / 1000.0
-        local_nps   = onset_count / max(window_sec, 1.0)
+        # The motif is measured on the window the model must generate, so it is
+        # corrupted before the model ever sees it.
+        beat_frames = beat_frames_from_timing(timing)
+        motif = compute_motif(chart, beat_frames, quantise=True)
+        if self.augment and self.motif_dropout > 0:
+            motif, motif_mask = corrupt_motif(
+                motif, rng, dim_dropout=self.motif_dropout, jitter=self.motif_jitter
+            )
+        else:
+            motif_mask = np.ones(MOTIF_DIM, dtype=np.float32)
 
-        # section_pos: normalised position in map (0=start, 1=end)
-        section_pos = start / max(T_tensor - 1, 1)
-
-        # motif vector
-        motif = _compute_motif(t_crop, avg_nps=avg_nps, snap_1_4=rec.get("snap_1_4", 0.0),
-                               snap_1_8=rec.get("snap_1_8", 0.0))
+        onsets     = sum(int((chart[c] > 0.5).sum()) for c in ONSET_CHANNELS)
+        window_sec = max(valid_mask.sum() * FRAME_MS / 1000.0, 1e-6)
 
         return {
-            "mel":         torch.from_numpy(m_crop),
-            "tensor":      torch.from_numpy(t_crop),
+            "mel":         torch.from_numpy(mel),
+            "chart":       torch.from_numpy(chart),
+            "timing":      torch.from_numpy(timing),
             "valid_mask":  torch.from_numpy(valid_mask),
-            "difficulty":  torch.tensor(difficulty,  dtype=torch.float32),
-            "style":       torch.tensor(style,        dtype=torch.long),
-            "avg_nps":     torch.tensor(avg_nps,      dtype=torch.float32),
-            "peak_nps":    torch.tensor(peak_nps,     dtype=torch.float32),
-            "local_nps":   torch.tensor(local_nps,    dtype=torch.float32),
-            "section_pos": torch.tensor(section_pos,  dtype=torch.float32),
+            "difficulty":  torch.tensor(normalise_difficulty(difficulty), dtype=torch.float32),
+            "style":       torch.tensor(style, dtype=torch.long),
+            "avg_nps":     torch.tensor(normalise_avg_nps(avg_nps),  dtype=torch.float32),
+            "peak_nps":    torch.tensor(normalise_peak_nps(peak_nps), dtype=torch.float32),
             "motif":       torch.from_numpy(motif),
+            "motif_mask":  torch.from_numpy(motif_mask),
+            "local_nps":   torch.tensor(onsets / window_sec, dtype=torch.float32),
+            "map_index":   torch.tensor(idx, dtype=torch.long),
         }
 
-
-# ---------------------------------------------------------------------------
-# PreprocessedDataset (original — kept for backward compatibility)
-# ---------------------------------------------------------------------------
-
-class PreprocessedDataset(Dataset):
-    """
-    Original full-map dataset. Pads everything to PAD_FRAMES / MEL_FRAMES.
-    Kept for backward compatibility and autoencoder training.
-    """
-
-    def __init__(
-        self,
-        records:     list[dict],
-        data_root:   Path,
-        pad_frames:  int   = PAD_FRAMES,
-        mel_frames:  int   = MEL_FRAMES,
-        augment:     bool  = False,
-        rate_p:      float = 0.2,
-        rate_range:  tuple = (0.9, 1.1),
-        freq_mask_p: float = 0.15,
-        freq_mask_bands: int = 12,
-    ):
-        self.records         = records
-        self.data_root       = Path(data_root)
-        self.pad_frames      = pad_frames
-        self.mel_frames      = mel_frames
-        self.augment         = augment
-        self.rate_p          = rate_p
-        self.rate_range      = rate_range
-        self.freq_mask_p     = freq_mask_p
-        self.freq_mask_bands = freq_mask_bands
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-    def __getitem__(self, idx: int) -> dict:
-        for _ in range(5):
-            rec = self.records[idx]
-            try:
-                mel_path    = self.data_root / rec["mel_path"].replace("\\", "/")
-                tensor_path = self.data_root / rec["tensor_path"].replace("\\", "/")
-
-                mel_npz    = np.load(mel_path)
-                tensor_npz = np.load(tensor_path)
-
-                mel    = (mel_npz["mel"]       if "mel"    in mel_npz    else mel_npz["arr_0"]).astype(np.float32)
-                tensor = (tensor_npz["tensor"] if "tensor" in tensor_npz else tensor_npz["arr_0"]).astype(np.float32)
-
-                T          = tensor.shape[1]
-                valid_len  = min(T, self.pad_frames)
-                valid_mask = np.zeros(self.pad_frames, dtype=np.float32)
-                valid_mask[:valid_len] = 1.0
-
-                if T < self.pad_frames:
-                    tensor = np.concatenate(
-                        [tensor, np.zeros((N_CHANNELS, self.pad_frames - T), dtype=np.float32)], axis=1
-                    )
-                else:
-                    tensor = tensor[:, :self.pad_frames]
-
-                T_mel = mel.shape[1]
-                if T_mel < self.mel_frames:
-                    mel = np.concatenate(
-                        [mel, np.zeros((128, self.mel_frames - T_mel), dtype=np.float32)], axis=1
-                    )
-                else:
-                    mel = mel[:, :self.mel_frames]
-
-                if self.augment:
-                    if random.random() < self.rate_p:
-                        rate  = random.uniform(*self.rate_range)
-                        t_mel = max(64, int(mel.shape[1] / rate))
-                        t_bm  = max(32, int(tensor.shape[1] / rate))
-                        mel_t = torch.from_numpy(mel).unsqueeze(0)
-                        mel   = F.interpolate(mel_t, size=t_mel, mode="linear", align_corners=False)[0].numpy()
-                        ten_t = torch.from_numpy(tensor).unsqueeze(0)
-                        tensor = F.interpolate(ten_t, size=t_bm, mode="nearest")[0].numpy()
-                        valid_len = min(int(valid_len / rate), self.pad_frames)
-                        valid_mask = np.zeros(self.pad_frames, dtype=np.float32)
-                        valid_mask[:valid_len] = 1.0
-                        if mel.shape[1] < self.mel_frames:
-                            mel = np.concatenate([mel, np.zeros((128, self.mel_frames - mel.shape[1]), np.float32)], axis=1)
-                        else:
-                            mel = mel[:, :self.mel_frames]
-                        if tensor.shape[1] < self.pad_frames:
-                            tensor = np.concatenate([tensor, np.zeros((N_CHANNELS, self.pad_frames - tensor.shape[1]), np.float32)], axis=1)
-                        else:
-                            tensor = tensor[:, :self.pad_frames]
-                    if random.random() < self.freq_mask_p:
-                        f  = random.randint(1, self.freq_mask_bands)
-                        f0 = random.randint(0, 127 - f)
-                        mel[f0:f0 + f, :] = 0.0
-
-                difficulty = float(rec["difficulty"])
-                style      = int(rec["style"])
-
-                if self.augment:
-                    difficulty = max(0.0, min(10.0, difficulty + random.gauss(0, 0.1)))
-
-                return {
-                    "mel":        torch.from_numpy(mel),
-                    "tensor":     torch.from_numpy(tensor),
-                    "valid_mask": torch.from_numpy(valid_mask),
-                    "difficulty": torch.tensor(difficulty, dtype=torch.float32),
-                    "style":      torch.tensor(style, dtype=torch.long),
-                    "avg_nps":    torch.tensor(float(rec.get("avg_nps", 0.0)),  dtype=torch.float32),
-                    "peak_nps":   torch.tensor(float(rec.get("peak_nps", 0.0)), dtype=torch.float32),
-                }
-            except Exception as e:
-                print(f"[dataset] failed idx={idx} ({rec.get('tensor_path', '?')}): {e}")
-                idx = random.randint(0, len(self.records) - 1)
-
+    def _empty(self) -> dict:
+        W = self.window_frames
         return {
-            "mel":        torch.zeros(128, self.mel_frames),
-            "tensor":     torch.zeros(N_CHANNELS, self.pad_frames),
-            "valid_mask": torch.zeros(self.pad_frames),
-            "difficulty": torch.tensor(5.0),
-            "style":      torch.tensor(0, dtype=torch.long),
+            "mel":        torch.zeros(MEL_BINS, W),
+            "chart":      torch.zeros(N_CHART_CHANNELS, W),
+            "timing":     torch.zeros(N_TIMING_CHANNELS, W),
+            "valid_mask": torch.zeros(W),
+            "difficulty": torch.tensor(0.0),
+            "style":      torch.tensor(STYLE_NULL, dtype=torch.long),
             "avg_nps":    torch.tensor(0.0),
             "peak_nps":   torch.tensor(0.0),
+            "motif":      torch.zeros(MOTIF_DIM),
+            "motif_mask": torch.zeros(MOTIF_DIM),
+            "local_nps":  torch.tensor(0.0),
+            "map_index":  torch.tensor(-1, dtype=torch.long),
         }
 
 
-# ---------------------------------------------------------------------------
-# Index loader
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Augmentation
+# --------------------------------------------------------------------------- #
 
-def load_index(
-    index_path: str | Path,
-    val_ratio:  float = 0.05,
-    seed:       int   = 42,
-) -> tuple[list[dict], list[dict]]:
-    index_path = Path(index_path)
-    if not index_path.exists():
-        raise FileNotFoundError(f"Index not found: {index_path}")
-    records = [
-        json.loads(line)
-        for line in index_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+def _rate_augment(
+    mel: np.ndarray,
+    chart: np.ndarray,
+    timing: np.ndarray,
+    valid_mask: np.ndarray,
+    rate: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Resample all four arrays by the same factor, then pad or crop back to width.
+
+    Chart uses nearest-neighbour so onsets stay crisp single frames; mel and
+    timing use linear because both are continuous signals.
+    """
+    W = mel.shape[1]
+    new_w = max(32, int(round(W / rate)))
+
+    def resample(arr: np.ndarray, mode: str) -> np.ndarray:
+        t = torch.from_numpy(arr).unsqueeze(0)
+        if mode == "linear":
+            out = F.interpolate(t, size=new_w, mode="linear", align_corners=False)
+        else:
+            out = F.interpolate(t, size=new_w, mode="nearest")
+        return out[0].numpy()
+
+    mel    = resample(mel,    "linear")
+    chart  = resample(chart,  "nearest")
+    timing = resample(timing, "linear")
+    valid  = resample(valid_mask[None, :], "nearest")[0]
+
+    def fit(arr: np.ndarray) -> np.ndarray:
+        if arr.shape[-1] >= W:
+            return np.ascontiguousarray(arr[..., :W])
+        pad = np.zeros(arr.shape[:-1] + (W - arr.shape[-1],), dtype=arr.dtype)
+        return np.ascontiguousarray(np.concatenate([arr, pad], axis=-1))
+
+    return fit(mel), fit(chart), fit(timing), fit(valid)
+
+
+# --------------------------------------------------------------------------- #
+# Splits
+# --------------------------------------------------------------------------- #
+
+def split_indices(
+    reader: ShardReader,
+    val_ratio: float = 0.05,
+    seed: int = 42,
+    ranked_only: bool = False,
+) -> tuple[list[int], list[int]]:
+    """
+    Split by *song*, not by map.
+
+    A beatmapset's difficulties share one audio file. Splitting by map would put
+    the Muzukashii of a song in train and its Oni in validation, so validation
+    would measure memorisation of songs the model has already heard rather than
+    generalisation to new ones -- and would report a val loss far better than
+    the real one.
+    """
+    by_song: dict[str, list[int]] = {}
+    for idx, record in enumerate(reader.records):
+        if ranked_only and not record.get("ranked", False):
+            continue
+        by_song.setdefault(record["mel_key"], []).append(idx)
+
+    songs = sorted(by_song)
     rng = random.Random(seed)
-    rng.shuffle(records)
-    n_val = max(1, int(len(records) * val_ratio))
-    return records[n_val:], records[:n_val]
+    rng.shuffle(songs)
+
+    n_val = max(1, int(len(songs) * val_ratio))
+    val_songs = set(songs[:n_val])
+
+    train_idx = [i for s in songs if s not in val_songs for i in by_song[s]]
+    val_idx   = [i for s in songs if s in val_songs     for i in by_song[s]]
+    return train_idx, val_idx
 
 
-def print_index_stats(records: list[dict], label: str = "dataset"):
-    style_names  = {0: "standard", 1: "stream", 2: "speed", 3: "tech"}
-    style_dist   = {}
-    difficulties = []
-    nps_vals     = []
+def print_split_stats(reader: ShardReader, indices: Sequence[int], label: str) -> None:
+    from taiko.data.conditioning import style_to_name
 
-    for r in records:
-        s = r.get("style_name", style_names.get(r.get("style", 0), "?"))
-        style_dist[s] = style_dist.get(s, 0) + 1
-        difficulties.append(r.get("difficulty", 0.0))
-        if r.get("avg_nps", 0) > 0:
-            nps_vals.append(r["avg_nps"])
+    if not indices:
+        print(f"{label}: empty")
+        return
 
-    print(f"{label}: {len(records)} maps")
-    for s, c in sorted(style_dist.items()):
-        pct = c / max(len(records), 1) * 100
-        print(f"  {s:10s}: {c:5d}  ({pct:.1f}%)")
-    if difficulties:
-        print(f"  SR range  : {min(difficulties):.1f} – {max(difficulties):.1f}"
-              f"  (mean {sum(difficulties)/len(difficulties):.1f})")
-    if nps_vals:
-        print(f"  NPS range : {min(nps_vals):.1f} – {max(nps_vals):.1f}"
-              f"  (mean {sum(nps_vals)/len(nps_vals):.1f})")
+    styles: dict[str, int] = {}
+    diffs, npss, songs = [], [], set()
+
+    for i in indices:
+        r = reader.records[i]
+        name = style_to_name(r.get("style", STYLE_NULL))
+        styles[name] = styles.get(name, 0) + 1
+        diffs.append(float(r.get("difficulty", 0.0)))
+        if r.get("avg_nps", 0):
+            npss.append(float(r["avg_nps"]))
+        songs.add(r["mel_key"])
+
+    ranked = sum(1 for i in indices if reader.records[i].get("ranked"))
+    print(f"{label}: {len(indices)} maps over {len(songs)} songs  ({ranked} ranked)")
+    for name, count in sorted(styles.items(), key=lambda kv: -kv[1]):
+        print(f"    {name:<10s} {count:>6d}  ({count / len(indices) * 100:5.1f}%)")
+    if diffs:
+        print(f"    SR  {min(diffs):.1f} - {max(diffs):.1f}  (mean {sum(diffs)/len(diffs):.2f})")
+    if npss:
+        print(f"    NPS {min(npss):.1f} - {max(npss):.1f}  (mean {sum(npss)/len(npss):.2f})")
+
+
+def load_reader(shard_dir: str | Path = "data/processed/shards") -> ShardReader:
+    return ShardReader(shard_dir)

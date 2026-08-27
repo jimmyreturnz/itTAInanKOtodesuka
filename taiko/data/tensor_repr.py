@@ -130,23 +130,31 @@ def _red_line_segments(
 def build_timing_stream(
     timing_points: list[TimingPoint],
     n_frames: int,
+    start_frame: int = 0,
 ) -> np.ndarray:
     """
     Build the [3, T] conditioning stream from a map's timing points.
 
     Phase is measured from each red line's own offset, so a mid-map tempo
     change restarts the grid exactly where osu! restarts it.
+
+    Args:
+        n_frames:    length of the stream to produce
+        start_frame: absolute frame the stream begins at. Building a window
+                     directly is exact and costs nothing, which is what lets
+                     the dataset store a handful of timing points per map
+                     instead of a dense [3, T] array per map.
     """
     stream = np.zeros((N_TIMING_CHANNELS, n_frames), dtype=np.float32)
     if n_frames <= 0:
         return stream
 
-    total_ms = n_frames * FRAME_MS
-    frame_ms = np.arange(n_frames, dtype=np.float64) * FRAME_MS
+    total_ms = (start_frame + n_frames) * FRAME_MS
+    frame_ms = (np.arange(n_frames, dtype=np.float64) + start_frame) * FRAME_MS
 
     for start_ms, end_ms, ms_per_beat, meter in _red_line_segments(timing_points, total_ms):
-        lo = max(0, int(np.floor(start_ms / FRAME_MS)))
-        hi = min(n_frames, int(np.ceil(end_ms / FRAME_MS)))
+        lo = max(0, int(np.floor(start_ms / FRAME_MS)) - start_frame)
+        hi = min(n_frames, int(np.ceil(end_ms / FRAME_MS)) - start_frame)
         if hi <= lo or ms_per_beat <= 0:
             continue
 
@@ -167,6 +175,7 @@ def timing_stream_from_bpm(
     offset_ms: float,
     n_frames: int,
     meter: int = DEFAULT_METER,
+    start_frame: int = 0,
 ) -> np.ndarray:
     """
     Build the timing stream at inference, from a single detected or
@@ -180,7 +189,7 @@ def timing_stream_from_bpm(
         meter=max(1, meter),
         uninherited=True,
     )
-    return build_timing_stream([tp], n_frames)
+    return build_timing_stream([tp], n_frames, start_frame=start_frame)
 
 
 # --------------------------------------------------------------------------- #
