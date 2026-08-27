@@ -1,7 +1,57 @@
 # tAIkoMapper — Development Direction
 
 **Goal:** MuG-Diffusion-class osu!taiko chart generation with controllable difficulty and
-style, trained on Kaggle 2×T4.
+style, trained on Kaggle 2x T4.
+
+---
+
+## Status
+
+Phases 0-2 of the plan below are implemented. Phase 3 is the long training run,
+which needs GPU time rather than code.
+
+| Item | State |
+|---|---|
+| 2.1 mel/chart misalignment | fixed; `frames.py` owns the grid, `tests/test_dataset.py` proves it |
+| 2.2 audio encoder resolutions | fixed; strided stem to latent resolution, one level per U-Net level |
+| 2.3 drumroll durations | fixed; resolved against red and green lines |
+| 3.1 beat grid as input | done; 3-channel sin/cos phase conditioning stream |
+| 3.2 motif leakage | mitigated; quantised to 8 buckets, per-dimension dropout, leakage probe in `evaluate.py` |
+| 3.3 classifier-free guidance | fixed; learned null embedding, `STYLE_NULL`, dropout 0.15, stratified |
+| 3.4 EMA and latent scale | done; EMA 0.9995, `calibrate_scale()` stored as a buffer |
+| 3.5 windowed inference | done; MultiDiffusion in `taiko/model/sampling.py` |
+| 4.1 DataParallel | fixed; loss lives in `forward()` |
+| 4.2 fp16 | on by default |
+| 4.3 dead encoder levels | structurally impossible; `DiffusionProfile.validate()` |
+| 4.4 data loading | packed shards: fp16 mel memmap, sparse chart events |
+| 4.5 broken scripts | rewritten |
+| 5 evaluation harness | `taiko/eval/metrics.py`, `scripts/evaluate.py` |
+| Phase 3 | **not started** -- needs 150-250 GPU-hours |
+| Phase 4 controllability | presets and reference-chart style transfer done; subdivision mask and difficulty envelope outstanding |
+
+Found and fixed while implementing, beyond the original review:
+
+- **Serializer wrote big kats as hitsound 10** (WHISTLE|CLAP), which carries no
+  FINISH bit -- every big kat in a generated map came back an ordinary kat.
+- **Serializer wrote drumroll extent in milliseconds** where osu! stores a pixel
+  length: the same units confusion as the parser bug, inverted.
+- **`apply_timing_refinement` re-fitted BPM from generated notes**, overriding the
+  grid the chart was generated against. Supplying 150 BPM produced a map re-timed
+  to 200.
+- **Window sizes not divisible by the compression ratio** lose their tail: 1500
+  frames at 16x decodes back to 1488, and the gap lands on the loss in every sample.
+- **`pos_weight` breaks probability calibration.** At a fixed 0.5 threshold the
+  autoencoder over-predicts by roughly the weight factor. The threshold is now
+  swept on validation and stored in the checkpoint.
+- **torchaudio's mel referenced 1.0 rather than the clip peak**, so it tracked mix
+  loudness and disagreed with the librosa fallback.
+
+Verified end to end on a synthetic corpus (pack, both training stages, evaluate,
+generate a `.osz`): onset F1 0.974, mean timing error 0.05 ms, snap validity 1.000,
+zero unplayable patterns. That is a trivially easy corpus -- it demonstrates the
+machinery is correct, not that the model is good.
+
+---
 
 **Status assessment:** the architecture is the right one. The wiring between its parts is
 not. There are three defects that each independently prevent the model from learning
