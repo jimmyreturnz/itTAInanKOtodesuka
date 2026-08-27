@@ -1,5 +1,11 @@
 """Quick tests for Mug-style timing refinement."""
 
+from __future__ import annotations
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import numpy as np
 
 from taiko.data.osu_parser import TaikoBeatmap, TaikoNote
