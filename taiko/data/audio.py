@@ -59,10 +59,18 @@ def _load_librosa(path: str | Path) -> tuple[np.ndarray, int]:
 
 
 def load_audio(path: str | Path) -> tuple[np.ndarray, int]:
-    """Load audio file → (mono float32 waveform, sample_rate)."""
+    """
+    Load audio file -> (mono float32 waveform, sample_rate).
+
+    Falls back to librosa on any torchaudio failure, not just ImportError.
+    osu! song folders are full of mp3s with damaged headers and odd codecs, and
+    torchaudio raises "Unspecified internal error" on them; librosa decodes most
+    of those fine. Catching only ImportError meant the fallback existed but
+    never ran for the case that actually occurs, losing ~1% of the corpus.
+    """
     try:
         return _load_torchaudio(path)
-    except ImportError:
+    except Exception:                                          # noqa: BLE001
         return _load_librosa(path)
 
 
