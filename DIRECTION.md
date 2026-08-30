@@ -68,6 +68,20 @@ beyond step 1. Start it, then write the rest while it runs.
 1. **`pack_dataset.py --ranked-only`.** It already stores the flag at line 448; it just cannot filter on it. (D2)
 2. **Start packing.** 2–5 h unattended CPU.
 
+### Blocked: getting the shards onto Kaggle
+
+The pack is done and correct locally (11,106 maps, 6.69 GB `mels.dat`). Upload is
+the open problem: a single 6.7 GB transfer over an AIS mobile hotspot failed
+after 80 minutes, having pushed 12.2 GB — 82% retransmission — then lost the
+final `CreateDataset` call to SSL handshake failures. The dataset registered
+with only `charts.npz` and `index.json`; **`taiko-shards` v1 is 13 MB and
+unusable**.
+
+Retry either on a stable wired connection (single upload, simplest), or by
+splitting `mels.dat` into ~500 MB parts so a dropout costs one part rather than
+the whole transfer, with the notebook concatenating them at session start.
+Do not re-pack — the mel cache and shards are intact on disk.
+
 ### While the packer runs — unblocks the rehearsal
 3. **Fix the dead branch.** `notebooks/kaggle_train.ipynb` cell 2 and `docs/MANUAL.md` both `git clone --branch claude/osu-taiko-chart-generation-4tkieb`. That branch no longer exists on the remote — only `main` does. **The first Kaggle session dies at cell 2.**
 4. **`torch.backends.cudnn.benchmark = True`** in both training scripts. Missing; 5–15% on fixed-shape convs for one line.
