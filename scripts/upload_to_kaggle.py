@@ -25,7 +25,11 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_SHARDS = Path("data/processed/shards")
+# Relative to the repo, not the shell's cwd -- otherwise running this from a
+# parent directory silently looks for the shards somewhere they cannot be, and
+# reports them missing.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_SHARDS = REPO_ROOT / "data" / "processed" / "shards"
 REQUIRED = ("mels.dat", "charts.npz", "index.json")
 
 
@@ -113,10 +117,23 @@ def main() -> int:
     ref = f"{args.owner}/{args.slug}"
     shards = args.shards
 
+    shards = shards.resolve()
     missing = [n for n in REQUIRED if not (shards / n).exists()]
     if missing:
         print(f"ERROR: {shards} is missing {', '.join(missing)}")
-        print("  Run: python scripts/pack_dataset.py --ranked-only")
+        if not shards.exists():
+            print("  That folder does not exist. Pack the dataset first:")
+            print("    python scripts/pack_dataset.py --ranked-only")
+        else:
+            print("  Pack the dataset first, or point --shards at it.")
+        return 1
+
+    try:
+        import kaggle                                          # noqa: F401
+    except ImportError:
+        print(f"ERROR: the `kaggle` package is not installed for {sys.executable}")
+        print("  Either install it here:  pip install kaggle")
+        print("  or use the interpreter that has it (your global Python 3.11).")
         return 1
 
     api = get_api()
