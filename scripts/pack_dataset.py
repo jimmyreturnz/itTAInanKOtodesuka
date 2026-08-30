@@ -246,12 +246,13 @@ def save_beatmapset_cache(cache: dict) -> None:
 # osu! API v1 `approved`: 1 ranked, 2 approved, 3 qualified, 4 loved,
 # 0 pending, -1 wip, -2 graveyard.
 #
-# Loved and qualified are deliberately excluded (DIRECTION.md D2). Loved is a
-# popularity vote, not a quality bar, and carries gimmick and SV-abuse maps --
-# star rating cannot filter them out because star rating is what they inflate:
-# a loved map in the first pack scored 18.16* on 8.81 nps, less dense than the
-# genuine 11* charts beneath it. Qualified is not final and can be disqualified.
-RANKED_APPROVED = ("1", "2")
+# Ranked and nothing else (DIRECTION.md D2). Loved is a popularity vote, not a
+# quality bar, and carries gimmick and SV-abuse maps -- star rating cannot
+# filter them out because star rating is what they inflate: a loved map in the
+# first pack scored 18.16* on 8.81 nps, less dense than the genuine 11* charts
+# beneath it. Qualified is not final and can be disqualified. Approved is the
+# legacy marathon status; it is ranked-grade, but "ranked" is the line drawn.
+RANKED_APPROVED = ("1",)
 
 APPROVED_NAMES = {
     "-2": "graveyard", "-1": "wip", "0": "pending",
@@ -298,13 +299,13 @@ def fetch_beatmapset(set_id: int, cache: dict, session, api_key: str) -> dict | 
 
 
 def is_ranked(entry) -> bool:
-    """Ranked or approved. Reads `approved` where present, else `approved_str`."""
+    """Ranked only. Reads `approved` where present, else `approved_str`."""
     if not isinstance(entry, dict):
         return False
     approved = entry.get("approved")
     if approved is not None:
         return str(approved) in RANKED_APPROVED
-    return entry.get("approved_str") in ("ranked", "approved")
+    return entry.get("approved_str") == "ranked"
 
 
 def _sr_value(raw) -> float:
