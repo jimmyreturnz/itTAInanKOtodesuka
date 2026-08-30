@@ -409,6 +409,15 @@ def main() -> int:
         by_folder[path.parent].append(path)
     print(f"{len(by_folder)} beatmapset folders")
 
+    # populate_beatmapset_cache.py reads .env; this did not, so a key kept there
+    # was silently ignored and every uncached set was dropped as "no star rating".
+    if not args.no_api and not os.environ.get("OSU_API_KEY"):
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(Path(__file__).parent.parent / ".env")
+        except ImportError:
+            pass
+
     api_key = None if args.no_api else os.environ.get("OSU_API_KEY")
     session = requests.Session() if (api_key and requests) else None
     if api_key and not requests:
