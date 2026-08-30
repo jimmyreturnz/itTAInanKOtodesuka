@@ -243,6 +243,12 @@ def save_beatmapset_cache(cache: dict) -> None:
     BEATMAPSET_CACHE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
 
 
+APPROVED_NAMES = {
+    "-2": "graveyard", "-1": "wip", "0": "pending",
+    "1": "ranked", "2": "approved", "3": "qualified", "4": "loved",
+}
+
+
 def fetch_beatmapset(set_id: int, cache: dict, session, api_key: str) -> dict | None:
     key = str(set_id)
     if key in cache:
@@ -267,8 +273,12 @@ def fetch_beatmapset(set_id: int, cache: dict, session, api_key: str) -> dict | 
     entry = {
         "approved": approved,
         "ranked": approved in ("1", "2", "3", "4"),
+        "approved_str": APPROVED_NAMES.get(approved, approved),
         "difficulties": {
-            str(d.get("beatmap_id", "")): float(d.get("difficultyrating", 0.0))
+            str(d.get("beatmap_id", "")): {
+                "sr": float(d.get("difficultyrating", 0.0)),
+                "version": d.get("version", ""),
+            }
             for d in data if d.get("beatmap_id")
         },
     }
@@ -277,14 +287,68 @@ def fetch_beatmapset(set_id: int, cache: dict, session, api_key: str) -> dict | 
     return entry
 
 
+def _sr_value(raw) -> float:
+    """
+    Star rating out of either cache layout.
+
+    populate_beatmapset_cache.py writes {"sr": float, "version": str} per
+    difficulty; older entries here wrote a bare float. Reading the dict form
+    with float() raises TypeError, which is uncaught and kills pass 2 on the
+    first cached ranked map, so both layouts are accepted.
+    """
+    if isinstance(raw, dict):
+        raw = raw.get("sr", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def star_rating_for(bm, cache: dict, session, api_key: str) -> tuple[float, bool]:
     entry = cache.get(str(bm.beatmap_set_id))
     if entry is None and api_key:
         entry = fetch_beatmapset(bm.beatmap_set_id, cache, session, api_key)
     if not isinstance(entry, dict):
         return 0.0, False
-    sr = float(entry.get("difficulties", {}).get(str(bm.beatmap_id), 0.0))
+    sr = _sr_value(entry.get("difficulties", {}).get(str(bm.beatmap_id)))
     return sr, bool(entry.get("ranked", False))
+
+
+def _set_id_from_header(path) -> int:
+    """BeatmapSetID without a full parse -- it sits in [Metadata], near the top."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for _ in range(80):
+                line = fh.readline()
+                if not line or line.startswith("[HitObjects]"):
+                    break
+                if line.startswith("BeatmapSetID:"):
+                    return int(line.split(":", 1)[1].strip() or -1)
+    except Exception:                                          # noqa: BLE001
+        pass
+    return -1
+
+
+def drop_unranked_folders(by_folder: dict, cache: dict) -> int:
+    """
+    Drop folders that contain no ranked map, before mel extraction pays for them.
+
+    Only the cache is consulted, and a folder whose sets it does not know is
+    kept -- pass 2 makes the real decision once the map is parsed and the API
+    can be asked. This is an optimisation, never the filter of record.
+    """
+    dropped = 0
+    for folder in list(by_folder):
+        keep = False
+        for path in by_folder[folder]:
+            entry = cache.get(str(_set_id_from_header(path)))
+            if not isinstance(entry, dict) or entry.get("ranked"):
+                keep = True          # unknown or ranked -- pass 2 decides
+                break
+        if not keep:
+            del by_folder[folder]
+            dropped += 1
+    return dropped
 
 
 # --------------------------------------------------------------------------- #
@@ -301,6 +365,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=None,
                     help="Only process this many maps. Use a small number first.")
     ap.add_argument("--no-api", action="store_true", help="Never call the osu! API")
+    ap.add_argument("--ranked-only", action="store_true",
+                    help="pack only ranked maps (D2 -- unranked carries rate-ups, "
+                         "which pair one chart with differently-timed audio)")
     ap.add_argument("--keep-unrated", action="store_true",
                     help="Keep maps with no known star rating (not recommended)")
     args = ap.parse_args()
@@ -349,6 +416,11 @@ def main() -> int:
     cache = load_beatmapset_cache()
     print(f"Beatmapset cache: {len(cache)} entries"
           f"{'  (API enabled)' if api_key else '  (offline)'}")
+
+    if args.ranked_only:
+        dropped = drop_unranked_folders(by_folder, cache)
+        print(f"ranked-only: {dropped} folders hold no ranked map, skipping their "
+              f"mel extraction ({len(by_folder)} folders remain)")
 
     # ---- pass 1: mels ---------------------------------------------------- #
     args.mel_cache.mkdir(parents=True, exist_ok=True)
@@ -428,6 +500,9 @@ def main() -> int:
                     continue
 
                 sr, ranked = star_rating_for(bm, cache, session, api_key)
+                if args.ranked_only and not ranked:
+                    skipped["not ranked"] += 1
+                    continue
                 if sr <= 0 and not args.keep_unrated:
                     skipped["no star rating"] += 1
                     continue

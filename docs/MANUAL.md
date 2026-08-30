@@ -33,7 +33,7 @@ On your PC:
 ```bash
 git clone https://github.com/jimmyreturnz/itTAInanKOtodesuka.git
 cd itTAInanKOtodesuka
-git checkout claude/osu-taiko-chart-generation-4tkieb
+git checkout main
 pip install -r requirements.txt
 ```
 
@@ -71,14 +71,20 @@ export OSU_API_KEY=your_key_here
 ## 1. Pack the dataset (your PC)
 
 ```bash
-python scripts/pack_dataset.py --scan "D:/osu!/Songs"
+python scripts/pack_dataset.py --scan "D:/osu!/Songs" --ranked-only
 ```
+
+`--ranked-only` is the corpus decision from `DIRECTION.md` (D2): unranked maps
+include rate-ups, which pair one chart with differently-timed audio and are
+anti-signal for exactly the alignment Gate B measures, plus gimmick maps that
+star rating cannot filter out. Folders holding no ranked map are skipped before
+mel extraction, which is about a fifth of the packing time.
 
 Try a small run first — it takes a minute and shows you whether anything is
 wrong before you commit to a few hours:
 
 ```bash
-python scripts/pack_dataset.py --scan "D:/osu!/Songs" --limit 200
+python scripts/pack_dataset.py --scan "D:/osu!/Songs" --ranked-only --limit 200
 ```
 
 What it does:
@@ -93,7 +99,7 @@ PC sleeps), re-running picks up where it stopped. Re-running with no `--scan`
 reuses the cached file list:
 
 ```bash
-python scripts/pack_dataset.py
+python scripts/pack_dataset.py --ranked-only
 ```
 
 Expect roughly 2-5 hours for 13k maps, almost all of it in mel extraction.

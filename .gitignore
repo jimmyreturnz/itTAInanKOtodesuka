@@ -21,7 +21,9 @@ data/processed/
 # Dataset caches
 *.json
 data/tmp_osz/
-data/unranked_review.csv
+
+# Generated maps
+outputs/
 
 # OS files
 .DS_Store
@@ -33,12 +35,6 @@ Thumbs.db
 # Downloading More Maps
 scripts/download_maps.py
 
-# Diffusion Training Notebook
-taiko_diffusion_colab.ipynb
-
 # notes
 CLAUDE.md
 Mug-Diffusion.md
-
-# github repomix
-node_modules

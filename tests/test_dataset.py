@@ -27,6 +27,11 @@ from taiko.data.tensor_repr import (
 
 W = 384          # a multiple of 64, as WindowedDataset requires
 
+# ponytail: TemporaryDirectory(ignore_cleanup_errors=True) everywhere below --
+# ShardReader holds an np.memmap on mels.dat and never releases it, so Windows
+# refuses to delete the temp dir. Give ShardReader a close()/context manager if
+# anything ever needs to repack shards in a live process.
+
 
 def _decode_frames(mel: np.ndarray) -> np.ndarray:
     """Read the absolute frame index back out of the probe mel."""
@@ -83,7 +88,7 @@ def test_mel_and_chart_describe_the_same_frames():
     frames the chart window covers. The old `start * 2` bug fails this by a
     factor of two.
     """
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp)
         ds = WindowedDataset(reader, window_frames=W, random_window=True,
                              augment=False, samples_per_epoch=64, seed=7)
@@ -114,7 +119,7 @@ def test_mel_and_chart_describe_the_same_frames():
 
 
 def test_shapes_and_dtypes():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         ds = WindowedDataset(_build(tmp), window_frames=W, samples_per_epoch=4)
         s = ds[0]
         assert s["mel"].shape    == (MEL_BINS, W)
@@ -130,7 +135,7 @@ def test_shapes_and_dtypes():
 
 def test_timing_stream_tracks_the_window():
     """The beat grid must describe the window's own frames, not frame zero."""
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp)
         ds = WindowedDataset(reader, window_frames=W, random_window=True,
                              augment=False, samples_per_epoch=32, seed=3)
@@ -143,7 +148,7 @@ def test_timing_stream_tracks_the_window():
 
 
 def test_samples_per_epoch_controls_length():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp)
         assert len(WindowedDataset(reader, window_frames=W)) == len(reader)
         assert len(WindowedDataset(reader, window_frames=W, samples_per_epoch=5000)) == 5000
@@ -151,7 +156,7 @@ def test_samples_per_epoch_controls_length():
 
 
 def test_eval_mode_is_deterministic():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp)
         ds = WindowedDataset(reader, window_frames=W, random_window=False, augment=False)
         for i in (0, 3, 7):
@@ -161,7 +166,7 @@ def test_eval_mode_is_deterministic():
 
 
 def test_training_mode_moves_the_window():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp)
         ds = WindowedDataset(reader, window_frames=W, random_window=True,
                              augment=False, samples_per_epoch=40, seed=11)
@@ -201,7 +206,7 @@ def test_rate_augmentation_keeps_everything_in_step():
 def test_valid_mask_marks_the_tail():
     # A chart shorter than the window is the only case that can overrun: for
     # longer charts the sampler bounds the start so the window always fits.
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp, length=300)
         ds = WindowedDataset(reader, window_frames=W, random_window=True,
                              augment=False, samples_per_epoch=20, seed=5)
@@ -215,7 +220,7 @@ def test_valid_mask_marks_the_tail():
 
 def test_window_never_starts_past_the_last_note():
     """Sampling into the silent tail wastes a training step on nothing."""
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp, length=4000)
         ds = WindowedDataset(reader, window_frames=W, random_window=True,
                              augment=False, samples_per_epoch=50, seed=9)
@@ -227,7 +232,7 @@ def test_window_never_starts_past_the_last_note():
 
 
 def test_motif_is_corrupted_only_when_augmenting():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp)
 
         clean = WindowedDataset(reader, window_frames=W, augment=False, samples_per_epoch=10)
@@ -246,7 +251,7 @@ def test_split_is_by_song_not_by_map():
     Difficulties of one song share audio; letting them straddle the split turns
     validation into a memorisation check.
     """
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp, n_songs=10, diffs_per_song=3)
         train, val = split_indices(reader, val_ratio=0.3, seed=1)
 
@@ -258,7 +263,7 @@ def test_split_is_by_song_not_by_map():
 
 
 def test_ranked_only_filter():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp, n_songs=10)
         train, val = split_indices(reader, val_ratio=0.2, ranked_only=True)
         for i in train + val:
@@ -267,7 +272,7 @@ def test_ranked_only_filter():
 
 
 def test_conditioning_is_normalised():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         ds = WindowedDataset(_build(tmp), window_frames=W, augment=False, samples_per_epoch=12)
         for i in range(12):
             s = ds[i]
@@ -280,7 +285,7 @@ def test_conditioning_is_normalised():
 
 def test_batches_collate():
     from torch.utils.data import DataLoader
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         ds = WindowedDataset(_build(tmp), window_frames=W, augment=True, samples_per_epoch=16)
         batch = next(iter(DataLoader(ds, batch_size=4, num_workers=0)))
         assert batch["mel"].shape == (4, MEL_BINS, W)

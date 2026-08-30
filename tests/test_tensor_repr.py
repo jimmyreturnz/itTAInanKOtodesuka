@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import tempfile
 import numpy as np
 
 from taiko.data.frames import FRAME_MS, ms_to_frame
@@ -212,12 +213,14 @@ def test_short_long_notes_are_discarded():
     print("  sub-threshold longs cut   ok")
 
 
-def test_legacy_seven_channel_load(tmp="/tmp/_legacy_taiko.npz"):
+def test_legacy_seven_channel_load():
     """Old 7-channel tensors must still load, minus the retired beat channel."""
     from taiko.data.tensor_repr import load_tensors
     legacy = np.random.rand(7, 300).astype(np.float32)
-    np.savez_compressed(tmp, tensor=legacy)
-    chart, timing = load_tensors(tmp)
+    with tempfile.TemporaryDirectory() as d:
+        tmp = str(Path(d) / "legacy.npz")
+        np.savez_compressed(tmp, tensor=legacy)
+        chart, timing = load_tensors(tmp)
     assert chart.shape == (6, 300)
     assert timing.shape == (3, 300)
     assert np.allclose(chart, legacy[:6])

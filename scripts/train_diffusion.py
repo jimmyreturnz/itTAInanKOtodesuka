@@ -133,6 +133,10 @@ def main() -> int:
     lr = args.lr or profile.lr
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Every batch is the same shape, so let cuDNN pick its fastest kernels
+    # once instead of re-deciding per call. 5-15% on a conv-dominated run.
+    torch.backends.cudnn.benchmark = True
     n_gpus = 0 if device.type == "cpu" else (1 if args.single_gpu else torch.cuda.device_count())
     use_fp16 = args.fp16 and device.type == "cuda"
 

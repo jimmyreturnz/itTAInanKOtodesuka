@@ -90,7 +90,7 @@ def test_full_pack_round_trip():
         TimingPoint(time=25_000, beat_length=-50.0, meter=4, uninherited=False),  # ignored
     ]
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         with ShardWriter(tmp) as w:
             w.add_mel("song", mel)
             w.add_map({"difficulty": 5.2, "style": 1}, chart_a, points, "song")
@@ -128,7 +128,7 @@ def test_full_pack_round_trip():
 def test_reader_rejects_a_stale_frame_rate():
     """A dataset packed on a different time grid must refuse to load."""
     import json
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         with ShardWriter(tmp) as w:
             w.add_mel("s", np.zeros((MEL_BINS, 100), dtype=np.float32))
             w.add_map({}, np.zeros((N_CHART_CHANNELS, 100), dtype=np.float32), [], "s")
@@ -147,7 +147,7 @@ def test_reader_rejects_a_stale_frame_rate():
 
 
 def test_missing_dataset_says_what_to_run():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         try:
             ShardReader(tmp)
         except FileNotFoundError as e:
