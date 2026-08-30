@@ -243,6 +243,16 @@ def save_beatmapset_cache(cache: dict) -> None:
     BEATMAPSET_CACHE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
 
 
+# osu! API v1 `approved`: 1 ranked, 2 approved, 3 qualified, 4 loved,
+# 0 pending, -1 wip, -2 graveyard.
+#
+# Loved and qualified are deliberately excluded (DIRECTION.md D2). Loved is a
+# popularity vote, not a quality bar, and carries gimmick and SV-abuse maps --
+# star rating cannot filter them out because star rating is what they inflate:
+# a loved map in the first pack scored 18.16* on 8.81 nps, less dense than the
+# genuine 11* charts beneath it. Qualified is not final and can be disqualified.
+RANKED_APPROVED = ("1", "2")
+
 APPROVED_NAMES = {
     "-2": "graveyard", "-1": "wip", "0": "pending",
     "1": "ranked", "2": "approved", "3": "qualified", "4": "loved",
@@ -272,7 +282,7 @@ def fetch_beatmapset(set_id: int, cache: dict, session, api_key: str) -> dict | 
     approved = str(data[0].get("approved", "0"))
     entry = {
         "approved": approved,
-        "ranked": approved in ("1", "2", "3", "4"),
+        "ranked": approved in RANKED_APPROVED,
         "approved_str": APPROVED_NAMES.get(approved, approved),
         "difficulties": {
             str(d.get("beatmap_id", "")): {
@@ -285,6 +295,16 @@ def fetch_beatmapset(set_id: int, cache: dict, session, api_key: str) -> dict | 
     cache[key] = entry
     time.sleep(API_DELAY)
     return entry
+
+
+def is_ranked(entry) -> bool:
+    """Ranked or approved. Reads `approved` where present, else `approved_str`."""
+    if not isinstance(entry, dict):
+        return False
+    approved = entry.get("approved")
+    if approved is not None:
+        return str(approved) in RANKED_APPROVED
+    return entry.get("approved_str") in ("ranked", "approved")
 
 
 def _sr_value(raw) -> float:
@@ -311,7 +331,7 @@ def star_rating_for(bm, cache: dict, session, api_key: str) -> tuple[float, bool
     if not isinstance(entry, dict):
         return 0.0, False
     sr = _sr_value(entry.get("difficulties", {}).get(str(bm.beatmap_id)))
-    return sr, bool(entry.get("ranked", False))
+    return sr, is_ranked(entry)
 
 
 def _set_id_from_header(path) -> int:
@@ -342,7 +362,7 @@ def drop_unranked_folders(by_folder: dict, cache: dict) -> int:
         keep = False
         for path in by_folder[folder]:
             entry = cache.get(str(_set_id_from_header(path)))
-            if not isinstance(entry, dict) or entry.get("ranked"):
+            if not isinstance(entry, dict) or is_ranked(entry):
                 keep = True          # unknown or ranked -- pass 2 decides
                 break
         if not keep:
