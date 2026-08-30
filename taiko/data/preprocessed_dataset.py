@@ -24,7 +24,8 @@ Augmentation
 ------------
 Rate augmentation resamples mel, chart and timing together. Stretching time
 stretches the beat grid with it, so the timing stream stays truthful about the
-augmented audio -- resampling the sin/cos phasor is exactly right, which is one
+augmented audio -- resampling the sin/cos phasor is right once its radius is
+restored (see _rate_augment), which is one
 more reason to carry phase rather than a pulse train.
 """
 
@@ -49,7 +50,7 @@ from taiko.data.motif import (
 )
 from taiko.data.shards import MEL_BINS, ShardReader
 from taiko.data.tensor_repr import (
-    N_CHART_CHANNELS, N_TIMING_CHANNELS, ONSET_CHANNELS,
+    N_CHART_CHANNELS, N_TIMING_CHANNELS, ONSET_CHANNELS, TM_COS, TM_SIN,
 )
 
 # Window sizes in frames (20 ms each).
@@ -269,6 +270,14 @@ def _rate_augment(
 
     Chart uses nearest-neighbour so onsets stay crisp single frames; mel and
     timing use linear because both are continuous signals.
+
+    The timing phasor then needs renormalising. Linear interpolation between two
+    points on the unit circle traces the chord rather than the arc, so the radius
+    collapses toward the origin between samples -- by cos(dtheta/2), which at
+    150 BPM is a 2.5% error every frame. That silently gave the model a beat grid
+    of wobbling magnitude on the 20% of samples this fires for, while inference
+    always supplies an exact one. The angle survives interpolation to second
+    order; only the length has to be put back.
     """
     W = mel.shape[1]
     new_w = max(32, int(round(W / rate)))
@@ -284,6 +293,11 @@ def _rate_augment(
     mel    = resample(mel,    "linear")
     chart  = resample(chart,  "nearest")
     timing = resample(timing, "linear")
+    radius = np.sqrt(timing[TM_SIN] ** 2 + timing[TM_COS] ** 2)
+    ok = radius > 1e-6
+    timing[TM_SIN] = np.where(ok, timing[TM_SIN] / np.where(ok, radius, 1.0), 0.0)
+    timing[TM_COS] = np.where(ok, timing[TM_COS] / np.where(ok, radius, 1.0), 0.0)
+
     valid  = resample(valid_mask[None, :], "nearest")[0]
 
     def fit(arr: np.ndarray) -> np.ndarray:

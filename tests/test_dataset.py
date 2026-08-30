@@ -231,6 +231,34 @@ def test_window_never_starts_past_the_last_note():
         print("  windows stay in the chart ok")
 
 
+def test_timing_phasor_stays_on_the_unit_circle():
+    """
+    sin/cos must satisfy sin^2 + cos^2 == 1 on every frame the mask counts.
+
+    Rate augmentation resamples the timing stream, and linear interpolation
+    between two points on a circle traces the chord: the radius collapses
+    toward the origin between samples. That gave the model a beat grid of
+    wobbling magnitude during training while inference always supplied an exact
+    one, and nothing else in the suite could see it.
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        reader = _build(tmp)
+        for augment in (False, True):
+            ds = WindowedDataset(reader, window_frames=W, random_window=True,
+                                 augment=augment, samples_per_epoch=48, seed=4)
+            for i in range(24):
+                s = ds[i]
+                timing = s["timing"].numpy()
+                valid = s["valid_mask"].numpy().astype(bool)
+                radius = timing[0] ** 2 + timing[1] ** 2
+                off = ~np.isclose(radius, 1.0, atol=1e-3) & valid
+                assert not off.any(), (
+                    f"augment={augment}: {off.sum()} valid frames off the unit "
+                    f"circle, min radius {np.sqrt(radius[valid]).min():.4f}"
+                )
+    print("  timing phasor on unit circle ok")
+
+
 def test_motif_is_corrupted_only_when_augmenting():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp)
