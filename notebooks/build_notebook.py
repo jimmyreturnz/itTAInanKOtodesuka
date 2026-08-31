@@ -174,7 +174,72 @@ print(f"\\nPeak at lag {peak:+d}: audio and charts agree to within one 20 ms fra
 """),
 
 md("""
-## 3. Stage 1 — autoencoder
+## 3. Run configuration
+
+Every later cell reads these, so they live here rather than inside the stage 1
+cell -- otherwise skipping stage 1 takes `CKPT` and `PROFILE` down with it.
+"""),
+code("""
+# D4 called for a full rehearsal on "tiny" before committing to p1, because
+# nothing had run on real data. Most of what it was meant to shake out is now
+# proven -- mel cache, memmap on Kaggle disk, DataParallel, alignment, Gate A --
+# and p1 measures 23.7 samples/s against tiny's 29, so the rehearsal no longer
+# saves much. p1 keeps its weights; tiny throws them away. Set "tiny" here if
+# you would still rather test the resume loop on weights you can afford to lose.
+PROFILE = "p1"                         # "tiny" = rehearsal, "p1" = the real run
+
+CKPT = Path("/kaggle/working/checkpoints")
+CKPT.mkdir(parents=True, exist_ok=True)
+AE_BEST = CKPT / "autoencoder" / "best.pt"
+
+print(f"profile {PROFILE}  checkpoints {CKPT}")
+print(f"autoencoder {'present' if AE_BEST.exists() else 'not yet trained'}")
+"""),
+
+md("""
+## 4. Resume from an earlier session
+
+Kaggle deletes `/kaggle/working` when a session ends, so a later session starts
+with nothing. Attach the checkpoint dataset you saved and run this: it copies
+the read-only files into the writable working directory, where stage 1 sees an
+autoencoder to skip and stage 2 sees a `last.pt` to resume from.
+
+Nothing restored is the correct output on a first run.
+"""),
+code("""
+# Copy read-only checkpoints from /kaggle/input into the writable working dir.
+import os, shutil
+
+CKPT = Path("/kaggle/working/checkpoints")
+CKPT.mkdir(parents=True, exist_ok=True)
+
+# Same symlink trap as the dataset search: os.walk, not rglob.
+restored = 0
+for root, _dirs, files in os.walk("/kaggle/input", followlinks=True):
+    for name in files:
+        source = Path(root) / name
+        if not name.endswith(".pt"):
+            continue
+        # Substring on the whole path, not exact path parts: a dataset may
+        # arrive as autoencoder/best.pt, as taiko-autoencoder/best.pt, or
+        # flattened. Matching parts only worked for the first, and failed
+        # silently by restoring nothing.
+        where = str(source).lower()
+        if "autoencoder" not in where and "diffusion" not in where:
+            continue
+        stage = "autoencoder" if "autoencoder" in where else "diffusion"
+        target = CKPT / stage / source.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        restored += 1
+        print(f"  restored {stage}/{source.name}")
+
+print(f"{restored} checkpoints restored" if restored else
+      "Nothing restored -- attach your checkpoint dataset first.")
+"""),
+
+md("""
+## 5. Stage 1 — autoencoder
 
 Roughly 6-10 GPU-hours. Compresses charts into the latent space the diffusion
 model works in.
@@ -185,13 +250,7 @@ will not clear at 16x, drop one entry from `--channel-mult` for 8x and retrain.
 A first stage that loses notes caps everything downstream permanently.
 """),
 code("""
-# D4: run the whole pipeline at "tiny" once on real data before committing
-# to p1. Gate A is meaningful at tiny; Gate B is advisory only.
-PROFILE = "tiny"                       # "tiny" = rehearsal, "p1" = the real run
-REHEARSAL = PROFILE == "tiny"
-
-CKPT = Path("/kaggle/working/checkpoints")
-CKPT.mkdir(parents=True, exist_ok=True)
+import subprocess
 
 AE_ARGS = [
     "--shards", str(SHARDS),
@@ -211,11 +270,18 @@ if (CKPT / "autoencoder" / "last.pt").exists():
     AE_ARGS += ["--resume", str(CKPT / "autoencoder" / "last.pt")]
     print("resuming the autoencoder")
 
-!python scripts/train_autoencoder.py {" ".join(AE_ARGS)}
+# Restored from a checkpoint dataset, or trained earlier in this session: there
+# is nothing to do. Gate A is a property of the file, not of this run.
+if AE_BEST.exists():
+    print(f"{AE_BEST} already exists -- skipping stage 1.")
+    print("Delete it, or the whole checkpoints/autoencoder folder, to retrain.")
+else:
+    subprocess.run([sys.executable, "scripts/train_autoencoder.py", *AE_ARGS],
+                   check=True)
 """),
 
 md("""
-## 4. Stage 2 — diffusion
+## 6. Stage 2 — diffusion
 
 The long one: 150-250 GPU-hours, so about 15-25 sessions. `--max-hours 11`
 stops cleanly and saves before Kaggle cuts the session off.
@@ -224,8 +290,7 @@ Start with `--profile p1`. Prove the pipeline first with `tiny` if you want a
 fast end-to-end run.
 """),
 code("""
-AE_BEST = CKPT / "autoencoder" / "best.pt"
-assert AE_BEST.exists(), "Run stage 1 first."
+assert AE_BEST.exists(), "No autoencoder. Run stage 1, or restore one (section 4)."
 
 import torch
 gate_a = torch.load(AE_BEST, map_location="cpu", weights_only=False).get("best_f1", 0)
@@ -284,7 +349,7 @@ if (CKPT / "diffusion" / "last.pt").exists():
 """),
 
 md("""
-## 5. Save the checkpoints
+## 7. Save the checkpoints
 
 Nothing under `/kaggle/working` survives once the session ends unless you save
 it. Do this **before** the session times out, or you lose the run.
@@ -302,44 +367,7 @@ for f in sorted(CKPT.rglob("*.pt")):
 """),
 
 md("""
-## 6. Resuming in a later session
-
-Attach the checkpoint dataset you saved, then run this before sections 3 and 4.
-"""),
-code("""
-# Copy read-only checkpoints from /kaggle/input into the writable working dir.
-import os, shutil
-
-CKPT = Path("/kaggle/working/checkpoints")
-CKPT.mkdir(parents=True, exist_ok=True)
-
-# Same symlink trap as section 2: os.walk, not rglob.
-restored = 0
-for root, _dirs, files in os.walk("/kaggle/input", followlinks=True):
-    for name in files:
-        source = Path(root) / name
-        if not name.endswith(".pt"):
-            continue
-        # Substring on the whole path, not exact path parts: a dataset may
-        # arrive as autoencoder/best.pt, as taiko-autoencoder/best.pt, or
-        # flattened. Matching parts only worked for the first, and failed
-        # silently by restoring nothing.
-        where = str(source).lower()
-        if "autoencoder" not in where and "diffusion" not in where:
-            continue
-        stage = "autoencoder" if "autoencoder" in where else "diffusion"
-        target = CKPT / stage / source.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        restored += 1
-        print(f"  restored {stage}/{source.name}")
-
-print(f"{restored} checkpoints restored" if restored else
-      "Nothing restored -- attach your checkpoint dataset first.")
-"""),
-
-md("""
-## 7. Gate B — is it listening to the music?
+## 8. Gate B — is it listening to the music?
 
 Onset F1 above 0.40 against held-out audio. This is what separates a model
 following the song from one emitting plausible taiko rhythms; nothing else in
@@ -355,7 +383,7 @@ code("""
 """),
 
 md("""
-## 8. Generate a map
+## 9. Generate a map
 
 Supply `--bpm` and `--offset` when you know them. Tempo is an input to the
 model now, and getting the grid right is most of getting the chart right.
