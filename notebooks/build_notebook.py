@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 
 REPO = "https://github.com/jimmyreturnz/itTAInanKOtodesuka.git"
-BRANCH = "claude/osu-taiko-chart-generation-4tkieb"
+BRANCH = "main"
 
 
 def md(text: str) -> dict:
@@ -84,17 +84,24 @@ if torch.cuda.device_count() < 2:
 md("""
 ## 2. Find the dataset
 
-Kaggle mounts attached datasets read-only under `/kaggle/input/`. This locates
-the shard folder wherever you put it.
+Kaggle mounts attached datasets read-only under `/kaggle/input/`, usually as a
+symlink into `/kaggle/input/datasets/<owner>/<slug>/`. Before Python 3.13
+`Path.rglob` refuses to descend into symlinked directories, so this walks with
+`followlinks=True` -- otherwise the dataset is right there and invisible.
 """),
 code("""
+import os
+
 SHARDS = None
-for candidate in Path("/kaggle/input").rglob("index.json"):
-    if (candidate.parent / "mels.dat").exists():
-        SHARDS = candidate.parent
+for root, _dirs, files in os.walk("/kaggle/input", followlinks=True):
+    if "index.json" in files and "mels.dat" in files:
+        SHARDS = Path(root)
         break
 
 if SHARDS is None:
+    for root, _dirs, files in os.walk("/kaggle/input", followlinks=True):
+        if files:
+            print("  mounted:", root, sorted(files)[:6])
     raise SystemExit(
         "No packed dataset found under /kaggle/input.\\n"
         "  Attach the dataset you uploaded (Add Data in the right-hand panel).\\n"
@@ -129,24 +136,41 @@ code("""
 import numpy as np
 from taiko.data.preprocessed_dataset import WindowedDataset
 
+# Comparing note frames against non-note frames does not work here: the mel is
+# log-scaled and referenced to the clip's own peak, so a blip in a quiet gap
+# shows a larger relative rise than a real hit inside a dense stream. Sweeping a
+# lag does work -- whatever the absolute numbers, the flux must peak on the
+# charted frame. A peak parked at a nonzero lag is a genuine misalignment.
+N = 40
 probe = WindowedDataset(reader, train_idx, window_frames=1536,
                         random_window=True, augment=False,
-                        samples_per_epoch=8, seed=0)
+                        samples_per_epoch=N, seed=0)
 
-for i in range(4):
+LAGS = range(-5, 6)
+acc = {lag: [] for lag in LAGS}
+for i in range(N):
     s = probe[i]
-    mel, chart = s["mel"].numpy(), s["chart"].numpy()
-    # Onset energy in the audio: positive spectral flux, summed over mel bins.
-    flux = np.maximum(0, np.diff(mel, axis=1)).sum(0)
-    onsets = (chart[:4].sum(0) > 0.5)[1:]
-    if onsets.sum() < 5:
+    flux = np.maximum(0.0, np.diff(s["mel"].numpy(), axis=1)).sum(0)
+    frames = np.flatnonzero(s["chart"].numpy()[:4].sum(0) > 0.5)
+    if len(frames) < 20:
         continue
-    ratio = flux[onsets].mean() / max(flux[~onsets].mean(), 1e-6)
-    print(f"  window {i}: audio energy at notes is {ratio:.2f}x the energy elsewhere "
-          f"({int(onsets.sum())} notes)")
+    for lag in LAGS:
+        idx = frames + lag
+        idx = idx[(idx >= 0) & (idx < len(flux))]
+        if len(idx):
+            acc[lag].append(flux[idx].mean())
 
-print("\\nAbove 1.0 means notes land on audio events. Near 1.0 means they do not,")
-print("and something is misaligned -- stop and run tests/test_dataset.py.")
+means = {lag: float(np.mean(v)) for lag, v in acc.items() if v}
+peak = max(means, key=means.get)
+for lag, v in sorted(means.items()):
+    print(f"  lag {lag:+d} ({lag * 20:+4d} ms)  onset flux {v:7.3f}"
+          + ("   <-- peak" if lag == peak else ""))
+
+assert abs(peak) <= 1, (
+    f"onset energy peaks {peak} frames ({peak * 20} ms) away from the charted "
+    "notes -- the audio and the charts describe different milliseconds. Stop "
+    "and run tests/test_dataset.py.")
+print(f"\\nPeak at lag {peak:+d}: audio and charts agree to within one 20 ms frame.")
 """),
 
 md("""
@@ -161,6 +185,11 @@ will not clear at 16x, drop one entry from `--channel-mult` for 8x and retrain.
 A first stage that loses notes caps everything downstream permanently.
 """),
 code("""
+# D4: run the whole pipeline at "tiny" once on real data before committing
+# to p1. Gate A is meaningful at tiny; Gate B is advisory only.
+PROFILE = "tiny"                       # "tiny" = rehearsal, "p1" = the real run
+REHEARSAL = PROFILE == "tiny"
+
 CKPT = Path("/kaggle/working/checkpoints")
 CKPT.mkdir(parents=True, exist_ok=True)
 
@@ -169,7 +198,7 @@ AE_ARGS = [
     "--out", str(CKPT / "autoencoder"),
     "--window-frames", "1536",
     "--batch-size", "16",
-    "--epochs", "60",
+    "--epochs", "8" if REHEARSAL else "60",
     "--samples-per-epoch", "20000",
     "--channel-mult", "1", "1", "2", "2", "4",   # 16x compression
     "--num-workers", "2",
@@ -206,18 +235,25 @@ if gate_a < 0.98:
 """),
 
 code("""
+# D5: effective batch was 4 (2/GPU x 2 GPUs) -- the smallest in any working
+# diffusion recipe. Accumulation takes it to 64 without touching the window,
+# so the 30 s structural horizon long songs need is kept.
+GRAD_ACCUM = "2" if REHEARSAL else "16"        # effective batch 32 / 64
+
 DIFF_ARGS = [
     "--ae", str(AE_BEST),
     "--shards", str(SHARDS),
     "--out", str(CKPT / "diffusion"),
-    "--profile", "p1",
+    "--profile", PROFILE,
     "--window-frames", "1536",
+    "--grad-accum", GRAD_ACCUM,
+    "--ranked-only",                           # D2; a no-op on ranked-only shards
     "--epochs", "200",
     "--samples-per-epoch", "20000",
     "--num-workers", "2",
     "--val-every", "1000",
     "--save-every", "500",
-    "--max-hours", "11",
+    "--max-hours", "11",                       # 12 h cap, 1 h to zip and save
 ]
 
 if (CKPT / "diffusion" / "last.pt").exists():
@@ -252,14 +288,20 @@ Attach the checkpoint dataset you saved, then run this before sections 3 and 4.
 """),
 code("""
 # Copy read-only checkpoints from /kaggle/input into the writable working dir.
-import shutil
+import os, shutil
 
 CKPT = Path("/kaggle/working/checkpoints")
 CKPT.mkdir(parents=True, exist_ok=True)
 
+# Same symlink trap as section 2: os.walk, not rglob.
 restored = 0
-for source in Path("/kaggle/input").rglob("*.pt"):
-    if "autoencoder" in source.parts or "diffusion" in source.parts:
+for root, _dirs, files in os.walk("/kaggle/input", followlinks=True):
+    for name in files:
+        source = Path(root) / name
+        if not name.endswith(".pt"):
+            continue
+        if "autoencoder" not in source.parts and "diffusion" not in source.parts:
+            continue
         stage = "autoencoder" if "autoencoder" in source.parts else "diffusion"
         target = CKPT / stage / source.name
         target.parent.mkdir(parents=True, exist_ok=True)

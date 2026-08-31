@@ -250,9 +250,13 @@ def main() -> int:
           f"{args.window_frames} -> {args.window_frames // model.compression} latent frames")
 
     model = model.to(device)
-    if n_gpus > 1:
-        model = nn.DataParallel(model, device_ids=list(range(n_gpus)))
-        print(f"DataParallel across {n_gpus} GPUs, effective batch {batch}")
+    # Deliberately NOT wrapped in DataParallel. The training step calls
+    # training_loss(), a method -- and DataParallel only intercepts forward(),
+    # so wrapping here scattered nothing while printing that it did: GPU 1 sat
+    # at 3 MiB for the whole run. Stage 2 avoids this by computing the loss
+    # inside forward(). Stage 1 clears Gate A in ~9 minutes on one T4, so the
+    # second card is not worth restructuring the loss path for.
+    print(f"Single GPU (cuda:0), batch {batch}")
 
     optimizer = torch.optim.AdamW(unwrap(model).parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)

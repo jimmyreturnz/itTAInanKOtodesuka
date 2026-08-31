@@ -68,24 +68,22 @@ beyond step 1. Start it, then write the rest while it runs.
 1. **`pack_dataset.py --ranked-only`.** It already stores the flag at line 448; it just cannot filter on it. (D2)
 2. **Start packing.** 2–5 h unattended CPU.
 
-### Blocked: getting the shards onto Kaggle
+### Done: the shards are on Kaggle
 
-The pack is done and correct locally (11,106 maps, 6.69 GB `mels.dat`). Upload is
-the open problem: a single 6.7 GB transfer over an AIS mobile hotspot failed
-after 80 minutes, having pushed 12.2 GB — 82% retransmission — then lost the
-final `CreateDataset` call to SSL handshake failures. The dataset registered
-with only `charts.npz` and `index.json`; **`taiko-shards` v1 is 13 MB and
-unusable**.
+`jimmyreturnz/taiko-shards` holds all three files byte-exact (`mels.dat`
+7,178,432,256 B, `charts.npz`, `index.json`), verified against the local pack by
+`scripts/upload_to_kaggle.py --verify-only`. Kaggle's dataset listing reports a
+smaller *stored* total (6.34 GB) because it compresses; that is not a short
+upload, and the verifier no longer flags it.
 
-Retry either on a stable wired connection (single upload, simplest), or by
-splitting `mels.dat` into ~500 MB parts so a dropout costs one part rather than
-the whole transfer, with the notebook concatenating them at session start.
-Do not re-pack — the mel cache and shards are intact on disk.
+Items 3–5 below are done too: the notebook clones `main`, both training scripts
+set `cudnn.benchmark`, and `--grad-accum` is wired.
 
-### While the packer runs — unblocks the rehearsal
-3. **Fix the dead branch.** `notebooks/kaggle_train.ipynb` cell 2 and `docs/MANUAL.md` both `git clone --branch claude/osu-taiko-chart-generation-4tkieb`. That branch no longer exists on the remote — only `main` does. **The first Kaggle session dies at cell 2.**
-4. **`torch.backends.cudnn.benchmark = True`** in both training scripts. Missing; 5–15% on fixed-shape convs for one line.
-5. **Launch flags:** `--grad-accum 16`, and confirm `p1` still fits at batch 2. (D5)
+### Next: the `tiny` rehearsal (D4)
+
+Attach the dataset to `notebooks/kaggle_train.ipynb` on a T4 x2 session and run
+it top to bottom. **Record the measured steps/sec from stage 2's first ten
+minutes and replace the Schedule paragraph above with it.**
 
 ### After the rehearsal — before the GUI
 6. **Batch the sampler.** `sampling.py:196` loops windows sequentially at batch 1 and runs CFG as a second separate forward: a 5-min song is **1,900 batch-1 U-Net forwards**, entirely launch-overhead bound. Stack all windows *and* both CFG branches into one batch → 50 forwards at batch ~38. Estimated 3–8 min → 10–30 s. Cap the batch (`--batch-windows`) so a 15-min song still fits 4 GB. ~15 lines.

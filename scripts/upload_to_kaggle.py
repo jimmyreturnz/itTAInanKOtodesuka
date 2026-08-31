@@ -89,8 +89,10 @@ def verify(api, ref: str, shards: Path) -> bool:
             problems.append(f"SIZE     {name}: local {human(size)}, Kaggle {human(got)}")
 
     # The file listing has been seen to under-report, so the dataset's own byte
-    # total is the second opinion. Both must look right.
-    if total and total < want * 0.98:
+    # total is the second opinion -- but only when the listing is incomplete.
+    # Kaggle reports the *stored* (compressed) size there, which is legitimately
+    # smaller than the raw bytes, so it would false-alarm on a good upload.
+    if total and len(remote) < len(local) and total < want * 0.98:
         problems.append(f"TOTAL    dataset is {human(total)}, expected ~{human(want)}")
 
     for p in problems:
