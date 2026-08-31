@@ -198,7 +198,9 @@ AE_ARGS = [
     "--out", str(CKPT / "autoencoder"),
     "--window-frames", "1536",
     "--batch-size", "16",
-    "--epochs", "8" if REHEARSAL else "60",
+    # 8 epochs (5,500 steps, ~9 min on one T4) cleared Gate A at onset F1
+    # 0.9998, flat across every threshold from 0.70 to 0.99. 60 was a guess.
+    "--epochs", "8",
     "--samples-per-epoch", "20000",
     "--channel-mult", "1", "1", "2", "2", "4",   # 16x compression
     "--num-workers", "2",
@@ -236,20 +238,26 @@ if gate_a < 0.98:
 
 code("""
 # D5: effective batch was 4 (2/GPU x 2 GPUs) -- the smallest in any working
-# diffusion recipe. Both paths below reach an effective batch of 64 without
-# touching the window, so the 30 s structural horizon long songs need is kept.
-#
-# How they get there differs, because the constraint differs. tiny leaves most
-# of the 15 GiB unused at the profile's 8/GPU, and a small batch on a T4 is
-# launch-overhead bound rather than compute bound, so the rehearsal spends the
-# memory instead: 32/GPU with no accumulation is the same 64 samples per
-# optimiser step at a quarter of the kernel launches. p1 keeps the profile's
-# 2/GPU and accumulates, because there the memory is genuinely spent.
+# diffusion recipe. 32/GPU x 2 GPUs reaches an effective 64 without touching
+# the window, so the 30 s structural horizon long songs need is kept.
 #
 # If 32/GPU OOMs, halve it and set GRAD_ACCUM to "2" -- effective batch is what
 # has to stay at 64, not the split.
-BATCH_ARGS = ["--batch-size", "32"] if REHEARSAL else []
-GRAD_ACCUM = "1" if REHEARSAL else "16"
+#
+# This applies to both profiles. Measured on 2x T4 at this window, p1
+# runs 1.8 samples/s at the profile's own 2/GPU and 23.7 at 32/GPU, for 1.3 GiB
+# of 15 and step time barely moving (2.22 s -> 2.7 s while the batch grew 16x).
+# Small batches leave these models launch-overhead bound, so per_gpu_batch is a
+# floor that fits anywhere rather than a recommendation, and checkpointing
+# trades compute for memory that is sitting unused.
+BATCH_ARGS = ["--batch-size", "32", "--no-grad-checkpoint"]
+GRAD_ACCUM = "1"                               # 32/GPU x 2 GPUs = effective 64
+
+# Save & Run All gets a fresh 12 h; the cells above cost ~15 min because a
+# committed run starts from an empty /kaggle/working and retrains the
+# autoencoder. Running this interactively instead, subtract the hours the
+# session has already spent.
+MAX_HOURS = "10.5"
 
 DIFF_ARGS = [
     "--ae", str(AE_BEST),
@@ -265,7 +273,7 @@ DIFF_ARGS = [
     "--num-workers", "4",
     "--val-every", "1000",
     "--save-every", "500",
-    "--max-hours", "11",                       # 12 h cap, 1 h to zip and save
+    "--max-hours", MAX_HOURS,                  # stop cleanly, then cell 15 zips
 ]
 
 if (CKPT / "diffusion" / "last.pt").exists():
@@ -312,9 +320,14 @@ for root, _dirs, files in os.walk("/kaggle/input", followlinks=True):
         source = Path(root) / name
         if not name.endswith(".pt"):
             continue
-        if "autoencoder" not in source.parts and "diffusion" not in source.parts:
+        # Substring on the whole path, not exact path parts: a dataset may
+        # arrive as autoencoder/best.pt, as taiko-autoencoder/best.pt, or
+        # flattened. Matching parts only worked for the first, and failed
+        # silently by restoring nothing.
+        where = str(source).lower()
+        if "autoencoder" not in where and "diffusion" not in where:
             continue
-        stage = "autoencoder" if "autoencoder" in source.parts else "diffusion"
+        stage = "autoencoder" if "autoencoder" in where else "diffusion"
         target = CKPT / stage / source.name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
