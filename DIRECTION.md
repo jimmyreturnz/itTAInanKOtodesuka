@@ -48,14 +48,33 @@ Not a hosted service. Not a research artifact. The thing being optimised is
 
 ## Schedule
 
-The 150–250 GPU-hour figure in `DEVELOPMENT_PLAN.md` is an estimate nobody
-measured, and it looks pessimistic for a 35M-parameter model whose latent is 96
-frames. Arithmetic suggests 0.5–1.5 s/step on 2×T4 and convergence in the
-100k–300k step range: **30–80 hours, so 2–3 weeks of quota rather than 6–8.**
+**Measured 2026-08-31**, `p1`, 1536-frame window, 2×T4, fp16, no gradient
+checkpointing. Throughput is set almost entirely by batch size, because at small
+batch these models are launch-overhead bound rather than compute bound — step
+time barely moves while the batch grows 16×:
 
-That number is a guess too. The `tiny` rehearsal produces the real steps/sec in
-its first ten minutes — **replace this paragraph with the measurement** rather
-than carrying the folklore forward.
+| batch/GPU | step time | samples/s | GPU util | memory |
+|---|---|---|---|---|
+| 2 (profile default) | 2.22 s | 1.8 | 22–27% | 0.9 GiB |
+| 8 | 2.4 s | 6.7 | — | 0.9 GiB |
+| **32** | 2.7 s | **23.7** | 40–54% | 1.3 GiB |
+
+At effective batch 64 that is **75 hours for 100k steps, 225 for 300k** — 2.5 to
+7 weeks of quota. The profile's own `per_gpu_batch = 2` was costing 13×, and the
+"~9 GB per T4" note beside it was an unmeasured guess that overstated memory by
+about 10×. Both are corrected in `model_config.py`; treat `per_gpu_batch` as a
+floor that fits anywhere, not a recommendation.
+
+40–54% utilisation says there is still headroom at 64/GPU. It was not taken,
+because that doubles the effective batch to 128 and D5's reasoning is about
+effective batch, not throughput — worth revisiting with an lr adjustment if the
+schedule gets tight.
+
+`tiny` measures 29 samples/s under the same settings, so `p1` costs only ~20%
+more per sample than the rehearsal profile. That removes most of the argument
+for rehearsing on `tiny` at all (D4): the plumbing it was meant to shake out —
+mel cache, memmap, DataParallel, alignment on real data — is already proven, and
+a `p1` run keeps its weights.
 
 ---
 
