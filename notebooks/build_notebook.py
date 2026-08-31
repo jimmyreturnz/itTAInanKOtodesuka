@@ -236,9 +236,20 @@ if gate_a < 0.98:
 
 code("""
 # D5: effective batch was 4 (2/GPU x 2 GPUs) -- the smallest in any working
-# diffusion recipe. Accumulation takes it to 64 without touching the window,
-# so the 30 s structural horizon long songs need is kept.
-GRAD_ACCUM = "2" if REHEARSAL else "16"        # effective batch 32 / 64
+# diffusion recipe. Both paths below reach an effective batch of 64 without
+# touching the window, so the 30 s structural horizon long songs need is kept.
+#
+# How they get there differs, because the constraint differs. tiny leaves most
+# of the 15 GiB unused at the profile's 8/GPU, and a small batch on a T4 is
+# launch-overhead bound rather than compute bound, so the rehearsal spends the
+# memory instead: 32/GPU with no accumulation is the same 64 samples per
+# optimiser step at a quarter of the kernel launches. p1 keeps the profile's
+# 2/GPU and accumulates, because there the memory is genuinely spent.
+#
+# If 32/GPU OOMs, halve it and set GRAD_ACCUM to "2" -- effective batch is what
+# has to stay at 64, not the split.
+BATCH_ARGS = ["--batch-size", "32"] if REHEARSAL else []
+GRAD_ACCUM = "1" if REHEARSAL else "16"
 
 DIFF_ARGS = [
     "--ae", str(AE_BEST),
@@ -246,11 +257,12 @@ DIFF_ARGS = [
     "--out", str(CKPT / "diffusion"),
     "--profile", PROFILE,
     "--window-frames", "1536",
+    *BATCH_ARGS,
     "--grad-accum", GRAD_ACCUM,
     "--ranked-only",                           # D2; a no-op on ranked-only shards
     "--epochs", "200",
     "--samples-per-epoch", "20000",
-    "--num-workers", "2",
+    "--num-workers", "4",
     "--val-every", "1000",
     "--save-every", "500",
     "--max-hours", "11",                       # 12 h cap, 1 h to zip and save

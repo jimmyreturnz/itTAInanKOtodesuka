@@ -18,9 +18,16 @@ config that can drift silently eventually does.
 
 Sizing for two T4s
 ------------------
-A Kaggle T4 has about 15 GB. The numbers below are for a 1536-frame window
-(30.7 s) at 16x compression, batch 2 per GPU, fp16 with gradient checkpointing.
-Measure before trusting them -- they move with window size.
+A Kaggle T4 has about 15 GB, and these models do not come close to filling it.
+Measured on 2x T4, 1536-frame window (30.7 s), 16x compression, fp16:
+
+    p1 at 2/GPU   1.8 samples/s
+    p1 at 8/GPU   6.7 samples/s, 0.9 GiB, GPU at 22-27%
+
+So per_gpu_batch below is a floor that fits anywhere, not a recommendation.
+These models are launch-overhead bound at small batch: raise --batch-size until
+memory or throughput stops improving, and pass --no-grad-checkpoint while the
+card is this empty -- checkpointing trades compute for memory you are not using.
 """
 
 from __future__ import annotations
@@ -107,7 +114,7 @@ PROFILES: dict[str, DiffusionProfile] = {
         use_checkpoint      = True,
         per_gpu_batch       = 2,
         lr                  = 1e-4,
-        note                = "recommended: ~9 GB per T4 at 1536 frames",
+        note                = "recommended; measured 0.9 GiB per T4 at 8/GPU",
     ),
 
     # Wider, for a second run once p1 has cleared Gate B. Deeper is not the

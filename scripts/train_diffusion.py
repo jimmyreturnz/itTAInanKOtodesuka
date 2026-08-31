@@ -28,6 +28,7 @@ import argparse
 import math
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -126,9 +127,15 @@ def main() -> int:
     ap.add_argument("--fp16", action="store_true", default=True)
     ap.add_argument("--fp32", dest="fp16", action="store_false")
     ap.add_argument("--single-gpu", action="store_true")
+    ap.add_argument("--no-grad-checkpoint", action="store_true",
+                    help="disable gradient checkpointing. It buys memory with "
+                         "recomputation, which is a bad trade when the card is "
+                         "empty: p1 at 8/GPU uses under 1 GiB of 15.")
     args = ap.parse_args()
 
     profile = get_profile(args.profile)
+    if args.no_grad_checkpoint:
+        profile = replace(profile, use_checkpoint=False)
     batch_per_gpu = args.batch_size or profile.per_gpu_batch
     lr = args.lr or profile.lr
 
@@ -189,7 +196,9 @@ def main() -> int:
     # ---- model ------------------------------------------------------------ #
     model = TaikoDiffusion(
         autoencoder_ckpt=str(args.ae),
-        profile=args.profile,
+        profile=profile,          # the object, not the name -- --no-grad-checkpoint
+                                  # modifies it and passing args.profile would
+                                  # silently re-fetch the unmodified original
         prediction_type=args.prediction_type,
     )
     model.first_stage.check_window(args.window_frames)
