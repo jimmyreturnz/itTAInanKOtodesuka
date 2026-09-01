@@ -239,6 +239,52 @@ print(f"{restored} checkpoints restored" if restored else
 """),
 
 md("""
+Now check they survived the round trip, before any GPU time goes into them.
+
+A checkpoint can arrive wrapped in an archive, truncated by an unfinished
+transfer, or replaced by an error page, and none of that is visible until
+`--resume` tries to open it -- which, without this cell, happens after the
+session has already built the model and is ready to train.
+"""),
+code("""
+import subprocess
+
+verify = subprocess.run(
+    ["python", "scripts/verify_checkpoints.py", str(CKPT)],
+    capture_output=True, text=True,
+)
+print(verify.stdout)
+if verify.stderr.strip():
+    print(verify.stderr)
+
+# A stage is only resumable if its own checkpoints verified. Anything that did
+# not is renamed aside, so the training cells below start that stage cleanly
+# instead of stopping on a file they cannot read.
+RESUMABLE = {"autoencoder": False, "diffusion": False}
+for stage in RESUMABLE:
+    last = CKPT / stage / "last.pt"
+    if not last.exists():
+        continue
+    probe = subprocess.run(
+        ["python", "-c",
+         "import torch,sys; torch.load(sys.argv[1], map_location='cpu', "
+         "weights_only=False)", str(last)],
+        capture_output=True, text=True,
+    )
+    if probe.returncode == 0:
+        RESUMABLE[stage] = True
+    else:
+        broken = last.with_suffix(".pt.unreadable")
+        last.rename(broken)
+        print(f"{stage}: last.pt will not load; moved to {broken.name}")
+        print(f"  try: python scripts/rescue_checkpoint.py {CKPT / stage}")
+        print(f"  otherwise this stage restarts from zero, which is fine --")
+        print(f"  the other stage is a separate file and is unaffected.")
+
+print(f"\nresumable: {RESUMABLE}")
+"""),
+
+md("""
 ## 5. Stage 1 — autoencoder
 
 Roughly 6-10 GPU-hours. Compresses charts into the latent space the diffusion
@@ -272,7 +318,7 @@ AE_ARGS = [
     "--save-every-min", "10",
 ]
 
-if (CKPT / "autoencoder" / "last.pt").exists():
+if RESUMABLE["autoencoder"]:
     AE_ARGS += ["--resume", str(CKPT / "autoencoder" / "last.pt")]
     print("resuming the autoencoder")
 
@@ -355,7 +401,7 @@ DIFF_ARGS = [
     "--max-hours", MAX_HOURS,                  # stop cleanly, then cell 15 zips
 ]
 
-if (CKPT / "diffusion" / "last.pt").exists():
+if RESUMABLE["diffusion"]:
     DIFF_ARGS += ["--resume", str(CKPT / "diffusion" / "last.pt")]
     print("resuming diffusion training")
 

@@ -35,6 +35,7 @@ than a mystery.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import signal
 import time
@@ -158,6 +159,91 @@ def install_stop_handlers() -> _StopFlag:
 # Saving
 # --------------------------------------------------------------------------- #
 
+MANIFEST_NAME = "checkpoints.sha256"
+
+
+def file_digest(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
+    """sha256 of a file, read in chunks so a 500 MB checkpoint costs no memory."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while block_bytes := handle.read(chunk):
+            digest.update(block_bytes)
+    return digest.hexdigest()
+
+
+def update_manifest(directory: Path) -> Path:
+    """
+    Record the size and digest of every checkpoint in a directory.
+
+    Written next to the checkpoints and carried with them. A checkpoint that
+    arrives on the next machine 7-Zip-wrapped, truncated, or replaced by an
+    HTML error page has a different size and digest, and that is knowable in
+    seconds at restore time rather than eleven hours later when --resume
+    finally opens it.
+    """
+    directory = Path(directory)
+    lines = []
+    for path in sorted(directory.glob("*.pt")):
+        lines.append(f"{file_digest(path)}  {path.stat().st_size}  {path.name}")
+    manifest = directory / MANIFEST_NAME
+    manifest.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return manifest
+
+
+def verify_manifest(directory: Path) -> tuple[list[str], list[str]]:
+    """
+    Check checkpoints against their manifest.
+
+    Returns (ok, problems). A missing manifest is not a problem -- checkpoints
+    from before this existed are still perfectly loadable -- so it reports
+    nothing rather than inventing a failure.
+    """
+    directory = Path(directory)
+    manifest = directory / MANIFEST_NAME
+    if not manifest.exists():
+        return [], []
+
+    ok: list[str] = []
+    problems: list[str] = []
+
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            expected_digest, expected_size, name = line.split(None, 2)
+        except ValueError:
+            continue
+
+        path = directory / name
+        if not path.exists():
+            problems.append(f"{name}: recorded in the manifest but not here")
+            continue
+
+        actual_size = path.stat().st_size
+        if actual_size != int(expected_size):
+            delta = actual_size - int(expected_size)
+            description, container = describe_file(path)
+            detail = (f"{name}: {actual_size:,} bytes, manifest says "
+                      f"{int(expected_size):,} ({delta:+,})")
+            detail += f"\n      it is now: {description}"
+            if container:
+                detail += (f"\n      a {container} container -- something wrapped it "
+                           f"in transit; scripts/rescue_checkpoint.py can unwrap it")
+            elif actual_size < int(expected_size):
+                detail += "\n      smaller than recorded: the transfer did not finish"
+            problems.append(detail)
+            continue
+
+        if file_digest(path) != expected_digest:
+            problems.append(f"{name}: right size, wrong contents -- "
+                            f"the bytes changed in transit")
+            continue
+
+        ok.append(name)
+
+    return ok, problems
+
+
 def atomic_save(payload: dict, path: Path) -> None:
     """
     Write a checkpoint that is never observed half-written.
@@ -234,6 +320,10 @@ class CheckpointSaver:
     def save(self, name: str = "last.pt", reason: str = "") -> Path:
         path = self.out / name
         atomic_save(self.build(), path)
+        # Refresh after every write. The manifest is only useful if it
+        # describes the files as they are now, not as they were at the start
+        # of the session.
+        update_manifest(self.out)
         if name == "last.pt":
             # Only the resume target resets the clock. best.pt is written
             # whenever validation improves, which is not a reason to let

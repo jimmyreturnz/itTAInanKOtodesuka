@@ -174,6 +174,83 @@ def extract(source: Path, kind: str, workdir: Path) -> Path | None:
     return None
 
 
+def inspect(path: Path) -> None:
+    """
+    Report everything knowable about a file without trying to repair it.
+
+    When extraction fails, the summary line says "unrecoverable" and nothing
+    about why. The three causes need different responses and look identical
+    from outside: the archive is truncated, the tool to open it is missing, or
+    there is nowhere to put what comes out.
+    """
+    description, container = describe_file(path)
+    size = path.stat().st_size if path.exists() else 0
+    print(f"\n{path}")
+    print(f"  identified as : {description}")
+    print(f"  size on disk  : {size:,} bytes ({size / 1024**2:.1f} MB)")
+
+    with open(path, "rb") as handle:
+        head = handle.read(32)
+        handle.seek(max(0, size - 16))
+        tail = handle.read(16)
+    print(f"  first 16 bytes: {head[:16].hex(' ')}")
+    print(f"  last 16 bytes : {tail.hex(' ')}")
+
+    free = free_bytes(path.parent)
+    print(f"  free space    : {free / 1024**3:.1f} GB next to the file")
+
+    if container != "7z":
+        if container:
+            print(f"  container     : {container}")
+        return
+
+    # A 7z file records its total size in the 32-byte header. Comparing that
+    # against the file on disk is how a truncated download is distinguished
+    # from a corrupt one -- extraction fails the same way for both.
+    import struct
+    if len(head) >= 32:
+        next_offset, next_size = struct.unpack("<QQ", head[12:28])
+        expected = 32 + next_offset + next_size
+        print(f"  header says   : {expected:,} bytes total")
+        if expected > size:
+            short = expected - size
+            print(f"  TRUNCATED     : {short:,} bytes missing "
+                  f"({short / 1024**2:.1f} MB, {short / expected:.1%} of the file)")
+            print(f"                  the upload or download did not finish; "
+                  f"re-fetch it")
+            return
+        if expected < size:
+            print(f"  note          : {size - expected:,} bytes of trailing data")
+
+    try:
+        import py7zr                                               # noqa: PLC0415
+    except ImportError:
+        print("  contents      : install py7zr to list them "
+              "(pip install py7zr)")
+        return
+
+    try:
+        with py7zr.SevenZipFile(path, "r") as archive:
+            members = archive.list()
+    except Exception as exc:                                       # noqa: BLE001
+        print(f"  contents      : cannot be listed -- {type(exc).__name__}: {exc}")
+        print("                  the archive header is damaged, not just the payload")
+        return
+
+    total = sum(m.uncompressed for m in members)
+    print(f"  contents      : {len(members)} member(s), "
+          f"{total / 1024**2:.1f} MB uncompressed")
+    for member in members[:10]:
+        print(f"      {member.filename}  ({member.uncompressed / 1024**2:.1f} MB)"
+              f"{'  [encrypted]' if getattr(member, 'is_encrypted', False) else ''}")
+    if len(members) > 10:
+        print(f"      ... and {len(members) - 10} more")
+
+    if total > free:
+        print(f"  NO ROOM       : needs {total / 1024**3:.1f} GB, "
+              f"{free / 1024**3:.1f} GB free")
+
+
 def rescue(path: Path, write: bool, depth: int = 0) -> bool:
     """Diagnose one checkpoint, unwrapping containers until it loads."""
     indent = "  " + "  " * depth
@@ -257,6 +334,9 @@ def main() -> int:
     )
     ap.add_argument("target", type=Path,
                     help="a .pt file, or a directory of them")
+    ap.add_argument("--inspect", action="store_true",
+                    help="report what each file is and what is inside it, "
+                         "without attempting any repair")
     ap.add_argument("--write", action="store_true",
                     help="replace a wrapped checkpoint with its contents "
                          "(the original is kept as .pt.broken)")
@@ -273,6 +353,11 @@ def main() -> int:
         if not targets:
             print(f"No .pt files under {args.target}")
             return 1
+
+    if args.inspect:
+        for path in targets:
+            inspect(path)
+        return 0
 
     print(f"Checking {len(targets)} checkpoint(s)\n")
     healthy, rescued, lost = [], [], []
