@@ -382,6 +382,16 @@ python scripts/rescue_checkpoint.py /kaggle/working/checkpoints/diffusion --writ
 It unwraps the container and verifies the contents really are a checkpoint
 before replacing anything; the unreadable file is kept as `.pt.broken`.
 
+**A damaged checkpoint keeps coming back every session** -- it is in the
+attached dataset, and section 4 used to copy every `.pt` it found. It now
+screens on the first four bytes and refuses anything that is not a checkpoint,
+so you do **not** need to detach the dataset to escape a bad file. Detaching
+would take the other stage's checkpoint with it, which is the opposite of what
+you want. The rejected stage starts fresh; the good one restores as normal.
+
+To keep a rejected file for recovery, copy it into the working directory by
+hand and run `scripts/rescue_checkpoint.py <dir> --write`.
+
 **Every checkpoint in a directory fails the same way** -- nothing was written
 wrong. Writes are atomic, and two files written minutes apart do not corrupt
 identically. Something happened to them afterwards: the download, the zip, the

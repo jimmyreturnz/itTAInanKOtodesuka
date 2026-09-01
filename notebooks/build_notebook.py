@@ -204,17 +204,27 @@ with nothing. Attach the checkpoint dataset you saved and run this: it copies
 the read-only files into the writable working directory, where stage 1 sees an
 autoencoder to skip and stage 2 sees a `last.pt` to resume from.
 
+Files that are not checkpoints are **not copied**. An attached dataset holding
+a damaged checkpoint would otherwise restore it every session, so leaving the
+dataset attached for the sake of one good stage keeps re-importing the broken
+one. Screening happens on the first four bytes, so it costs nothing even for a
+500 MB file, and the stage whose checkpoint was rejected simply starts fresh.
+
 Nothing restored is the correct output on a first run.
 """),
 code("""
-# Copy read-only checkpoints from /kaggle/input into the writable working dir.
+# Copy read-only checkpoints from /kaggle/input into the writable working dir,
+# skipping anything that is not actually a checkpoint.
 import os, shutil
+from taiko.train.session import describe_file
 
 CKPT = Path("/kaggle/working/checkpoints")
 CKPT.mkdir(parents=True, exist_ok=True)
 
+restored, rejected = 0, 0
+newest = {}
+
 # Same symlink trap as the dataset search: os.walk, not rglob.
-restored = 0
 for root, _dirs, files in os.walk("/kaggle/input", followlinks=True):
     for name in files:
         source = Path(root) / name
@@ -228,13 +238,37 @@ for root, _dirs, files in os.walk("/kaggle/input", followlinks=True):
         if "autoencoder" not in where and "diffusion" not in where:
             continue
         stage = "autoencoder" if "autoencoder" in where else "diffusion"
-        target = CKPT / stage / source.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        restored += 1
-        print(f"  restored {stage}/{source.name}")
 
-print(f"{restored} checkpoints restored" if restored else
+        # A torch checkpoint is a zip; the header is enough to reject an
+        # archive, an HTML page or a truncated file without reading 500 MB.
+        description, container = describe_file(source)
+        if not description.startswith(("zip archive", "legacy pickle")):
+            rejected += 1
+            print(f"  SKIPPED {stage}/{name}: {description}")
+            if container:
+                print(f"          a {container} container. To recover it, copy it in"
+                      f" by hand and run:")
+                print(f"          python scripts/rescue_checkpoint.py {CKPT / stage} --write")
+            print(f"          not copied, so {stage} will start fresh rather than"
+                  f" stop on it.")
+            continue
+
+        # Several datasets may carry the same filename; keep the newest.
+        key = (stage, name)
+        stamp = source.stat().st_mtime
+        if key in newest and newest[key][0] >= stamp:
+            continue
+        newest[key] = (stamp, source)
+
+for (stage, name), (_stamp, source) in sorted(newest.items()):
+    target = CKPT / stage / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    restored += 1
+    print(f"  restored {stage}/{name}  ({target.stat().st_size / 1024**2:.0f} MB)")
+
+print(f"\n{restored} restored, {rejected} skipped"
+      if (restored or rejected) else
       "Nothing restored -- attach your checkpoint dataset first.")
 """),
 
