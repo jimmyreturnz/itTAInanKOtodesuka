@@ -51,6 +51,16 @@ from taiko.train.session import describe_file
 CHECKPOINT_KEYS = ("model", "unet", "wave", "optimizer", "step")
 
 
+def free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def _report(message: str, indent: str = "") -> None:
+    """Print immediately. Extraction of a large archive is minutes of silence
+    otherwise, which is indistinguishable from a hang."""
+    print(f"{indent}{message}", flush=True)
+
+
 def loads_cleanly(path: Path) -> tuple[bool, str]:
     try:
         obj = torch.load(path, map_location="cpu", weights_only=False)
@@ -124,30 +134,42 @@ def extract(source: Path, kind: str, workdir: Path) -> Path | None:
         return _largest_member(workdir)
 
     if kind == "7z":
-        try:
-            import py7zr                                           # noqa: PLC0415
-        except ImportError:
-            py7zr = None
-        if py7zr is not None:
-            try:
-                with py7zr.SevenZipFile(source, "r") as archive:
-                    archive.extractall(workdir)
-                return _largest_member(workdir)
-            except Exception as exc:                               # noqa: BLE001
-                print(f"    py7zr failed: {exc}")
+        # The binary first: it streams, where py7zr buffers members in memory.
+        # On a checkpoint of several hundred megabytes, on a machine already
+        # short of RAM, that difference is the difference between recovering
+        # the run and being killed while recovering it.
         binary = shutil.which("7z") or shutil.which("7za") or shutil.which("7zr")
         if binary:
+            _report(f"    using {Path(binary).name}")
             result = subprocess.run(
-                [binary, "x", str(source), f"-o{workdir}", "-y"],
+                [binary, "x", str(source), f"-o{workdir}", "-y", "-bso0", "-bsp0"],
                 capture_output=True, text=True,
             )
             if result.returncode == 0:
                 return _largest_member(workdir)
-            print(f"    {Path(binary).name} failed: {result.stderr.strip()[:200]}")
-        else:
-            print("    no 7-Zip available. Install one, then re-run:")
-            print("      pip install py7zr")
-        return None
+            _report(f"    {Path(binary).name} failed: "
+                    f"{(result.stderr or result.stdout).strip()[:200]}")
+
+        try:
+            import py7zr                                           # noqa: PLC0415
+        except ImportError:
+            _report("    no 7-Zip available. Install one and re-run:")
+            _report("      pip install py7zr          # or: apt-get install -y p7zip-full")
+            return None
+
+        _report("    using py7zr (holds members in memory; the 7z binary is "
+                "lighter if you can install it)")
+        try:
+            with py7zr.SevenZipFile(source, "r") as archive:
+                archive.extractall(workdir)
+            return _largest_member(workdir)
+        except MemoryError:
+            _report("    ran out of memory. Install the binary instead:")
+            _report("      apt-get install -y p7zip-full")
+            return None
+        except Exception as exc:                                   # noqa: BLE001
+            _report(f"    py7zr failed: {exc}")
+            return None
 
     return None
 
@@ -172,15 +194,31 @@ def rescue(path: Path, write: bool, depth: int = 0) -> bool:
         print(f"{indent}  giving up after three layers of wrapping")
         return False
 
-    print(f"{indent}  it is a {container} container; extracting")
-    with tempfile.TemporaryDirectory() as tmp:
-        recovered = extract(path, container, Path(tmp) / "out")
+    size_mb = path.stat().st_size / 1024 ** 2
+    # Extract beside the file, not into /tmp. On the same filesystem the final
+    # move is a rename rather than a copy of several hundred megabytes, and it
+    # cannot fill a small /tmp on a machine whose real space is elsewhere.
+    workdir = path.parent / f".rescue-{path.name}"
+
+    needed = path.stat().st_size * 3          # archive + payload + the copy
+    available = free_bytes(path.parent)
+    if available < needed:
+        _report(f"  not enough room next to the file: "
+                f"{available / 1024**3:.1f} GB free, about "
+                f"{needed / 1024**3:.1f} GB needed", indent)
+        return False
+
+    _report(f"  it is a {container} container; extracting {size_mb:.0f} MB "
+            f"(minutes, not seconds)", indent)
+
+    try:
+        recovered = extract(path, container, workdir)
         if recovered is None:
-            print(f"{indent}  nothing came out of it")
+            _report("  nothing came out of it", indent)
             return False
 
-        size_mb = recovered.stat().st_size / 1024 ** 2
-        print(f"{indent}  recovered {recovered.name} ({size_mb:.1f} MB)")
+        out_mb = recovered.stat().st_size / 1024 ** 2
+        _report(f"  recovered {recovered.name} ({out_mb:.1f} MB)", indent)
 
         inner_ok, inner_detail = loads_cleanly(recovered)
         if not inner_ok:
@@ -199,14 +237,18 @@ def rescue(path: Path, write: bool, depth: int = 0) -> bool:
         print(f"{indent}  the contents ARE a checkpoint -- {inner_detail}")
 
         if not write:
-            print(f"{indent}  re-run with --write to replace {path.name} with it")
+            _report(f"  re-run with --write to replace {path.name} with it", indent)
             return True
 
         backup = path.with_suffix(path.suffix + ".broken")
         shutil.move(str(path), str(backup))
-        shutil.copy2(recovered, path)
-        print(f"{indent}  wrote {path.name}; the unreadable file is now {backup.name}")
+        # Same filesystem, so this is a rename: instant, and it cannot leave a
+        # half-written checkpoint behind if the process dies mid-copy.
+        shutil.move(str(recovered), str(path))
+        _report(f"  wrote {path.name}; the unreadable file is now {backup.name}", indent)
         return True
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 def main() -> int:
