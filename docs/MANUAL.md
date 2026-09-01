@@ -359,6 +359,46 @@ each milestone.
 
 ## Troubleshooting
 
+**`invalid load key` when resuming**
+
+`torch.load` is quoting the first byte of the file it could not read, and that
+byte identifies the problem:
+
+| byte | the file is | recoverable |
+|---|---|---|
+| `'7'` | a 7-Zip archive | yes |
+| `'\x1f'` | a gzip stream | yes |
+| `'P'` | a zip -- either a healthy checkpoint or a truncated one | sometimes |
+| `'<'` | an HTML page, e.g. a download that returned an error | no |
+| `'v'` | a Git LFS pointer, not the file itself | no, fetch it properly |
+
+Run this before assuming anything is lost:
+
+```bash
+python scripts/rescue_checkpoint.py /kaggle/working/checkpoints/diffusion
+python scripts/rescue_checkpoint.py /kaggle/working/checkpoints/diffusion --write
+```
+
+It unwraps the container and verifies the contents really are a checkpoint
+before replacing anything; the unreadable file is kept as `.pt.broken`.
+
+**Every checkpoint in a directory fails the same way** -- nothing was written
+wrong. Writes are atomic, and two files written minutes apart do not corrupt
+identically. Something happened to them afterwards: the download, the zip, the
+Kaggle Dataset upload, or the attach. Check whether the archive you uploaded
+was extracted on the way in, and that you uploaded the `.pt` files rather than
+an archive of them.
+
+**One file fails and its siblings load** -- that single write was interrupted.
+`--resume` already falls back to `best.pt`, so the run continues on its own.
+
+**Losing stage 2 does not mean losing stage 1.** They are separate checkpoints.
+If `train_diffusion.py` got as far as printing `Trainable: ...M`, the
+autoencoder loaded fine -- the model cannot be built without it -- so Gate A
+still stands and only stage 2 restarts.
+
+
+
 **`No packed dataset found under /kaggle/input`**
 The dataset is not attached, or you uploaded the parent folder. Kaggle must see
 `mels.dat`, `charts.npz` and `index.json`.

@@ -252,6 +252,67 @@ class CheckpointSaver:
         return True
 
 
+# Magic numbers, longest first so a prefix cannot shadow a longer match.
+# The point is not to support these formats -- it is to say what a file
+# actually is when torch refuses it, because "invalid load key, '7'" is pickle
+# reporting the first byte it did not understand and nothing more.
+_FILE_SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
+    (b"\xfd7zXZ\x00",           "xz archive",        "xz"),
+    (b"7z\xbc\xaf\x27\x1c",    "7-Zip archive",     "7z"),
+    (b"PK\x03\x04",             "zip archive",       "zip"),
+    (b"PK\x05\x06",             "empty zip archive", ""),
+    (b"\x1f\x8b",               "gzip stream",       "gzip"),
+    (b"BZh",                     "bzip2 stream",      "bz2"),
+    (b"version https://git-lfs", "Git LFS pointer",   ""),
+    (b"<!DOCTYPE",               "HTML page",         ""),
+    (b"<html",                   "HTML page",         ""),
+    (b"<?xml",                   "XML document",      ""),
+)
+
+
+def describe_file(path: Path) -> tuple[str, str]:
+    """
+    Identify a file from its first bytes.
+
+    Returns (description, container_kind). `container_kind` is non-empty when
+    the file is an archive whose contents could be extracted -- which is the
+    difference between "your training is gone" and "your training is wrapped in
+    something".
+    """
+    path = Path(path)
+    if not path.exists():
+        return "missing", ""
+
+    size = path.stat().st_size
+    if size == 0:
+        return "empty (0 bytes)", ""
+
+    with open(path, "rb") as handle:
+        head = handle.read(512)
+        tar_marker = b""
+        if size > 262:
+            handle.seek(257)
+            tar_marker = handle.read(5)
+
+    for signature, description, kind in _FILE_SIGNATURES:
+        if head.startswith(signature):
+            return f"{description} ({size / 1024**2:.1f} MB)", kind
+
+    if tar_marker == b"ustar":
+        return f"tar archive ({size / 1024**2:.1f} MB)", "tar"
+
+    # torch.save without the zip container writes a bare pickle.
+    if head[:1] == b"\x80" and len(head) > 1 and head[1] in (2, 3, 4, 5):
+        return f"legacy pickle, protocol {head[1]} ({size / 1024**2:.1f} MB)", ""
+
+    printable = sum(32 <= b < 127 or b in (9, 10, 13) for b in head)
+    if head and printable / len(head) > 0.9:
+        preview = head[:60].decode("utf-8", "replace").replace("\n", " ")
+        return f"text, not a checkpoint ({size / 1024**2:.1f} MB): {preview!r}", ""
+
+    return (f"unrecognised, first bytes {head[:8]!r} ({size / 1024**2:.1f} MB)", "")
+
+
 def load_checkpoint(path: Path, map_location, fallbacks: tuple[str, ...] = ("best.pt",)):
     """
     Load a checkpoint, falling back to a sibling if it will not open.
@@ -271,12 +332,28 @@ def load_checkpoint(path: Path, map_location, fallbacks: tuple[str, ...] = ("bes
         try:
             ckpt = torch.load(candidate, map_location=map_location, weights_only=False)
         except Exception as exc:                                   # noqa: BLE001
-            errors.append(f"  {candidate}: {type(exc).__name__}: {exc}")
+            description, container = describe_file(candidate)
+            note = f"  {candidate}: {type(exc).__name__}: {exc}\n" \
+                   f"      the file on disk is: {description}"
+            if container:
+                note += (
+                    f"\n      it is a {container} container, so the checkpoint "
+                    f"inside is probably intact --\n"
+                    f"      run: python scripts/rescue_checkpoint.py "
+                    f"{candidate.parent}"
+                )
+            errors.append(note)
             print(f"WARNING: {candidate} could not be loaded ({exc}).")
+            print(f"         it is: {description}")
             continue
         if candidate != path:
             print(f"  fell back to {candidate}")
         return ckpt, candidate
     if errors:
-        raise RuntimeError("no loadable checkpoint:\n" + "\n".join(errors))
+        raise RuntimeError(
+            "no loadable checkpoint:\n" + "\n".join(errors)
+            + "\n\n  If none of these can be rescued, start stage 2 again without"
+              "\n  --resume. Stage 1 is unaffected: the autoencoder loaded fine,"
+              "\n  or this script would have stopped before building the model."
+        )
     return None, None
