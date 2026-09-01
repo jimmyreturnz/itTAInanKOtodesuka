@@ -152,10 +152,18 @@ create a notebook and paste the cells).
 
 Attach your `taiko-shards` dataset (**Add Data** → your datasets).
 
-Then run the cells in order. Section 2 has an alignment sanity check — it
-reports how much louder the audio is at note positions than elsewhere. Above
-1.0 means notes land on audio events. Near 1.0 means they do not, and you
-should stop rather than train on it.
+Then run the cells in order — all of them, every session. Section 4 restores
+checkpoints before anything trains, so a resumed session that skips it starts
+over from scratch without saying so.
+
+Section 5 has an alignment sanity check: it reports how much louder the audio
+is at note positions than elsewhere. Above 1.0 means notes land on audio
+events. Near 1.0 means they do not, and you should stop rather than train on
+it.
+
+Section 3 prints how mels will be read. A 6.5 GB `mels.dat` is most of a
+Kaggle notebook's RAM once it is resident, which is why `--mel-io read` is the
+default — see the memory entry under Troubleshooting.
 
 ### Stage 1: autoencoder (~8 hours, usually one session)
 
@@ -178,27 +186,61 @@ slower — worth it. Do not proceed on 0.95.
 
 ### Stage 2: diffusion (150-250 hours, 15-25 sessions)
 
-This is the long haul. Each session:
+This is the long haul. Each session: run every cell in order. Section 4
+restores the checkpoints *before* anything trains, section 7 trains until its
+share of the 11-hour budget runs out, and section 8 packages the result.
 
-1. Run sections 1, 2, and 6 (restore checkpoints)
-2. Run section 4 (training) — `--max-hours 11` stops it cleanly
-3. **Run section 5 and save the output before the session ends**
-
-Step 3 is the one that bites. Kaggle deletes `/kaggle/working` when a session
-ends. If you forget, you lose that session's work entirely.
+Section 8 is the one that bites. Kaggle deletes `/kaggle/working` when a
+session ends. If you forget, you lose that session's work entirely.
 
 Saving checkpoints between sessions:
 
-- Run section 5 to produce `checkpoints.zip`
+- Run section 8 to produce `checkpoints.zip`
 - Download it from the Output panel
 - Upload it as a Dataset named **taiko-checkpoints** (or update the existing one)
-- Attach it next session; section 6 restores from it
+- Attach it next session; section 4 restores from it
+
+**Upload both `best.pt` and `last.pt`, for both stages.** They do different
+jobs and neither substitutes for the other:
+
+| file | carries | used by |
+|---|---|---|
+| `last.pt` | weights, optimiser, GradScaler, EMA, step, epoch, position in the epoch | `--resume` |
+| `best.pt` | the same, at the best validation score so far | `evaluate.py`, `generate.py`, and as the fallback if `last.pt` is damaged |
+
+`best.pt` cannot resume a run properly: it is a snapshot from whenever
+validation last improved, so resuming from it silently discards every step
+since. And with only `last.pt` you have nothing to generate from if the most
+recent weights are worse than the best ones.
+
+### What a session writes, and when
+
+`last.pt` is written every 250 steps, every 10 minutes, and at the end of every
+epoch — whichever comes first. The clock is the one that matters. Steps are not
+a unit of risk: at 2.6 s/step, saving every 500 steps means an OOM kill or a
+session cut-off costs 22 minutes, and the previous run lost exactly that when
+it died at step 550 with `last.pt` still at step 500.
+
+Writes are atomic — a temporary file, then a rename — so a kill during a save
+cannot leave a `last.pt` the next session refuses to open. If one is damaged
+anyway, `--resume` falls back to `best.pt` and says so rather than ending the
+session.
+
+SIGTERM and the notebook's interrupt button now save before exiting. `SIGKILL`
+from the OOM killer cannot be caught by anything, which is why the periodic
+save above is the real defence.
+
+### Resuming lands where it stopped
+
+The checkpoint records the position within the epoch, and `--resume` runs only
+the remaining batches of it. The old loop restarted the epoch from batch zero,
+repeating up to a full epoch on every resume — across twenty resumes, days.
 
 A healthy loss curve falls fast for the first few thousand steps and then
 improves slowly. Do not read much into small val-loss movements — the number
 that matters is Gate B.
 
-### Gate B (section 7)
+### Gate B (section 9)
 
 ```
 onset_f1           0.5231   target > 0.550    below target
@@ -215,7 +257,7 @@ that fails Gate B will not be fixed by more steps, and finding that out at
 If Gate B fails early:
 
 - Run `python tests/test_dataset.py` — audio/chart alignment
-- Check the section 2 sanity check reported well above 1.0
+- Check the section 5 sanity check reported well above 1.0
 - Confirm the audio encoder levels match the U-Net levels (`profile.summary()`)
 
 Once Gate B passes, keep training; the remaining metrics improve with steps.
@@ -337,12 +379,40 @@ Lower `--batch-size` to 1, or switch to `--profile tiny` to confirm the
 pipeline first.
 
 **Training is slow / GPUs idle**
-Check both T4s are visible in section 1. Raise `--num-workers` to 4. If the GPU
+Check both T4s are visible in section 1. Raise `--num-workers` to 4 and
+`--prefetch-factor` to 4 — but watch the `ram` figure in the log, since each
+queued batch costs `batch x window x 128` floats of host memory. If the GPU
 sits below 80% the dataloader is the bottleneck, not the model.
 
 **Kaggle session died and I lost work**
-Only what was not saved. Always run section 5 before the session ends, and keep
-`--max-hours 11` so training stops with time to spare.
+At most ten minutes of it, plus whatever was in `/kaggle/working` and never
+packaged. Always run section 8 before the session ends, and leave `--max-hours`
+set from the session budget so training stops with time to spare.
+
+**"Your notebook tried to allocate more memory than is available"**
+Host RAM, not GPU. The usual cause was reading mels through a memmap: every
+page it touches becomes a resident page, so random window sampling walks RSS up
+by the full size of `mels.dat` over an hour or two and then the session dies —
+a leak with nothing in the Python heap to blame for it. Both training scripts
+now default to `--mel-io read`, which preads one window at a time and holds no
+pages (measured on a 732 MB file: 20k random windows cost 732 MB of RSS mapped,
+3 MB pread).
+
+If it still happens, the log line carries the numbers:
+
+```
+epoch 2 step 550  loss 0.79  mae 0.71  |g| 0.37  lr 2.75e-05  2.4min  ram 6.2/28.9G
+```
+
+`ram` is the whole process tree, dataloader workers included, over the total the
+machine has. If it climbs steadily, the next things to cut are
+`--prefetch-factor` (each queued batch is `batch x window x 128` floats),
+`--num-workers`, and `--batch-size`.
+
+**Resuming started from an earlier step than I expected**
+The run was killed before its next save. Check the `Resumed from ...: step N,
+epoch E, batch B/M` line — that is exactly where it will continue from. If it is
+older than you expect, lower `--save-every-min`.
 
 ---
 
@@ -353,6 +423,7 @@ taiko/data/frames.py       the time grid; nothing else may define one
 taiko/data/tensor_repr.py  chart <-> tensor, and the beat-grid conditioning
 taiko/data/shards.py       the packed dataset format
 taiko/data/motif.py        the style vector and its presets
+taiko/train/session.py     atomic checkpoints, save triggers, memory reporting
 taiko/model/               autoencoder, audio encoder, U-Net, diffusion
 taiko/eval/metrics.py      chart quality measures
 scripts/                   pack, train, evaluate, generate

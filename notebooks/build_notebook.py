@@ -264,6 +264,12 @@ AE_ARGS = [
     "--channel-mult", "1", "1", "2", "2", "4",   # 16x compression
     "--num-workers", "2",
     "--val-every", "500",
+    # A memmap's touched pages are resident pages, so sampling random windows
+    # walks RSS up by the whole size of mels.dat. "read" preads each window and
+    # holds nothing.
+    "--mel-io", "read",
+    # The clock, not the step count, is what bounds an OOM kill's blast radius.
+    "--save-every-min", "10",
 ]
 
 if (CKPT / "autoencoder" / "last.pt").exists():
@@ -337,7 +343,15 @@ DIFF_ARGS = [
     "--samples-per-epoch", "20000",
     "--num-workers", "4",
     "--val-every", "1000",
-    "--save-every", "500",
+    # Host RAM, not GPU, ended the two-hour run. See --mel-io in stage 1.
+    "--mel-io", "read",
+    "--val-workers", "0",                      # a loader used once per 1000 steps
+    "--prefetch-factor", "2",
+    # 250 steps and 10 minutes, whichever comes first. At 2.6 s/step, saving
+    # only every 500 steps makes a kill cost 22 minutes -- which is exactly what
+    # the run that died at step 550 lost.
+    "--save-every", "250",
+    "--save-every-min", "10",
     "--max-hours", MAX_HOURS,                  # stop cleanly, then cell 15 zips
 ]
 
