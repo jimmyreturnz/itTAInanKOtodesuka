@@ -33,6 +33,13 @@ def _cells() -> list[dict]:
     return json.loads(NOTEBOOK.read_text(encoding="utf-8"))["cells"]
 
 
+def _code_source() -> str:
+    """Every code cell of the generated notebook, concatenated."""
+    return "\n".join(
+        "".join(cell["source"]) for cell in _cells() if cell["cell_type"] == "code"
+    )
+
+
 def test_every_code_cell_parses():
     broken = []
     for i, cell in enumerate(_cells()):
@@ -131,6 +138,57 @@ def test_out_of_memory_restarts_and_resumes():
     assert all("--max-hours" in a for a in argvs), argvs
     print("  OOM restarts and resumes  ok")
 
+
+
+def test_child_output_is_relayed_not_inherited():
+    """
+    A child that inherits the notebook's stdout writes straight to file
+    descriptor 1, and Kaggle records those bytes twice -- once from the
+    descriptor, once when ipykernel's watcher re-emits them -- so every
+    training line appeared twice a fraction of a second apart.
+
+    The supervisor must therefore hand the child a pipe and do the printing
+    itself, leaving exactly one writer.
+    """
+    source = _code_source()
+    assert "stdout=subprocess.PIPE" in source, \
+        "the supervisor is not capturing the child's output"
+    assert "subprocess.run([sys.executable, script" not in source, \
+        "a training stage is run with inherited stdout again; its output " \
+        "will be recorded twice"
+    print("  child output relayed      ok")
+
+
+def test_relayed_output_keeps_exit_code_and_order():
+    """
+    Capturing must not cost the two things the supervisor depends on: the exit
+    code that distinguishes an out-of-memory kill from a real error, and
+    stderr landing in order with the stdout it interrupts.
+    """
+    import re, subprocess, sys, textwrap
+
+    match = re.search(r"def _run_streaming\(command\):.*?\n    return process\n",
+                      _code_source(), re.S)
+    assert match, "the streaming helper is gone"
+    namespace = {"subprocess": subprocess}
+    exec(match.group(0), namespace)
+    run_streaming = namespace["_run_streaming"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        child = Path(tmp) / "child.py"
+        child.write_text(textwrap.dedent("""
+            import sys
+            print("out", flush=True)
+            print("err", file=sys.stderr, flush=True)
+            sys.exit(int(sys.argv[1]))
+        """), encoding="utf-8")
+
+        # 137 is the out-of-memory kill the retry loop keys on; losing it would
+        # turn a recoverable death into an unretried failure.
+        for code in (0, 1, 137):
+            process = run_streaming([sys.executable, str(child), str(code)])
+            assert process.returncode == code, (code, process.returncode)
+    print("  exit codes survive relay  ok")
 
 def test_a_real_error_is_not_retried():
     ok, error, argvs = _run("1", "broken")

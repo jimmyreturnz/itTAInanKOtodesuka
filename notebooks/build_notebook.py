@@ -395,6 +395,39 @@ def _get_arg(args, flag, default):
     return args[args.index(flag) + 1] if flag in args else default
 
 
+def _run_streaming(command):
+    \"\"\"
+    Run a child process, relaying its output through this process.
+
+    Not subprocess.run. A child that inherits the notebook's stdout writes
+    straight to file descriptor 1, and Kaggle records that twice: once from the
+    raw descriptor, and again when ipykernel's watcher picks the same bytes up
+    and re-emits them. The result is every training line appearing twice, a
+    fraction of a second apart.
+
+    Handing the child a pipe and printing what comes back gives exactly one
+    writer -- this process -- so each line is recorded once. Streaming line by
+    line keeps the output live rather than arriving in a lump at exit, and
+    folding stderr into stdout keeps a traceback in order with the log it
+    interrupts.
+    \"\"\"
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        errors="replace",
+    )
+    try:
+        for line in process.stdout:
+            print(line, end="", flush=True)
+    finally:
+        process.stdout.close()
+        process.wait()
+    return process
+
+
 def supervise(script, args, out_dir, budget_hours, label):
     \"\"\"Run a training stage to completion, restarting it when the host runs out.\"\"\"
     out_dir = Path(out_dir)
@@ -425,7 +458,7 @@ def supervise(script, args, out_dir, budget_hours, label):
         print(f"{'=' * 70}", flush=True)
 
         started = time.time()
-        result = subprocess.run([sys.executable, script, *argv])
+        result = _run_streaming([sys.executable, script, *argv])
         ran = time.time() - started
 
         if result.returncode == 0:
