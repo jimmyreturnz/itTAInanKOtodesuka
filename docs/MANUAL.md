@@ -494,9 +494,32 @@ epoch 2 step 550  loss 0.79  ...  ram 3.1+1.0G | cg 9.4/28.9G cache 0.6G | free 
 - `free` — room left before the limit, discounting that cache. This is what
   `--min-free-gb` watches.
 
-If `ram` climbs steadily, cut `--prefetch-factor` (each queued batch is
-`batch x window x 128` floats), then `--num-workers`, then `--batch-size`, and
-pass `--no-pin-memory` — pinned pages cannot be swapped or reclaimed.
+You no longer have to read the trend off a column of numbers. Once growth is
+unmistakable the log says so once, loudly, and every validation prints where it
+went:
+
+```
+  since step 100: +8775 MB over 375 steps (+23.4 MB/step)
+    anonymous (heap, pinned buffers)        +8625 MB   (now 8.69 GB)
+      of which page-locked (pin_memory)     +8250 MB   (now 8.06 GB)
+    mapped files (a memmap)                    +0 MB   (now 0.21 GB)
+    shared memory (dataloader IPC)             +0 MB   (now 0.00 GB)
+    at this rate: about 647 steps of headroom left
+```
+
+Read the largest row, because each names a different cause:
+
+| Growing | What it is | What to do |
+|---|---|---|
+| page-locked | pinned dataloader batches | `--no-pin-memory` (the notebook passes it) |
+| mapped files | a mel memmap | `--mel-io read` |
+| shared memory | dataloader IPC through `/dev/shm` | lower `--num-workers`, `--prefetch-factor` |
+| anonymous only | the Python or CUDA heap | lower `--batch-size`; this one is a bug to find |
+
+Growth bounded by the size of `mels.dat` is the corpus becoming resident and
+will flatten. Growth that stays linear past that is a leak — the run that died
+grew 23.4 MB every step with no curvature over 425 steps, which no 6.69 GB file
+can explain.
 
 **A run stopped itself saying "Only N GB of host memory left"**
 Working as intended. `--min-free-gb` (3 GB in the notebook) saves `last.pt` and

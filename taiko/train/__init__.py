@@ -3,6 +3,7 @@
 from taiko.train.session import (
     EXIT_LOW_MEMORY,
     CheckpointSaver,
+    MemoryTrend,
     SaveTrigger,
     atomic_save,
     cgroup_memory,
@@ -18,6 +19,7 @@ from taiko.train.session import (
 __all__ = [
     "EXIT_LOW_MEMORY",
     "CheckpointSaver",
+    "MemoryTrend",
     "SaveTrigger",
     "atomic_save",
     "cgroup_memory",

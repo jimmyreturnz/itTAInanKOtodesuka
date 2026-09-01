@@ -48,8 +48,8 @@ from taiko.data.shards import MEL_IO_MODES, ShardReader
 from taiko.data.tensor_repr import CHART_CHANNEL_NAMES, ONSET_CHANNELS
 from taiko.model.autoencoder import AutoencoderConfig, ChartAutoencoder
 from taiko.train import (
-    EXIT_LOW_MEMORY, CheckpointSaver, SaveTrigger, headroom_gb,
-    install_stop_handlers, load_checkpoint, memory_line, memory_report,
+    EXIT_LOW_MEMORY, CheckpointSaver, MemoryTrend, SaveTrigger, headroom_gb,
+    install_stop_handlers, load_checkpoint, memory_line, memory_mb, memory_report,
 )
 
 GATE_A_F1 = 0.98
@@ -354,6 +354,7 @@ def main() -> int:
     print()
 
     t0 = time.time()
+    trend = MemoryTrend()
     model.train()
     stop = False
     epoch = start_epoch
@@ -395,12 +396,20 @@ def main() -> int:
             state["batch_in_epoch"] = done_in_epoch
 
             if step % args.log_every == 0:
+                snapshot = memory_mb()
+                trend.observe(step, snapshot)
+                growth = trend.compact()
                 print(f"epoch {epoch + 1:3d} step {step:7d}  "
                       f"loss {log['total_loss']:.4f}  "
                       f"don {log['recall_don']:.2f} kat {log['recall_kat']:.2f} "
                       f"big {log['recall_big_don']:.2f} roll {log['recall_roll']:.2f}  "
-                      f"lr {lr:.2e}  {time.time() - t0:.0f}s  {memory_line()}",
+                      f"lr {lr:.2e}  {time.time() - t0:.0f}s  "
+                      f"{memory_line(snapshot)}"
+                      + (f" | {growth}" if growth else ""),
                       flush=True)
+                alarm = trend.first_warning()
+                if alarm:
+                    print(alarm, flush=True)
 
             if args.val_every and step % args.val_every == 0:
                 val_loss = validate(model, val_loader, device, args.val_batches)
@@ -455,6 +464,7 @@ def main() -> int:
                       f"(--min-free-gb {args.min_free_gb:.1f}). Saving and "
                       f"stopping before the kernel does it for us.")
                 print(memory_report())
+                print(trend.report())
                 saver.save("last.pt", f"low memory at step {step}")
                 print(f"\nStopped at step {step} with a current checkpoint. "
                       f"Start again with:")
@@ -476,6 +486,7 @@ def main() -> int:
               f"/{batches_per_epoch} -- --resume picks up exactly here")
         print("Host memory at exit:")
         print(memory_report())
+        print(trend.report())
         print("\nThe latent scale is calibrated only on a completed run; resume "
               "with:")
         print(f"  python scripts/train_autoencoder.py --resume {args.out / 'last.pt'}")

@@ -148,10 +148,48 @@ there is still room to write 541 MB, instead of taking a SIGKILL. The build
 refuses to write a notebook containing a cell Python cannot parse, and
 `tests/test_notebook.py` keeps it that way.
 
-**Still open.** With the data path cleared by measurement and the metric
-corrected, the residual growth — if there is any — has not been attributed.
-The next session's first log line now prints an honest breakdown; that is what
-to read before changing anything else.
+**The growth is real, and here is its shape.** The full log settles what the
+tail could not. Fitting the 18 samples from step 600 to 1,025:
+
+```
+slope       23.4 MB per optimiser step
+intercept    7.9 GB at step 0
+residual    max 383 MB — dead linear, no curvature at all
+```
+
+Two things follow immediately.
+
+*It is not the mel memmap.* `mels.dat` is 6.69 GB and a step reads 24.0 MB of
+it, so after 600 steps a memmap would be 88% resident and after 1,000 steps
+97% — it could account for **0.62 GB** of growth across that span, against
+**9.3 GB** observed, and it would be visibly flattening. It is not, at all.
+Nothing bounded by the corpus size can produce a straight line 9 GB long.
+
+*It is one batch of mel per step.* 64 × 1536 × 128 × 2 B = 24.0 MB read per
+step against 23.4 MB of growth — a 2.5% match, sustained over 425 steps. And
+the same loop on CPU is flat over 2,018 steps, so whatever holds it exists only
+on the CUDA path. Page-locked batches are the largest such thing:
+`pin_memory=True` and 50 MB of pinned tensors per batch, in an allocator that
+does not return pages to the OS.
+
+That last step is inference, not measurement, and it is not worth another
+session of guessing. Both trainers now carry `MemoryTrend`, which reports the
+slope, the steps of headroom left, and — from `smaps_rollup` — *which kind* of
+memory is growing: anonymous, page-locked, mapped-file, or shared. Those four
+have four different culprits, and the log now names one:
+
+```
+  since step 100: +8775 MB over 375 steps (+23.4 MB/step)
+    anonymous (heap, pinned buffers)        +8625 MB
+      of which page-locked (pin_memory)     +8250 MB
+    mapped files (a memmap)                    +0 MB
+    shared memory (dataloader IPC)             +0 MB
+```
+
+The notebook passes `--no-pin-memory` on the hypothesis above; dropping that
+one line puts pinning back and the trend block reports the difference. Either
+way the session no longer hangs on the answer: `--min-free-gb 3` saves and
+exits with ~850 steps of headroom to spare, and the supervisor resumes.
 
 ### Next: the `tiny` rehearsal (D4)
 

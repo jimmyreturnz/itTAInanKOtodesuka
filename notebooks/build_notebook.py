@@ -581,6 +581,18 @@ DIFF_ARGS = [
     "--val-every", "1000",
     # Host RAM, not GPU, ended the two-hour run. See --mel-io in stage 1.
     "--mel-io", "read",
+    # The run that died grew 23.4 MB every single step, dead linear from step
+    # zero, which is almost exactly one batch of mel (64 x 1536 x 128 x 2 B =
+    # 24.0 MB). It is not the mel memmap -- that would saturate at 6.7 GB and
+    # visibly flatten, and it did not flatten across 425 steps -- and the same
+    # loop on CPU is flat over 2,018 steps. Page-locked batches are the largest
+    # thing that only exists on the CUDA path, so they go first. The H2D cost
+    # is 25 MB per 2.6 s step, which is nothing here.
+    #
+    # This is a hypothesis, and the log now tests it either way: the `lock`
+    # and trend fields say what is growing within a hundred steps. Drop this
+    # line to put pinning back and compare.
+    "--no-pin-memory",
     "--val-workers", "0",                      # a loader used once per 1000 steps
     "--prefetch-factor", "2",
     # 250 steps and 10 minutes, whichever comes first. At 2.6 s/step, saving

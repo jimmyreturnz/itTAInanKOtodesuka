@@ -181,6 +181,57 @@ def test_memory_counts_shared_pages_once():
     print("  memory is PSS, not RSS sum ok")
 
 
+def test_memory_trend_measures_a_leak_and_names_it():
+    """
+    The instrument that was missing. A run growing 23.4 MB a step was legible
+    only as a column of numbers nobody could act on; this has to turn the same
+    column into a rate, a deadline, and a culprit.
+    """
+    from taiko.train.session import MemoryTrend, memory_mb
+
+    trend = MemoryTrend(warmup_steps=0)
+    base, snapshot = memory_mb(), None
+    for step in range(0, 400, 25):
+        snapshot = dict(base)
+        snapshot["tree"] = base["tree"] + step * 23.4
+        snapshot["anon"] = base["anon"] + step * 23.0
+        snapshot["locked"] = base["locked"] + step * 22.0
+        trend.observe(step, snapshot)
+
+    slope = trend.slope_mb_per_step()
+    assert abs(slope - 23.4) < 0.01, slope
+    assert trend.steps_left() > 0
+    assert "23.4MB/st" in trend.compact(), trend.compact()
+
+    report = trend.report(snapshot)
+    assert "+23.4 MB/step" in report, report
+    # The point of the split: the growth is attributed, not just totalled.
+    assert "page-locked" in report and "+8250 MB" in report, report
+
+    # The alarm fires once, so it stays readable.
+    trend._warned = False
+    assert "HOST MEMORY IS GROWING" in trend.first_warning()
+    assert trend.first_warning() == "", "the alarm repeated"
+    print("  memory trend names a leak ok")
+
+
+def test_memory_trend_stays_quiet_when_flat():
+    """A warning that fires on a healthy run is a warning that gets ignored."""
+    from taiko.train.session import MemoryTrend, memory_mb
+
+    trend = MemoryTrend(warmup_steps=0)
+    base, snapshot = memory_mb(), None
+    for step in range(0, 400, 25):
+        snapshot = dict(base)
+        snapshot["tree"] = base["tree"] + (step % 50) * 0.01     # noise, no trend
+        trend.observe(step, snapshot)
+
+    assert trend.compact() == "", trend.compact()
+    assert trend.first_warning() == "", trend.first_warning()
+    assert "flat" in trend.report(snapshot), trend.report(snapshot)
+    print("  flat memory stays quiet  ok")
+
+
 if __name__ == "__main__":
     print("checkpointing")
     for name, fn in sorted(globals().items()):

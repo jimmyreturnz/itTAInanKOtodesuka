@@ -83,6 +83,43 @@ def _rss_mb(pid: int | None = None) -> float:
         return 0.0
 
 
+# What /proc/<pid>/smaps_rollup calls each kind of resident memory, and what
+# that kind actually is on a training host. This split is the whole point: 23 MB
+# a step is a mystery, 23 MB a step of *locked* memory is the pinned-batch
+# allocator and 23 MB a step of *file* memory is a memmap.
+_SMAPS_FIELDS = {
+    "Pss":       "pss",         # the tree's honest total
+    "Pss_Anon":  "anon",        # heap, and cudaHostAlloc'd pinned buffers
+    "Pss_File":  "file",        # mapped files -- a mel memmap lands here
+    "Pss_Shmem": "shmem",       # /dev/shm: how dataloader workers ship batches
+    "Locked":    "locked",      # page-locked, i.e. pin_memory
+    "Rss":       "rss",
+}
+
+
+def _smaps_mb(pid: int | None = None) -> dict[str, float]:
+    """
+    One process's resident memory, split by kind, in MB.
+
+    Falls back to RSS alone where smaps_rollup is unavailable, so this degrades
+    to the old (wrong-but-present) number rather than to nothing.
+    """
+    out = {name: 0.0 for name in _SMAPS_FIELDS.values()}
+    try:
+        with open(f"/proc/{pid or os.getpid()}/smaps_rollup", encoding="ascii") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                name = _SMAPS_FIELDS.get(key)
+                if name:
+                    out[name] = int(rest.split()[0]) / 1024
+        if out["pss"]:
+            return out
+    except (OSError, IndexError, ValueError):
+        pass
+    rss = _rss_mb(pid)
+    return {**out, "pss": rss, "rss": rss}
+
+
 def _pss_mb(pid: int | None = None) -> float:
     """
     Proportional set size of one process, in MB.
@@ -229,15 +266,25 @@ def memory_mb() -> dict[str, float]:
     """
     pid = os.getpid()
     children = _descendants(pid)
-    own = _pss_mb(pid)
-    workers = sum(_pss_mb(child) for child in children)
+    mine = _smaps_mb(pid)
+    theirs = [_smaps_mb(child) for child in children]
+
+    def total(name: str) -> float:
+        return mine[name] + sum(t[name] for t in theirs)
 
     out = {
-        "self": own,
-        "workers": workers,
+        "self": mine["pss"],
+        "workers": sum(t["pss"] for t in theirs),
         "worker_count": float(len(children)),
-        "tree": own + workers,
-        "rss": _rss_mb(pid),
+        "tree": total("pss"),
+        # Where that total lives. Anonymous is the heap and the pinned-buffer
+        # allocator; file is mapped files; shmem is how workers hand batches
+        # over; locked is pinned specifically, and is a subset of anonymous.
+        "anon": total("anon"),
+        "file": total("file"),
+        "shmem": total("shmem"),
+        "locked": total("locked"),
+        "rss": mine["rss"],
         "available": _mem_available_mb(),
         "headroom": headroom_mb(),
     }
@@ -253,7 +300,7 @@ def memory_mb() -> dict[str, float]:
     return out
 
 
-def memory_line() -> str:
+def memory_line(snapshot: dict[str, float] | None = None) -> str:
     """
     One compact field for the training log.
 
@@ -263,8 +310,10 @@ def memory_line() -> str:
 
         ram 4.1+1.2G | cg 18.3/29.0G cache 6.7G | free 10.7G gpu 1.1G
     """
-    m = memory_mb()
+    m = snapshot or memory_mb()
     text = f"ram {m['self'] / 1024:.1f}+{m['workers'] / 1024:.1f}G"
+    if m["locked"] > 256:
+        text += f" lock {m['locked'] / 1024:.1f}G"
     if "cgroup_limit" in m:
         text += (f" | cg {m['cgroup_usage'] / 1024:.1f}/{m['cgroup_limit'] / 1024:.1f}G"
                  f" cache {m.get('cgroup_cache', 0.0) / 1024:.1f}G")
@@ -274,9 +323,9 @@ def memory_line() -> str:
     return text
 
 
-def memory_report() -> str:
+def memory_report(snapshot: dict[str, float] | None = None) -> str:
     """The same numbers over several lines, for the start and end of a run."""
-    m = memory_mb()
+    m = snapshot or memory_mb()
     lines = [
         f"  this process     {m['self'] / 1024:6.2f} GB   (RSS {m['rss'] / 1024:.2f} GB)",
         f"  {int(m['worker_count'])} child processes {m['workers'] / 1024:6.2f} GB",
@@ -291,7 +340,122 @@ def memory_report() -> str:
         lines.append("  container        no cgroup limit visible; "
                      "falling back to MemAvailable")
     lines.append(f"  room to grow     {m['headroom'] / 1024:6.2f} GB")
+    lines.append(f"  of the total:    anonymous {m['anon'] / 1024:.2f} GB "
+                 f"(page-locked {m['locked'] / 1024:.2f} GB), "
+                 f"mapped files {m['file'] / 1024:.2f} GB, "
+                 f"shared {m['shmem'] / 1024:.2f} GB")
     return "\n".join(lines)
+
+
+class MemoryTrend:
+    """
+    Watches host memory across a run and says what it is doing, and why.
+
+    A number printed every 25 steps is not a trend, and two sessions were spent
+    reading one. What the log actually needed to say was: this is growing, at
+    23 MB a step, and at that rate you have 870 steps before you are killed --
+    which is knowable at step 150, not at hour one.
+
+    The attribution matters as much as the rate. Growth in `locked` is the
+    pinned-batch allocator; in `file`, a memmap; in `shmem`, the pipe the
+    dataloader workers ship batches through; in `anon` and nothing else, the
+    Python or CUDA heap. Naming the kind turns "find the leak" into a search
+    with one place to look.
+
+    A baseline is taken after `warmup_steps`, because the first minute of a run
+    is loader spin-up and CUDA context creation and is not a trend.
+    """
+
+    def __init__(self, warmup_steps: int = 100, window: int = 20):
+        self.warmup_steps = warmup_steps
+        self.window = window
+        self.baseline: tuple[int, dict[str, float]] | None = None
+        self.samples: list[tuple[int, float]] = []
+        self._warned = False
+
+    def observe(self, step: int, snapshot: dict[str, float] | None = None) -> None:
+        snapshot = snapshot or memory_mb()
+        if self.baseline is None:
+            if step < self.warmup_steps:
+                return
+            self.baseline = (step, snapshot)
+        self.samples.append((step, snapshot["tree"]))
+        if len(self.samples) > self.window:
+            del self.samples[0]
+
+    def slope_mb_per_step(self) -> float | None:
+        """Least squares over the recent window; None until there is one."""
+        if len(self.samples) < 4:
+            return None
+        n = len(self.samples)
+        sx = sum(s for s, _ in self.samples)
+        sy = sum(m for _, m in self.samples)
+        sxx = sum(s * s for s, _ in self.samples)
+        sxy = sum(s * m for s, m in self.samples)
+        denominator = n * sxx - sx * sx
+        if denominator == 0:
+            return None
+        return (n * sxy - sx * sy) / denominator
+
+    def steps_left(self) -> float | None:
+        slope = self.slope_mb_per_step()
+        if not slope or slope <= 0:
+            return None
+        return headroom_mb() / slope
+
+    def first_warning(self, threshold_mb_per_step: float = 1.0) -> str:
+        """
+        The alarm, raised once, as soon as growth is unmistakable.
+
+        Once is deliberate: a warning on every log line is a warning nobody
+        reads, and the useful moment is the first one -- when there are still
+        hours left to act on it rather than minutes.
+        """
+        if self._warned:
+            return ""
+        slope = self.slope_mb_per_step()
+        if slope is None or slope < threshold_mb_per_step:
+            return ""
+        self._warned = True
+        left = self.steps_left()
+        when = (f"about {left:.0f} steps" if left is not None else "an unknown time")
+        return ("\n  HOST MEMORY IS GROWING. This run has " + when + " before it is\n"
+                "  killed. What is growing:\n" + self.report())
+
+    def compact(self) -> str:
+        """`+23.4MB/st ~870 left`, or empty while nothing is growing."""
+        slope = self.slope_mb_per_step()
+        if slope is None or slope < 0.5:
+            return ""
+        left = self.steps_left()
+        text = f"+{slope:.1f}MB/st"
+        return text + (f" ~{left:.0f} left" if left is not None else "")
+
+    def report(self, snapshot: dict[str, float] | None = None) -> str:
+        """Where the growth since the baseline actually went."""
+        if self.baseline is None:
+            return "  memory trend: not enough of the run has passed yet"
+        first_step, first = self.baseline
+        now = snapshot or memory_mb()
+        steps = (self.samples[-1][0] if self.samples else first_step) - first_step
+        grown = now["tree"] - first["tree"]
+        slope = self.slope_mb_per_step()
+        if slope is not None and slope < 0.5:
+            return (f"  memory flat since step {first_step} "
+                    f"({grown:+.0f} MB over {steps} steps)")
+
+        lines = [f"  since step {first_step}: {grown:+.0f} MB over {steps} steps"
+                 + (f" ({grown / steps:+.1f} MB/step)" if steps > 0 else "")]
+        for key, label in (("anon", "anonymous (heap, pinned buffers)"),
+                           ("locked", "  of which page-locked (pin_memory)"),
+                           ("file", "mapped files (a memmap)"),
+                           ("shmem", "shared memory (dataloader IPC)")):
+            lines.append(f"    {label:<36s} {now[key] - first[key]:+8.0f} MB"
+                         f"   (now {now[key] / 1024:.2f} GB)")
+        left = self.steps_left()
+        if left is not None:
+            lines.append(f"    at this rate: about {left:.0f} steps of headroom left")
+        return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #

@@ -81,8 +81,8 @@ from taiko.data.shards import MEL_IO_MODES, ShardReader
 from taiko.model.diffusion import EMA, TaikoDiffusion
 from taiko.model.model_config import PROFILES, get_profile
 from taiko.train import (
-    EXIT_LOW_MEMORY, CheckpointSaver, SaveTrigger, headroom_gb,
-    install_stop_handlers, load_checkpoint, memory_line, memory_report,
+    EXIT_LOW_MEMORY, CheckpointSaver, MemoryTrend, SaveTrigger, headroom_gb,
+    install_stop_handlers, load_checkpoint, memory_line, memory_mb, memory_report,
 )
 
 
@@ -392,6 +392,7 @@ def main() -> int:
     print()
 
     t0 = time.time()
+    trend = MemoryTrend()
     model.train()
     stop = False
 
@@ -410,6 +411,9 @@ def main() -> int:
             saver.save("best.pt")
             marker = "  <- best"
         print(f"  val {val_loss:.5f} (best {state['best_val']:.5f}){marker}  [{tag}]")
+        # Validation is the natural place for the fuller picture: it is rare
+        # enough not to be noise and frequent enough to be current.
+        print(trend.report(), flush=True)
 
     epoch = start_epoch
     reason = "finished"
@@ -458,10 +462,17 @@ def main() -> int:
 
                 if step % args.log_every == 0:
                     elapsed = time.time() - t0
+                    snapshot = memory_mb()
+                    trend.observe(step, snapshot)
+                    growth = trend.compact()
                     print(f"epoch {epoch + 1:3d} step {step:7d}  "
                           f"loss {float(metrics[0]):.4f}  mae {float(metrics[1]):.4f}  "
                           f"|g| {float(grad_norm):.2f}  lr {lr_now:.2e}  "
-                          f"{elapsed / 60:.1f}min  {memory_line()}", flush=True)
+                          f"{elapsed / 60:.1f}min  {memory_line(snapshot)}"
+                          + (f" | {growth}" if growth else ""), flush=True)
+                    alarm = trend.first_warning()
+                    if alarm:
+                        print(alarm, flush=True)
 
                 if args.val_every and step % args.val_every == 0:
                     run_validation(f"step {step}")
@@ -488,6 +499,7 @@ def main() -> int:
                           f"(--min-free-gb {args.min_free_gb:.1f}). Saving and "
                           f"stopping before the kernel does it for us.")
                     print(memory_report())
+                    print(trend.report())
                     saver.save("last.pt", f"low memory at step {step}")
                     print(f"\nStopped at step {step} with a current checkpoint. "
                           f"Start again with:")
@@ -522,6 +534,7 @@ def main() -> int:
     print(f"Checkpoints: {args.out / 'best.pt'}  {args.out / 'last.pt'}")
     print("Host memory at exit:")
     print(memory_report())
+    print(trend.report())
     print("\nNext, measure Gate B (onset F1 > 0.40 on held-out audio):")
     print(f"  python scripts/evaluate.py --diffusion {args.out / 'best.pt'} --ae {args.ae}")
     return 0
