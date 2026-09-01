@@ -48,7 +48,8 @@ from taiko.data.shards import MEL_IO_MODES, ShardReader
 from taiko.data.tensor_repr import CHART_CHANNEL_NAMES, ONSET_CHANNELS
 from taiko.model.autoencoder import AutoencoderConfig, ChartAutoencoder
 from taiko.train import (
-    CheckpointSaver, SaveTrigger, install_stop_handlers, load_checkpoint, memory_line,
+    EXIT_LOW_MEMORY, CheckpointSaver, SaveTrigger, headroom_gb,
+    install_stop_handlers, load_checkpoint, memory_line, memory_report,
 )
 
 GATE_A_F1 = 0.98
@@ -209,6 +210,16 @@ def main() -> int:
     ap.add_argument("--no-epoch-save", dest="epoch_save", action="store_false",
                     default=True, help="do not save at the end of every epoch")
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--no-pin-memory", dest="pin_memory", action="store_false",
+                    default=True,
+                    help="do not page-lock loader batches. Pinned memory cannot "
+                         "be swapped or reclaimed; turn it off on a host short "
+                         "of RAM")
+    ap.add_argument("--min-free-gb", type=float, default=2.0,
+                    help="save and exit cleanly when this little host memory is "
+                         "left, rather than waiting to be killed. Exits with "
+                         f"code {EXIT_LOW_MEMORY} so a supervisor can restart "
+                         "with --resume. 0 to disable")
     ap.add_argument("--max-hours", type=float, default=None,
                     help="stop cleanly before a session limit, saving first")
     ap.add_argument("--fp16", action="store_true", default=True)
@@ -252,7 +263,7 @@ def main() -> int:
     def loader_kwargs(workers: int, persistent: bool) -> dict:
         return dict(
             num_workers=workers,
-            pin_memory=(device.type == "cuda"),
+            pin_memory=(device.type == "cuda" and args.pin_memory),
             persistent_workers=persistent and workers > 0,
             prefetch_factor=args.prefetch_factor if workers > 0 else None,
         )
@@ -335,6 +346,11 @@ def main() -> int:
     print(f"Checkpointing to {args.out}: {trigger.summary()}")
     if args.max_hours:
         print(f"Will stop cleanly after {args.max_hours:.1f} hours")
+    if args.min_free_gb:
+        print(f"Will stop cleanly if free host memory falls below "
+              f"{args.min_free_gb:.1f} GB")
+    print("Host memory before the first batch:")
+    print(memory_report())
     print()
 
     t0 = time.time()
@@ -432,6 +448,19 @@ def main() -> int:
                 stop = True
                 break
 
+            # Saving here is the difference between losing two minutes and
+            # losing the session: SIGKILL arrives without warning.
+            if args.min_free_gb and headroom_gb() < args.min_free_gb:
+                print(f"\nOnly {headroom_gb():.1f} GB of host memory left "
+                      f"(--min-free-gb {args.min_free_gb:.1f}). Saving and "
+                      f"stopping before the kernel does it for us.")
+                print(memory_report())
+                saver.save("last.pt", f"low memory at step {step}")
+                print(f"\nStopped at step {step} with a current checkpoint. "
+                      f"Start again with:")
+                print(f"  --resume {args.out / 'last.pt'}")
+                return EXIT_LOW_MEMORY
+
         # ---- end of epoch ------------------------------------------------- #
         if done_in_epoch >= batches_per_epoch:
             state["epoch"] = epoch + 1
@@ -445,7 +474,8 @@ def main() -> int:
         print(f"Stopped early ({reason}) at step {step}, best onset F1 {best_f1:.4f}")
         print(f"Epoch {state['epoch'] + 1}, batch {state['batch_in_epoch']}"
               f"/{batches_per_epoch} -- --resume picks up exactly here")
-        print(f"Memory at exit: {memory_line()}")
+        print("Host memory at exit:")
+        print(memory_report())
         print("\nThe latent scale is calibrated only on a completed run; resume "
               "with:")
         print(f"  python scripts/train_autoencoder.py --resume {args.out / 'last.pt'}")

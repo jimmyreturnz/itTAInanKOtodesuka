@@ -28,9 +28,26 @@ follow from that:
 
 Memory reporting lives here too, because "your notebook tried to allocate more
 memory than is available" is a message about host RAM that arrives with no
-indication of what consumed it. Printing RSS and MemAvailable on every log line
-turns the next occurrence into a number that can be read off the log rather
-than a mystery.
+indication of what consumed it. The first version of this printed the sum of
+RSS over the process and its dataloader workers, which multiplies every page
+they share by the number of workers -- the CUDA context, torch's shared
+objects, the model, the packed index -- and reported a run at 30 GB whose real
+footprint was a fraction of that. A wrong number is worse than none: it sent a
+whole session looking for a leak in the data path that measurement then showed
+was not there.
+
+So the numbers here are chosen to be attributable. PSS instead of RSS, so the
+tree's total is the tree's real footprint. This process and its workers
+separately, so growth has an address. The cgroup's own usage and limit, because
+that is what a container is actually killed on and /proc/meminfo may be
+describing the host. And page cache called out on its own, because streaming a
+6.7 GB mel file parks 6.7 GB of it -- reclaimable, not lost, and not the run's
+own growth.
+
+Running out is then something the run can act on rather than be killed by:
+`headroom_mb` is what the training loops watch, and a stage that sees it fall
+too far saves and exits with EXIT_LOW_MEMORY so a supervisor can restart it
+with --resume. Two minutes lost instead of a session.
 """
 
 from __future__ import annotations
@@ -51,6 +68,11 @@ import torch
 
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
+# Exit code meaning "I stopped myself because host memory ran out, my checkpoint
+# is current, start me again with --resume". Distinct from 1 (a real error) so a
+# supervisor can tell "resume me" from "I am broken" without parsing the log.
+EXIT_LOW_MEMORY = 17
+
 
 def _rss_mb(pid: int | None = None) -> float:
     """Resident set size of one process, in MB. 0.0 where /proc is absent."""
@@ -61,6 +83,34 @@ def _rss_mb(pid: int | None = None) -> float:
         return 0.0
 
 
+def _pss_mb(pid: int | None = None) -> float:
+    """
+    Proportional set size of one process, in MB.
+
+    RSS counts a shared page in full in every process that maps it, so summing
+    RSS across a parent and its forked dataloader workers multiplies everything
+    they share -- the CUDA context, torch's shared objects, the model, the
+    packed index -- by the number of workers. That is not a small correction:
+    measured here on a four-worker loader, the parent's RSS was 825 MB and the
+    RSS sum over the tree was 2,618 MB for a process whose real footprint was
+    about a gigabyte. A run reported at 30 GB on that arithmetic may be nowhere
+    near 30 GB, which is exactly how two sessions can be spent without learning
+    anything.
+
+    PSS divides each shared page by the number of processes mapping it, so the
+    sum over a process tree is the tree's real footprint. Falls back to RSS
+    where smaps_rollup is unavailable (older kernels, restricted /proc).
+    """
+    try:
+        with open(f"/proc/{pid or os.getpid()}/smaps_rollup", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, IndexError, ValueError):
+        pass
+    return _rss_mb(pid)
+
+
 def _child_pids(pid: int) -> list[int]:
     try:
         with open(f"/proc/{pid}/task/{pid}/children", encoding="ascii") as fh:
@@ -69,35 +119,134 @@ def _child_pids(pid: int) -> list[int]:
         return []
 
 
-def memory_mb() -> dict[str, float]:
-    """
-    Host and device memory, in MB.
-
-    `tree` includes the dataloader workers. They are where a windowed dataset's
-    memory actually lives -- each worker holds its own prefetch queue and its
-    own copy-on-write image of the index -- so a figure that counts only the
-    parent process reports roughly a third of the truth and exonerates the
-    component most likely to be at fault.
-    """
-    pid = os.getpid()
-    tree = _rss_mb(pid)
-    stack = _child_pids(pid)
+def _descendants(pid: int) -> list[int]:
+    out, stack = [], _child_pids(pid)
     while stack:
         child = stack.pop()
-        tree += _rss_mb(child)
+        out.append(child)
         stack.extend(_child_pids(child))
+    return out
 
-    available = 0.0
+
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path, encoding="ascii") as fh:
+            text = fh.read().strip()
+        return None if text == "max" else int(text)
+    except (OSError, ValueError):
+        return None
+
+
+def cgroup_memory() -> dict[str, float]:
+    """
+    The container's own memory accounting, in MB: `usage`, `limit`, `cache`.
+
+    This is the number a container is actually killed on, and it is not what
+    /proc/meminfo reports -- on a machine where /proc is not namespaced,
+    MemAvailable describes the host and says nothing about the limit this
+    process will die at. Empty dict where no cgroup limit is visible.
+
+    `cache` is page cache charged to the cgroup. Streaming a 6.7 GB mel file
+    parks 6.7 GB there; it is reclaimable rather than lost, so it is reported
+    separately instead of being mistaken for the run's own growth.
+    """
+    v2_usage = _read_int("/sys/fs/cgroup/memory.current")
+    if v2_usage is not None:
+        limit = _read_int("/sys/fs/cgroup/memory.max")
+        cache = 0
+        try:
+            with open("/sys/fs/cgroup/memory.stat", encoding="ascii") as fh:
+                for line in fh:
+                    if line.startswith("file "):
+                        cache = int(line.split()[1])
+                        break
+        except (OSError, IndexError, ValueError):
+            pass
+        out = {"usage": v2_usage / 1024 ** 2, "cache": cache / 1024 ** 2}
+        if limit:
+            out["limit"] = limit / 1024 ** 2
+        return out
+
+    v1_usage = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    if v1_usage is not None:
+        limit = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        cache = 0
+        try:
+            with open("/sys/fs/cgroup/memory/memory.stat", encoding="ascii") as fh:
+                for line in fh:
+                    if line.startswith("total_cache "):
+                        cache = int(line.split()[1])
+                        break
+        except (OSError, IndexError, ValueError):
+            pass
+        out = {"usage": v1_usage / 1024 ** 2, "cache": cache / 1024 ** 2}
+        # A cgroup with no limit reports something absurd like 8 EB.
+        if limit and limit < 1 << 53:
+            out["limit"] = limit / 1024 ** 2
+        return out
+
+    return {}
+
+
+def _mem_available_mb() -> float:
     try:
         with open("/proc/meminfo", encoding="ascii") as fh:
             for line in fh:
                 if line.startswith("MemAvailable:"):
-                    available = int(line.split()[1]) / 1024
-                    break
+                    return int(line.split()[1]) / 1024
     except (OSError, IndexError, ValueError):
         pass
+    return 0.0
 
-    out = {"rss": _rss_mb(pid), "tree": tree, "available": available}
+
+def headroom_mb() -> float:
+    """
+    How much more this process tree can allocate before it is killed, in MB.
+
+    Prefers the cgroup limit, because that is what kills a container, and
+    discounts page cache, because the kernel reclaims that rather than dying
+    on it. Falls back to MemAvailable where no limit is visible.
+    """
+    cg = cgroup_memory()
+    if "limit" in cg:
+        anonymous = max(cg["usage"] - cg.get("cache", 0.0), 0.0)
+        return max(cg["limit"] - anonymous, 0.0)
+    return _mem_available_mb()
+
+
+def headroom_gb() -> float:
+    return headroom_mb() / 1024
+
+
+def memory_mb() -> dict[str, float]:
+    """
+    Host and device memory, in MB.
+
+    `self` is this process, `workers` is everything it forked -- the dataloader
+    workers, where a windowed dataset's memory actually lives -- and both are
+    PSS, so the pages they share are counted once between them rather than once
+    each. `tree` is their sum: the real footprint of the run.
+    """
+    pid = os.getpid()
+    children = _descendants(pid)
+    own = _pss_mb(pid)
+    workers = sum(_pss_mb(child) for child in children)
+
+    out = {
+        "self": own,
+        "workers": workers,
+        "worker_count": float(len(children)),
+        "tree": own + workers,
+        "rss": _rss_mb(pid),
+        "available": _mem_available_mb(),
+        "headroom": headroom_mb(),
+    }
+    cg = cgroup_memory()
+    if cg:
+        out["cgroup_usage"] = cg["usage"]
+        out["cgroup_cache"] = cg.get("cache", 0.0)
+        if "limit" in cg:
+            out["cgroup_limit"] = cg["limit"]
     if torch.cuda.is_available():
         out["gpu"] = torch.cuda.memory_allocated() / 1024 ** 2
         out["gpu_reserved"] = torch.cuda.memory_reserved() / 1024 ** 2
@@ -105,12 +254,44 @@ def memory_mb() -> dict[str, float]:
 
 
 def memory_line() -> str:
-    """One compact field for the training log: `ram 3.1/12.4G gpu 8.9G`."""
+    """
+    One compact field for the training log.
+
+    Every term is here because its absence cost a session: how much this run
+    holds, how much of that is the workers, how much of the container's usage
+    is merely reclaimable page cache, and how much room is actually left.
+
+        ram 4.1+1.2G | cg 18.3/29.0G cache 6.7G | free 10.7G gpu 1.1G
+    """
     m = memory_mb()
-    text = f"ram {m['tree'] / 1024:.1f}/{(m['tree'] + m['available']) / 1024:.1f}G"
+    text = f"ram {m['self'] / 1024:.1f}+{m['workers'] / 1024:.1f}G"
+    if "cgroup_limit" in m:
+        text += (f" | cg {m['cgroup_usage'] / 1024:.1f}/{m['cgroup_limit'] / 1024:.1f}G"
+                 f" cache {m.get('cgroup_cache', 0.0) / 1024:.1f}G")
+    text += f" | free {m['headroom'] / 1024:.1f}G"
     if "gpu_reserved" in m:
         text += f" gpu {m['gpu_reserved'] / 1024:.1f}G"
     return text
+
+
+def memory_report() -> str:
+    """The same numbers over several lines, for the start and end of a run."""
+    m = memory_mb()
+    lines = [
+        f"  this process     {m['self'] / 1024:6.2f} GB   (RSS {m['rss'] / 1024:.2f} GB)",
+        f"  {int(m['worker_count'])} child processes {m['workers'] / 1024:6.2f} GB",
+        f"  run total        {m['tree'] / 1024:6.2f} GB",
+    ]
+    if "cgroup_limit" in m:
+        lines.append(
+            f"  container        {m['cgroup_usage'] / 1024:6.2f} GB of "
+            f"{m['cgroup_limit'] / 1024:.2f} GB, of which "
+            f"{m.get('cgroup_cache', 0.0) / 1024:.2f} GB is reclaimable page cache")
+    else:
+        lines.append("  container        no cgroup limit visible; "
+                     "falling back to MemAvailable")
+    lines.append(f"  room to grow     {m['headroom'] / 1024:6.2f} GB")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +352,24 @@ def file_digest(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def update_manifest(directory: Path) -> Path:
+def read_manifest(directory: Path) -> dict[str, tuple[str, int]]:
+    """{name: (digest, size)} from a directory's manifest; empty if absent."""
+    manifest = Path(directory) / MANIFEST_NAME
+    if not manifest.exists():
+        return {}
+    out: dict[str, tuple[str, int]] = {}
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            digest, size, name = line.split(None, 2)
+            out[name] = (digest, int(size))
+        except ValueError:
+            continue
+    return out
+
+
+def update_manifest(directory: Path, changed: Path | None = None) -> Path:
     """
     Record the size and digest of every checkpoint in a directory.
 
@@ -180,11 +378,27 @@ def update_manifest(directory: Path) -> Path:
     HTML error page has a different size and digest, and that is knowable in
     seconds at restore time rather than eleven hours later when --resume
     finally opens it.
+
+    `changed` names the one file just written, and every other entry is carried
+    over from the existing manifest. Re-hashing the whole directory on every
+    save meant reading best.pt as well as last.pt -- a gigabyte of I/O every
+    ten minutes, through the page cache, on the machine least able to spare it,
+    to recompute a digest that could not have changed.
     """
     directory = Path(directory)
+    known = read_manifest(directory)
+    if changed is not None:
+        known.pop(Path(changed).name, None)
+
     lines = []
     for path in sorted(directory.glob("*.pt")):
-        lines.append(f"{file_digest(path)}  {path.stat().st_size}  {path.name}")
+        cached = known.get(path.name)
+        if cached and cached[1] == path.stat().st_size:
+            digest, size = cached
+        else:
+            digest, size = file_digest(path), path.stat().st_size
+        lines.append(f"{digest}  {size}  {path.name}")
+
     manifest = directory / MANIFEST_NAME
     manifest.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     return manifest
@@ -322,8 +536,9 @@ class CheckpointSaver:
         atomic_save(self.build(), path)
         # Refresh after every write. The manifest is only useful if it
         # describes the files as they are now, not as they were at the start
-        # of the session.
-        update_manifest(self.out)
+        # of the session -- but only this file changed, so only this file is
+        # re-hashed.
+        update_manifest(self.out, changed=path)
         if name == "last.pt":
             # Only the resume target resets the clock. best.pt is written
             # whenever validation improves, which is not a reason to let

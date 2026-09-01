@@ -33,9 +33,19 @@ Host memory
 -----------
 --mel-io read is the default here. A memmap's touched pages are resident pages,
 so sampling random windows walks RSS up by the whole size of mels.dat over an
-hour or two and the run dies of a leak that is not in the Python heap. Every
-log line now carries RSS and the memory left, so the next occurrence is a
-number rather than a mystery. See taiko/data/shards.py.
+hour or two and the run dies of a leak that is not in the Python heap. See
+taiko/data/shards.py.
+
+Two things were then still missing, and between them they cost two Kaggle
+sessions. The first is a memory figure worth reading: the log used to print the
+sum of RSS over this process and its dataloader workers, which counts every
+page they share once per worker and reported a run at 30 GB whose real
+footprint was a fraction of that. It now prints PSS, split between this process
+and its workers, alongside the cgroup's own usage and limit -- the number the
+container is actually killed on. The second is doing something about it:
+--min-free-gb saves and exits with EXIT_LOW_MEMORY while there is still room to
+write the checkpoint, so a supervisor restarts with --resume and the run loses
+two minutes instead of ten hours.
 
 Gate B: onset F1 above 0.40 against held-out audio. That is the alignment gate
 -- it is what distinguishes a model listening to the music from one emitting
@@ -71,7 +81,8 @@ from taiko.data.shards import MEL_IO_MODES, ShardReader
 from taiko.model.diffusion import EMA, TaikoDiffusion
 from taiko.model.model_config import PROFILES, get_profile
 from taiko.train import (
-    CheckpointSaver, SaveTrigger, install_stop_handlers, load_checkpoint, memory_line,
+    EXIT_LOW_MEMORY, CheckpointSaver, SaveTrigger, headroom_gb,
+    install_stop_handlers, load_checkpoint, memory_line, memory_report,
 )
 
 
@@ -157,6 +168,16 @@ def main() -> int:
     ap.add_argument("--mel-io", default="read", choices=list(MEL_IO_MODES),
                     help="'read' preads each window and holds no pages; 'mmap' is "
                          "faster but its resident set grows to the size of mels.dat")
+    ap.add_argument("--no-pin-memory", dest="pin_memory", action="store_false",
+                    default=True,
+                    help="do not page-lock loader batches. Pinned memory cannot "
+                         "be swapped or reclaimed, and at this window a batch is "
+                         "tens of MB; turn it off on a host short of RAM")
+    ap.add_argument("--min-free-gb", type=float, default=2.0,
+                    help="save and exit cleanly when this little host memory is "
+                         "left, rather than waiting to be killed. Exits with "
+                         f"code {EXIT_LOW_MEMORY} so a supervisor can restart "
+                         "with --resume. 0 to disable")
     ap.add_argument("--val-every", type=int, default=1000)
     ap.add_argument("--val-batches", type=int, default=20)
     ap.add_argument("--save-every", type=int, default=1000,
@@ -239,7 +260,7 @@ def main() -> int:
     def loader_kwargs(workers: int, persistent: bool) -> dict:
         return dict(
             num_workers=workers,
-            pin_memory=(device.type == "cuda"),
+            pin_memory=(device.type == "cuda" and args.pin_memory),
             persistent_workers=persistent and workers > 0,
             prefetch_factor=args.prefetch_factor if workers > 0 else None,
         )
@@ -255,7 +276,8 @@ def main() -> int:
     sample_mb = total_batch * (128 + 6 + 3 + 1) * args.window_frames * 4 / 1024 ** 2
     print(f"Loader: {args.num_workers} train workers x {args.prefetch_factor} prefetch "
           f"= {sample_mb * args.num_workers * args.prefetch_factor:.0f} MB queued "
-          f"({sample_mb:.0f} MB/batch), {args.val_workers} val workers")
+          f"({sample_mb:.0f} MB/batch), {args.val_workers} val workers, "
+          f"pin_memory={args.pin_memory and device.type == 'cuda'}")
 
     # ---- model ------------------------------------------------------------ #
     model = TaikoDiffusion(
@@ -362,6 +384,11 @@ def main() -> int:
     print(f"Checkpointing to {args.out}: {trigger.summary()}")
     if args.max_hours:
         print(f"Will stop cleanly after {args.max_hours:.1f} hours")
+    if args.min_free_gb:
+        print(f"Will stop cleanly if free host memory falls below "
+              f"{args.min_free_gb:.1f} GB")
+    print("Host memory before the first batch:")
+    print(memory_report())
     print()
 
     t0 = time.time()
@@ -452,6 +479,21 @@ def main() -> int:
                     stop = True
                     break
 
+                # Checked every step, not every log line: the last run climbed a
+                # gigabyte in twenty-five steps. Saving here is the difference
+                # between losing two minutes and losing the session, because
+                # SIGKILL arrives without warning and cannot be caught.
+                if args.min_free_gb and headroom_gb() < args.min_free_gb:
+                    print(f"\nOnly {headroom_gb():.1f} GB of host memory left "
+                          f"(--min-free-gb {args.min_free_gb:.1f}). Saving and "
+                          f"stopping before the kernel does it for us.")
+                    print(memory_report())
+                    saver.save("last.pt", f"low memory at step {step}")
+                    print(f"\nStopped at step {step} with a current checkpoint. "
+                          f"Start again with:")
+                    print(f"  --resume {args.out / 'last.pt'}")
+                    return EXIT_LOW_MEMORY
+
         # ---- end of epoch ------------------------------------------------- #
         if done_in_epoch >= batches_per_epoch:
             # A completed epoch starts the next one at batch zero.
@@ -478,7 +520,8 @@ def main() -> int:
     print(f"Epoch {state['epoch'] + 1}, batch {state['batch_in_epoch']}/{batches_per_epoch} "
           f"-- --resume picks up exactly here")
     print(f"Checkpoints: {args.out / 'best.pt'}  {args.out / 'last.pt'}")
-    print(f"Memory at exit: {memory_line()}")
+    print("Host memory at exit:")
+    print(memory_report())
     print("\nNext, measure Gate B (onset F1 > 0.40 on held-out audio):")
     print(f"  python scripts/evaluate.py --diffusion {args.out / 'best.pt'} --ae {args.ae}")
     return 0

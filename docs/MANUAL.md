@@ -187,11 +187,15 @@ slower — worth it. Do not proceed on 0.95.
 ### Stage 2: diffusion (150-250 hours, 15-25 sessions)
 
 This is the long haul. Each session: run every cell in order. Section 4
-restores the checkpoints *before* anything trains, section 7 trains until its
-share of the 11-hour budget runs out, and section 8 packages the result.
+restores the checkpoints *before* anything trains, section 5 defines the
+supervisor both stages run under, section 7 trains until what is left of the
+session budget runs out, and section 8 packages the result.
 
-Section 8 is the one that bites. Kaggle deletes `/kaggle/working` when a
-session ends. If you forget, you lose that session's work entirely.
+Section 8 is the one that bites, and it bites twice. Kaggle deletes
+`/kaggle/working` when a session ends, so a session whose section 8 never ran
+is a session lost entirely — and a section 8 that ran but whose output was
+never attached as a dataset is the same loss one session later, because section
+4 restores from `/kaggle/input` and a saved version is not in `/kaggle/input`.
 
 Saving checkpoints between sessions:
 
@@ -435,29 +439,71 @@ queued batch costs `batch x window x 128` floats of host memory. If the GPU
 sits below 80% the dataloader is the bottleneck, not the model.
 
 **Kaggle session died and I lost work**
-At most ten minutes of it, plus whatever was in `/kaggle/working` and never
-packaged. Always run section 8 before the session ends, and leave `--max-hours`
-set from the session budget so training stops with time to spare.
+At most ten minutes of training, and usually less. What actually costs a
+session is not the death — it is nobody noticing. The notebook used to launch
+stage 2 with `!python ...`, which throws the exit code away, so a trainer
+killed 46 minutes into an 11-hour session left the notebook printing nothing
+wrong: it zipped the checkpoints, ran the evaluation and finished green with
+ten paid GPU-hours unspent.
+
+Section 5 now supervises both stages. It restarts a run killed for memory,
+`--resume`s it from the checkpoint that already exists, gives it whatever is
+left of the session rather than a fixed `--max-hours`, and drops a dataloader
+worker each time. It stops on any other error, because repeating a real bug
+twenty times is a slower way to waste the same session, and it raises at the
+end if the stage never finished, so a committed run shows red.
+
+**A session "started from the very beginning"**
+Saving a version is not attaching a dataset. Section 8 writes
+`checkpoints.zip` into the session *output*; section 4 restores from
+`/kaggle/input`. Until you create a Dataset from that output **and attach it to
+the notebook**, section 4 finds nothing, stage 1 retrains the autoencoder and
+stage 2 starts at step 0. Section 4 now says so in as many words when it
+restores nothing.
+
+Check this first, before spending GPU: if section 4 prints "Nothing restored"
+and this is not your first run, stop and fix the attachment.
 
 **"Your notebook tried to allocate more memory than is available"**
-Host RAM, not GPU. The usual cause was reading mels through a memmap: every
-page it touches becomes a resident page, so random window sampling walks RSS up
-by the full size of `mels.dat` over an hour or two and then the session dies —
-a leak with nothing in the Python heap to blame for it. Both training scripts
-now default to `--mel-io read`, which preads one window at a time and holds no
+Host RAM, not GPU. One known cause is reading mels through a memmap: every page
+it touches becomes a resident page, so random window sampling walks RSS up by
+the full size of `mels.dat` over an hour or two and then the session dies — a
+leak with nothing in the Python heap to blame for it. Both training scripts
+default to `--mel-io read`, which preads one window at a time and holds no
 pages (measured on a 732 MB file: 20k random windows cost 732 MB of RSS mapped,
-3 MB pread).
+3 MB pread), and now also tells the kernel to drop each window's pages
+afterwards, so a 6.7 GB corpus does not settle 6.7 GB of page cache against the
+container's limit.
 
-If it still happens, the log line carries the numbers:
+The log line carries the numbers:
 
 ```
-epoch 2 step 550  loss 0.79  mae 0.71  |g| 0.37  lr 2.75e-05  2.4min  ram 6.2/28.9G
+epoch 2 step 550  loss 0.79  ...  ram 3.1+1.0G | cg 9.4/28.9G cache 0.6G | free 19.5G gpu 1.1G
 ```
 
-`ram` is the whole process tree, dataloader workers included, over the total the
-machine has. If it climbs steadily, the next things to cut are
-`--prefetch-factor` (each queued batch is `batch x window x 128` floats),
-`--num-workers`, and `--batch-size`.
+- `ram A+B` — this process, then its dataloader workers. Both are **PSS**, so a
+  page they share is counted once between them. The earlier version summed RSS
+  across the tree, which counts every shared page once per worker: on a
+  four-worker loader that reported 2.6 GB for a process using about 1 GB, and
+  on Kaggle, where each worker also inherits a CUDA context, the overstatement
+  is several gigabytes. A run "at 30 GB" on that arithmetic was not at 30 GB.
+- `cg` — the container's own usage against its limit. This is the number a
+  container is killed on. `/proc/meminfo` may be describing the host.
+- `cache` — page cache charged to the container. Reclaimable, not lost, and not
+  the run's own growth.
+- `free` — room left before the limit, discounting that cache. This is what
+  `--min-free-gb` watches.
+
+If `ram` climbs steadily, cut `--prefetch-factor` (each queued batch is
+`batch x window x 128` floats), then `--num-workers`, then `--batch-size`, and
+pass `--no-pin-memory` — pinned pages cannot be swapped or reclaimed.
+
+**A run stopped itself saying "Only N GB of host memory left"**
+Working as intended. `--min-free-gb` (3 GB in the notebook) saves `last.pt` and
+exits with code 17 while there is still room to write 541 MB, instead of
+waiting for a SIGKILL that cannot be caught. The supervisor restarts it from
+that checkpoint. Set `--min-free-gb 0` to disable, though the only thing that
+buys is being killed instead of stopping.
 
 **Resuming started from an earlier step than I expected**
 The run was killed before its next save. Check the `Resumed from ...: step N,

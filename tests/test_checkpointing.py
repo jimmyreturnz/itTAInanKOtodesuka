@@ -129,6 +129,58 @@ def test_saver_writes_only_when_due():
         print("  saver honours the trigger ok")
 
 
+def test_manifest_rehashes_only_what_changed():
+    """
+    Re-hashing the whole directory on every save read best.pt as well as
+    last.pt -- a gigabyte of I/O every ten minutes, on the machine least able
+    to spare it, to recompute a digest that could not have changed.
+    """
+    from taiko.train.session import read_manifest, update_manifest
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        torch.save({"a": 1}, out / "best.pt")
+        torch.save({"a": 2}, out / "last.pt")
+        update_manifest(out)
+        first = read_manifest(out)
+        assert set(first) == {"best.pt", "last.pt"}
+
+        # Rewrite last.pt only, and claim as much.
+        torch.save({"a": 3}, out / "last.pt")
+        update_manifest(out, changed=out / "last.pt")
+        second = read_manifest(out)
+        assert second["best.pt"] == first["best.pt"], "carried entry was disturbed"
+        assert second["last.pt"] != first["last.pt"], "changed file was not re-hashed"
+
+        # A file that changed behind our back is still caught, because size is
+        # checked before the cached digest is trusted.
+        torch.save({"a": 4, "padding": list(range(4096))}, out / "best.pt")
+        update_manifest(out, changed=out / "last.pt")
+        third = read_manifest(out)
+        assert third["best.pt"] != first["best.pt"], "a resized file kept a stale digest"
+        print("  manifest rehashes one file ok")
+
+
+def test_memory_counts_shared_pages_once():
+    """
+    The old figure summed RSS over the process tree, so every page a forked
+    worker shares with its parent was counted twice. It reported a run at 30 GB
+    whose footprint was a fraction of that, and a whole session was spent
+    hunting a leak that measurement later showed was not there.
+    """
+    from taiko.train.session import headroom_mb, memory_line, memory_mb
+
+    m = memory_mb()
+    assert m["self"] > 0
+    assert m["tree"] >= m["self"]
+    # PSS never exceeds RSS: shared pages are divided, not multiplied.
+    assert m["self"] <= m["rss"] + 1.0, (m["self"], m["rss"])
+    assert headroom_mb() >= 0
+    line = memory_line()
+    assert "ram" in line and "free" in line, line
+    print("  memory is PSS, not RSS sum ok")
+
+
 if __name__ == "__main__":
     print("checkpointing")
     for name, fn in sorted(globals().items()):

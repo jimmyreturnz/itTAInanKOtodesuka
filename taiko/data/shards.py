@@ -47,6 +47,15 @@ single contiguous read -- and holds no pages at all. `mel_io="mmap"` is faster
 when the corpus comfortably fits in RAM, which is the case locally and is not
 the case on Kaggle. `"auto"` picks by comparing the file against the memory the
 machine actually has.
+
+"read" also advises the kernel to drop each window's pages once it has them.
+Nothing is resident either way, but the pages still pass through the page
+cache, and inside a container that cache is charged to the cgroup: random
+windows walk the whole corpus, so a 6.7 GB mel file settles 6.7 GB of cache
+against a limit under 30 GB. It is reclaimable rather than lost, but it is
+still the difference between a memory figure that describes the run and one
+that describes the file, and random access over a corpus that size gets no
+benefit from caching it.
 """
 
 from __future__ import annotations
@@ -342,11 +351,13 @@ class ShardReader:
             the file is small relative to the machine.
     """
 
-    def __init__(self, shard_dir: str | Path, mel_io: str = "auto"):
+    def __init__(self, shard_dir: str | Path, mel_io: str = "auto",
+                 drop_page_cache: bool | None = None):
         self.dir = Path(shard_dir)
         if mel_io not in MEL_IO_MODES:
             raise ValueError(f"mel_io must be one of {MEL_IO_MODES}, got {mel_io!r}")
         self.mel_io_requested = mel_io
+        self._drop_page_cache_requested = drop_page_cache
         index_path = self.dir / INDEX_FILENAME
         if not index_path.exists():
             raise FileNotFoundError(
@@ -383,6 +394,13 @@ class ShardReader:
         self._mel_fd: int | None = None
         self._owner_pid: int | None = None
         self.mel_io = self._resolve_mel_io(mel_io)
+        # "read" is chosen precisely when the corpus does not comfortably fit in
+        # memory, which is also exactly when caching it is pointless. Default the
+        # advice on in that mode and leave it off under mmap, where the page
+        # cache *is* the mechanism.
+        self.drop_page_cache = (
+            self.mel_io == "read" if drop_page_cache is None else bool(drop_page_cache)
+        )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -405,7 +423,9 @@ class ShardReader:
         ram = _total_ram_bytes()
         ram_text = f"{ram / 1024 ** 3:.1f} GB RAM" if ram else "RAM unknown"
         note = ("resident pages grow to the size of the file"
-                if self.mel_io == "mmap" else "one pread per window, no resident pages")
+                if self.mel_io == "mmap" else
+                "one pread per window, no resident pages"
+                + (", page cache dropped after each read" if self.drop_page_cache else ""))
         return (f"mel I/O: {self.mel_io} ({self.mel_bytes / 1024 ** 3:.2f} GB mels.dat, "
                 f"{ram_text}) -- {note}")
 
@@ -447,10 +467,36 @@ class ShardReader:
                 break                              # Short file; caller zero-pads.
             chunks.append(block)
             got += len(block)
+        if self.drop_page_cache and got:
+            self._forget(offset, got)
         raw = chunks[0] if len(chunks) == 1 else b"".join(chunks)
         frames = len(raw) // row_bytes
         return np.frombuffer(raw, dtype=np.float16, count=frames * MEL_BINS) \
                  .reshape(frames, MEL_BINS).astype(np.float32)
+
+    def _forget(self, offset: int, length: int) -> None:
+        """
+        Tell the kernel the pages just read will not be wanted again.
+
+        pread keeps nothing resident, but the pages it reads through still
+        land in the page cache -- and inside a container that cache is charged
+        to the cgroup. Sampling random windows walks the whole corpus, so a
+        6.7 GB mel file eventually parks 6.7 GB of cache against a limit of
+        under 30, on the one machine that cannot spare it. The kernel will
+        reclaim it rather than kill anything, but it also drives the memory
+        figure a supervisor reads, and it leaves that much less room for the
+        allocations that genuinely cannot be reclaimed.
+
+        Caching buys nothing here anyway: windows are drawn at random from a
+        corpus far larger than the cache, so a page read now is unlikely to be
+        wanted before it is evicted. Failures are ignored -- this is an
+        optimisation, and a kernel that will not take the advice is not a
+        reason to stop training.
+        """
+        try:
+            os.posix_fadvise(self._fd, offset, length, os.POSIX_FADV_DONTNEED)
+        except (OSError, AttributeError, ValueError):
+            self.drop_page_cache = False           # Not supported here; stop asking.
 
     def mel_window(self, idx: int, start: int, width: int) -> np.ndarray:
         """

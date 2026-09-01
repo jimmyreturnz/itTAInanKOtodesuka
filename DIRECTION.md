@@ -98,6 +98,61 @@ upload, and the verifier no longer flags it.
 Items 3–5 below are done too: the notebook clones `main`, both training scripts
 set `cudnn.benchmark`, and `--grad-accum` is wired.
 
+### Two sessions lost, and what actually took them
+
+Stage 2 died 46 minutes into an 11-hour session at step 1,025, with the log
+reporting `ram 30.7/32.1G`. It has now happened twice. What each part
+contributed, separated by measurement rather than by reading:
+
+**Not the training code.** 2,018 steps of stage 2 against a synthetic corpus,
+four workers, batch 64 at the same 1,536-frame window: memory dead flat, start
+to finish. The dataset, the loader, the EMA, validation, and the checkpoint
+path do not leak. `--mel-io read` also does what it claims — 300 batches, zero
+RSS growth.
+
+**The memory figure was wrong, and that is why this cost two sessions rather
+than one.** `ram` was the sum of RSS over the process and its dataloader
+workers. RSS counts a shared page in full in every process mapping it, so
+everything a fork shares — the CUDA context, torch's shared objects, the model,
+the packed index — was multiplied by the worker count. Measured here: parent
+825 MB, RSS sum 2,618 MB, real footprint about 1 GB. On Kaggle, where every
+worker also inherits a CUDA context, the overstatement is larger still. "30.7
+GB" was never a number anyone could act on. It is now PSS, split between this
+process and its workers, next to the container's own usage and limit and the
+page cache called out separately.
+
+**The notebook is what turned a 46-minute problem into two lost sessions.**
+Three separate faults, all in `kaggle_train.ipynb`:
+
+1. Stage 2 launched with `!python ...`, which discards the exit code. The
+   trainer was killed; the notebook zipped, evaluated and finished green with
+   ten paid GPU-hours idle. Nothing restarted it, though `last.pt` at step
+   1,000 was intact and only ~2 minutes of training had been lost.
+2. **Two cells could not be parsed at all** — the one that restores checkpoints
+   from `/kaggle/input` and the one that sets `RESUMABLE`. A `\n` written for
+   the notebook was expanded when `build_notebook.py` was imported and split
+   the string literal it sat inside. A `SyntaxError` is raised at compile time,
+   so neither cell ever ran a statement: nothing was restored and nothing
+   resumed, in a notebook whose whole design is resuming twenty times. The diff
+   read perfectly, because nothing had ever parsed the generated notebook.
+3. Saving a version is not attaching a dataset. Section 8 writes the zip to the
+   session output; section 4 reads `/kaggle/input`. Without the attach step the
+   next session legitimately starts at step 0 — which is the "it resets and
+   starts from the very beginning" symptom exactly.
+
+**Fixed.** Section 5 supervises both stages: restart on an out-of-memory death,
+resume from the existing checkpoint, budget from what is left of the session,
+one fewer worker each attempt, stop on any other error, raise if the stage
+never finished. `--min-free-gb` makes a stage save and exit with code 17 while
+there is still room to write 541 MB, instead of taking a SIGKILL. The build
+refuses to write a notebook containing a cell Python cannot parse, and
+`tests/test_notebook.py` keeps it that way.
+
+**Still open.** With the data path cleared by measurement and the metric
+corrected, the residual growth — if there is any — has not been attributed.
+The next session's first log line now prints an honest breakdown; that is what
+to read before changing anything else.
+
 ### Next: the `tiny` rehearsal (D4)
 
 Attach the dataset to `notebooks/kaggle_train.ipynb` on a T4 x2 session and run
