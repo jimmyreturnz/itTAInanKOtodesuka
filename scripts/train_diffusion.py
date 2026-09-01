@@ -8,8 +8,34 @@ Stage 2. Trains the latent diffusion model against a frozen autoencoder.
 
 Built for interruption. A Kaggle session caps at about 12 hours and this stage
 wants 150-250 GPU-hours, so it will be resumed roughly twenty times; every
-checkpoint carries the optimiser, the scaler, the EMA and the step count, and
---resume picks up mid-epoch rather than restarting one.
+checkpoint carries the optimiser, the scaler, the EMA, the step count and the
+position within the epoch, and --resume genuinely picks up there.
+
+Surviving the kill
+------------------
+Three things go wrong on a preemptible machine, and each has its own defence:
+
+  The session ends. --max-hours stops early and saves; SIGTERM and the
+  notebook's interrupt button now do the same rather than discarding the work
+  since the last save.
+
+  The OOM killer arrives. SIGKILL cannot be caught, so the only defence is
+  having saved recently: --save-every-min writes last.pt on a clock. Step
+  counts are not a unit of risk -- at 2.6 s/step, "--save-every 500" is a
+  22-minute blast radius, and a kill at step 550 discards 50 steps of work
+  while the log says the checkpoint is current.
+
+  The kill lands mid-write. Checkpoints are written to a temporary file and
+  renamed, so last.pt is always either the previous checkpoint or the new one.
+  A truncated last.pt used to end the *next* session before it began.
+
+Host memory
+-----------
+--mel-io read is the default here. A memmap's touched pages are resident pages,
+so sampling random windows walks RSS up by the whole size of mels.dat over an
+hour or two and the run dies of a leak that is not in the Python heap. Every
+log line now carries RSS and the memory left, so the next occurrence is a
+number rather than a mystery. See taiko/data/shards.py.
 
 Gate B: onset F1 above 0.40 against held-out audio. That is the alignment gate
 -- it is what distinguishes a model listening to the music from one emitting
@@ -41,9 +67,12 @@ from taiko.data.frames import describe
 from taiko.data.preprocessed_dataset import (
     WINDOW_FRAMES_DEFAULT, WindowedDataset, print_split_stats, split_indices,
 )
-from taiko.data.shards import ShardReader
+from taiko.data.shards import MEL_IO_MODES, ShardReader
 from taiko.model.diffusion import EMA, TaikoDiffusion
 from taiko.model.model_config import PROFILES, get_profile
+from taiko.train import (
+    CheckpointSaver, SaveTrigger, install_stop_handlers, load_checkpoint, memory_line,
+)
 
 
 def unwrap(model: nn.Module) -> TaikoDiffusion:
@@ -68,34 +97,34 @@ def batch_to(batch: dict, device: torch.device) -> dict:
 
 @torch.no_grad()
 def validate(model, loader, device, max_batches: int, use_fp16: bool) -> float:
+    """
+    Mean loss over the first `max_batches` validation batches.
+
+    The iterator is dropped explicitly rather than left to fall out of scope.
+    Abandoning a half-consumed DataLoader keeps its prefetch queue -- and, with
+    persistent workers, the workers themselves -- alive until the next garbage
+    collection, which on a machine already short of RAM is the wrong moment to
+    be holding twenty windows nobody will read.
+    """
     model.eval()
     total, seen = 0.0, 0
-    for i, batch in enumerate(loader):
-        if i >= max_batches:
-            break
-        with torch.amp.autocast("cuda", enabled=use_fp16):
-            loss, _ = model(**batch_to(batch, device))
-        total += float(loss.mean())
-        seen += 1
-    model.train()
+    iterator = iter(loader)
+    try:
+        for _ in range(max_batches):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            with torch.amp.autocast("cuda", enabled=use_fp16):
+                loss, _ = model(**batch_to(batch, device))
+            total += float(loss.mean())
+            seen += 1
+    finally:
+        del iterator
+        model.train()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return total / max(seen, 1)
-
-
-def save(path: Path, model, optimizer, scaler, ema, step, epoch, best, args):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    inner = unwrap(model)
-    torch.save({
-        "unet": inner.unet_model.state_dict(),
-        "wave": inner.wave_model.state_dict(),
-        "ema": ema.state_dict() if ema else None,
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
-        "step": step, "epoch": epoch, "best_val": best,
-        "profile": args.profile,
-        "window_frames": args.window_frames,
-        "prediction_type": args.prediction_type,
-        "autoencoder_ckpt": str(args.ae),
-    }, path)
 
 
 def main() -> int:
@@ -118,10 +147,32 @@ def main() -> int:
     ap.add_argument("--ranked-only", action="store_true",
                     help="train only on ranked maps (recommended for the final run)")
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--val-workers", type=int, default=0,
+                    help="workers for the validation loader. 0 keeps two fewer "
+                         "processes -- and two fewer prefetch queues -- resident "
+                         "for a loader used once every --val-every steps")
+    ap.add_argument("--prefetch-factor", type=int, default=2,
+                    help="batches queued per worker; each one costs "
+                         "batch x window x 128 floats of host RAM")
+    ap.add_argument("--mel-io", default="read", choices=list(MEL_IO_MODES),
+                    help="'read' preads each window and holds no pages; 'mmap' is "
+                         "faster but its resident set grows to the size of mels.dat")
     ap.add_argument("--val-every", type=int, default=1000)
     ap.add_argument("--val-batches", type=int, default=20)
-    ap.add_argument("--save-every", type=int, default=1000)
+    ap.add_argument("--save-every", type=int, default=1000,
+                    help="save last.pt every N optimiser steps (0 to disable)")
+    ap.add_argument("--save-every-min", type=float, default=10.0,
+                    help="save last.pt every N minutes. This is the one that "
+                         "bounds what an OOM kill costs; 0 to disable")
+    ap.add_argument("--no-epoch-save", dest="epoch_save", action="store_false",
+                    default=True, help="do not save at the end of every epoch")
+    ap.add_argument("--no-epoch-val", dest="epoch_val", action="store_false",
+                    default=True, help="do not validate at the end of every epoch")
     ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--total-steps", type=int, default=None,
+                    help="horizon for the cosine schedule. Defaults to "
+                         "epochs x batches/epoch, and is carried in the checkpoint "
+                         "so a resume cannot silently reshape the schedule")
     ap.add_argument("--max-hours", type=float, default=None,
                     help="stop cleanly before a session limit, saving first")
     ap.add_argument("--fp16", action="store_true", default=True)
@@ -168,7 +219,8 @@ def main() -> int:
         print("  diffusion training recovers it.")
 
     # ---- data ------------------------------------------------------------ #
-    reader = ShardReader(args.shards)
+    reader = ShardReader(args.shards, mel_io=args.mel_io)
+    print(reader.describe_mel_io())
     train_idx, val_idx = split_indices(reader, val_ratio=0.05, ranked_only=args.ranked_only)
     print_split_stats(reader, train_idx, "Train")
     print_split_stats(reader, val_idx, "Val")
@@ -183,15 +235,27 @@ def main() -> int:
     )
 
     total_batch = batch_per_gpu * max(n_gpus, 1)
-    loader_kwargs = dict(
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=4 if args.num_workers > 0 else None,
-    )
+
+    def loader_kwargs(workers: int, persistent: bool) -> dict:
+        return dict(
+            num_workers=workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=persistent and workers > 0,
+            prefetch_factor=args.prefetch_factor if workers > 0 else None,
+        )
+
     train_loader = DataLoader(train_ds, batch_size=total_batch, shuffle=True,
-                              drop_last=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=total_batch, shuffle=False, **loader_kwargs)
+                              drop_last=True, **loader_kwargs(args.num_workers, True))
+    # The validation loader is not persistent: it runs once every --val-every
+    # steps, and keeping its workers (and their prefetch queues) alive in
+    # between spends host RAM continuously to save a few seconds occasionally.
+    val_loader = DataLoader(val_ds, batch_size=total_batch, shuffle=False,
+                            **loader_kwargs(args.val_workers, False))
+
+    sample_mb = total_batch * (128 + 6 + 3 + 1) * args.window_frames * 4 / 1024 ** 2
+    print(f"Loader: {args.num_workers} train workers x {args.prefetch_factor} prefetch "
+          f"= {sample_mb * args.num_workers * args.prefetch_factor:.0f} MB queued "
+          f"({sample_mb:.0f} MB/batch), {args.val_workers} val workers")
 
     # ---- model ------------------------------------------------------------ #
     model = TaikoDiffusion(
@@ -219,24 +283,83 @@ def main() -> int:
     optimizer = torch.optim.AdamW(inner.trainable_parameters(), lr=lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
-    step, start_epoch, best_val = 0, 0, float("inf")
-    if args.resume and args.resume.exists():
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        if ckpt.get("profile") != args.profile:
-            print(f"ERROR: checkpoint is profile {ckpt.get('profile')!r}, "
-                  f"you asked for {args.profile!r}. Shapes will not match.")
-            return 1
-        inner.unet_model.load_state_dict(ckpt["unet"])
-        inner.wave_model.load_state_dict(ckpt["wave"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scaler.load_state_dict(ckpt["scaler"])
-        if ckpt.get("ema"):
-            ema.load_state_dict(ckpt["ema"])
-        step, start_epoch, best_val = ckpt["step"], ckpt["epoch"], ckpt["best_val"]
-        print(f"Resumed: step {step}, epoch {start_epoch}, best val {best_val:.5f}")
+    batches_per_epoch = len(train_loader)
+    default_total = args.epochs * batches_per_epoch // args.grad_accum
+    total_steps = args.total_steps or default_total
 
-    total_steps = args.epochs * len(train_loader) // args.grad_accum
-    print(f"\n{len(train_loader)} batches/epoch, ~{total_steps} optimiser steps total")
+    # `batch_offset` is how far into `start_epoch` the previous session got.
+    # Windows are drawn i.i.d., so resuming means running the remaining
+    # batches of that epoch, not re-running all of them: the old loop restarted
+    # the epoch from zero and quietly repeated up to an epoch of work on every
+    # single resume, which over twenty resumes is days.
+    step, start_epoch, best_val, batch_offset = 0, 0, float("inf"), 0
+    if args.resume:
+        ckpt, source = load_checkpoint(args.resume, map_location=device)
+        if ckpt is None:
+            print(f"No checkpoint at {args.resume}; starting from scratch.")
+        else:
+            if ckpt.get("profile") != args.profile:
+                print(f"ERROR: checkpoint is profile {ckpt.get('profile')!r}, "
+                      f"you asked for {args.profile!r}. Shapes will not match.")
+                return 1
+            inner.unet_model.load_state_dict(ckpt["unet"])
+            inner.wave_model.load_state_dict(ckpt["wave"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scaler.load_state_dict(ckpt["scaler"])
+            if ckpt.get("ema"):
+                ema.load_state_dict(ckpt["ema"])
+            step = ckpt["step"]
+            start_epoch = ckpt["epoch"]
+            best_val = ckpt["best_val"]
+            batch_offset = int(ckpt.get("batch_in_epoch", 0))
+            if batch_offset >= batches_per_epoch:
+                # The epoch length changed (a different --samples-per-epoch or
+                # batch size); the offset no longer means anything.
+                start_epoch, batch_offset = start_epoch + 1, 0
+
+            saved_total = ckpt.get("total_steps")
+            if saved_total and args.total_steps is None and saved_total != total_steps:
+                # The cosine schedule is defined by its horizon. Silently
+                # changing that horizon mid-run rewrites the learning rate for
+                # every remaining step, so the saved one wins unless overridden.
+                print(f"  keeping the saved schedule horizon ({saved_total} steps); "
+                      f"this session's arguments imply {total_steps}. "
+                      f"Pass --total-steps to change it deliberately.")
+                total_steps = saved_total
+
+            best_text = ("no validation yet" if best_val == float("inf")
+                         else f"best val {best_val:.5f}")
+            print(f"Resumed from {source}: step {step}, epoch {start_epoch + 1}, "
+                  f"batch {batch_offset}/{batches_per_epoch}, {best_text}")
+
+    state = {"step": step, "epoch": start_epoch, "batch_in_epoch": batch_offset,
+             "best_val": best_val}
+
+    def payload() -> dict:
+        node = unwrap(model)
+        return {
+            "unet": node.unet_model.state_dict(),
+            "wave": node.wave_model.state_dict(),
+            "ema": ema.state_dict() if ema else None,
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "step": state["step"],
+            "epoch": state["epoch"],
+            "batch_in_epoch": state["batch_in_epoch"],
+            "best_val": state["best_val"],
+            "total_steps": total_steps,
+            "profile": args.profile,
+            "window_frames": args.window_frames,
+            "prediction_type": args.prediction_type,
+            "autoencoder_ckpt": str(args.ae),
+        }
+
+    trigger = SaveTrigger(args.save_every, args.save_every_min)
+    saver = CheckpointSaver(args.out, payload, trigger)
+    stop_signal = install_stop_handlers()
+
+    print(f"\n{batches_per_epoch} batches/epoch, ~{total_steps} optimiser steps total")
+    print(f"Checkpointing to {args.out}: {trigger.summary()}")
     if args.max_hours:
         print(f"Will stop cleanly after {args.max_hours:.1f} hours")
     print()
@@ -245,10 +368,41 @@ def main() -> int:
     model.train()
     stop = False
 
+    def run_validation(tag: str) -> None:
+        """Validate on the EMA weights and keep best.pt if they improved."""
+        ema.store(inner.trainable_parameters())
+        ema.copy_to(inner.trainable_parameters())
+        try:
+            val_loss = validate(model, val_loader, device, args.val_batches, use_fp16)
+        finally:
+            ema.restore(inner.trainable_parameters())
+
+        marker = ""
+        if val_loss < state["best_val"]:
+            state["best_val"] = val_loss
+            saver.save("best.pt")
+            marker = "  <- best"
+        print(f"  val {val_loss:.5f} (best {state['best_val']:.5f}){marker}  [{tag}]")
+
+    epoch = start_epoch
+    reason = "finished"
+
     for epoch in range(start_epoch, args.epochs):
         if stop:
             break
+
+        # Only the resumed epoch is short; every later one is full.
+        done_in_epoch, batch_offset = batch_offset, 0
+        budget = batches_per_epoch - done_in_epoch
+        if budget <= 0:
+            continue
+        state["epoch"] = epoch
+
         for i, batch in enumerate(train_loader):
+            if i >= budget:
+                break
+            done_in_epoch += 1
+
             lr_now = lr_at(step, args.warmup, total_steps, lr)
             for group in optimizer.param_groups:
                 group["lr"] = lr_now
@@ -272,42 +426,59 @@ def main() -> int:
                 ema.update(inner.trainable_parameters())
                 step += 1
 
+                state["step"] = step
+                state["batch_in_epoch"] = done_in_epoch
+
                 if step % args.log_every == 0:
                     elapsed = time.time() - t0
                     print(f"epoch {epoch + 1:3d} step {step:7d}  "
                           f"loss {float(metrics[0]):.4f}  mae {float(metrics[1]):.4f}  "
                           f"|g| {float(grad_norm):.2f}  lr {lr_now:.2e}  "
-                          f"{elapsed / 60:.1f}min")
+                          f"{elapsed / 60:.1f}min  {memory_line()}", flush=True)
 
-                if step % args.val_every == 0:
-                    # Validate on the EMA weights: those are what generation
-                    # uses, so they are the ones whose quality matters.
-                    ema.store(inner.trainable_parameters())
-                    ema.copy_to(inner.trainable_parameters())
-                    val_loss = validate(model, val_loader, device, args.val_batches, use_fp16)
-                    ema.restore(inner.trainable_parameters())
+                if args.val_every and step % args.val_every == 0:
+                    run_validation(f"step {step}")
 
-                    marker = ""
-                    if val_loss < best_val:
-                        best_val = val_loss
-                        save(args.out / "best.pt", model, optimizer, scaler, ema,
-                             step, epoch, best_val, args)
-                        marker = "  <- best"
-                    print(f"  val {val_loss:.5f} (best {best_val:.5f}){marker}")
+                saver.maybe_save(step)
 
-                if step % args.save_every == 0:
-                    save(args.out / "last.pt", model, optimizer, scaler, ema,
-                         step, epoch, best_val, args)
-
-                if args.max_hours and (time.time() - t0) / 3600 >= args.max_hours:
-                    print(f"\nReached {args.max_hours}h; saving and stopping.")
+                if stop_signal:
+                    reason = f"{stop_signal.reason} at step {step}"
                     stop = True
                     break
 
-    save(args.out / "last.pt", model, optimizer, scaler, ema, step, epoch, best_val, args)
+                if args.max_hours and (time.time() - t0) / 3600 >= args.max_hours:
+                    print(f"\nReached {args.max_hours}h; saving and stopping.")
+                    reason = f"--max-hours at step {step}"
+                    stop = True
+                    break
+
+        # ---- end of epoch ------------------------------------------------- #
+        if done_in_epoch >= batches_per_epoch:
+            # A completed epoch starts the next one at batch zero.
+            state["epoch"] = epoch + 1
+            state["batch_in_epoch"] = 0
+        if not stop:
+            # Validating here is what guarantees a best.pt exists even in a
+            # session too short to reach --val-every. A run that dies with
+            # best_val still at infinity has produced nothing generation can use.
+            if args.epoch_val:
+                run_validation(f"end of epoch {epoch + 1}")
+            if args.epoch_save:
+                saver.save("last.pt", f"end of epoch {epoch + 1}")
+
+    if args.epoch_val and stop and state["best_val"] == float("inf"):
+        # Same argument, at the other exit: never end a session with no best.pt.
+        run_validation("before stopping")
+    saver.save("last.pt", reason)
+
     print(f"\n{'=' * 60}")
-    print(f"Stopped at step {step}, best val {best_val:.5f}")
+    best_text = ("never validated" if state["best_val"] == float("inf")
+                 else f"{state['best_val']:.5f}")
+    print(f"Stopped at step {step} ({reason}), best val {best_text}")
+    print(f"Epoch {state['epoch'] + 1}, batch {state['batch_in_epoch']}/{batches_per_epoch} "
+          f"-- --resume picks up exactly here")
     print(f"Checkpoints: {args.out / 'best.pt'}  {args.out / 'last.pt'}")
+    print(f"Memory at exit: {memory_line()}")
     print("\nNext, measure Gate B (onset F1 > 0.40 on held-out audio):")
     print(f"  python scripts/evaluate.py --diffusion {args.out / 'best.pt'} --ae {args.ae}")
     return 0

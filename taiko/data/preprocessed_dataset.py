@@ -375,5 +375,6 @@ def print_split_stats(reader: ShardReader, indices: Sequence[int], label: str) -
         print(f"    NPS {min(npss):.1f} - {max(npss):.1f}  (mean {sum(npss)/len(npss):.2f})")
 
 
-def load_reader(shard_dir: str | Path = "data/processed/shards") -> ShardReader:
-    return ShardReader(shard_dir)
+def load_reader(shard_dir: str | Path = "data/processed/shards",
+                mel_io: str = "auto") -> ShardReader:
+    return ShardReader(shard_dir, mel_io=mel_io)

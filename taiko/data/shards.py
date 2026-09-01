@@ -28,11 +28,31 @@ Three decisions worth stating, because each is a large multiplier:
 
 Time-major mel layout ([frames, mels], not [mels, frames]) so that reading a
 window is one contiguous slice rather than 128 strided reads.
+
+Reading mels: mmap or pread
+---------------------------
+`ShardReader` can serve windows either way, and on a memory-capped machine the
+choice decides whether the run finishes.
+
+A memmap's touched pages are resident pages: they count in RSS and against a
+container's memory limit exactly like an allocation does. Sampling random
+windows walks the whole file eventually, so RSS climbs by the full size of
+mels.dat over the first hour or two of training and then the run dies -- slowly
+enough to look like a leak, and with nothing in the Python heap to blame.
+Measured on a 732 MB file: 20k random windows via mmap grew RSS by 732 MB; the
+same windows via `os.pread` grew it by 3 MB.
+
+So `mel_io="read"` issues one pread per window -- the layout above makes that a
+single contiguous read -- and holds no pages at all. `mel_io="mmap"` is faster
+when the corpus comfortably fits in RAM, which is the case locally and is not
+the case on Kaggle. `"auto"` picks by comparing the file against the memory the
+machine actually has.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -53,6 +73,13 @@ CHART_FILENAME = "charts.npz"
 INDEX_FILENAME = "index.json"
 
 SHARD_FORMAT_VERSION = 1
+
+MEL_IO_MODES = ("auto", "mmap", "read")
+
+# Above this share of total RAM, "auto" stops mapping the mel file. A memmap
+# that fits in a fraction of memory is free speed; one that approaches the
+# limit is the run's cause of death.
+MEL_MMAP_RAM_FRACTION = 0.25
 
 
 # --------------------------------------------------------------------------- #
@@ -293,16 +320,33 @@ class ShardWriter:
 # Reading
 # --------------------------------------------------------------------------- #
 
+def _total_ram_bytes() -> int:
+    """Total system RAM, or 0 where it cannot be read."""
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
 class ShardReader:
     """
     Random-access reader over a packed dataset.
 
-    Safe to construct before forking dataloader workers: the memmap is opened
-    lazily per process, so workers do not share a file handle.
+    Safe to construct before forking dataloader workers: the mel file is opened
+    lazily per process, so workers do not share a handle or a mapping.
+
+    Args:
+        mel_io: how mel windows are read -- see the module docstring.
+            "read" issues one pread per window and holds no pages; "mmap" maps
+            the file and is faster while it fits in RAM; "auto" maps only when
+            the file is small relative to the machine.
     """
 
-    def __init__(self, shard_dir: str | Path):
+    def __init__(self, shard_dir: str | Path, mel_io: str = "auto"):
         self.dir = Path(shard_dir)
+        if mel_io not in MEL_IO_MODES:
+            raise ValueError(f"mel_io must be one of {MEL_IO_MODES}, got {mel_io!r}")
+        self.mel_io_requested = mel_io
         index_path = self.dir / INDEX_FILENAME
         if not index_path.exists():
             raise FileNotFoundError(
@@ -336,18 +380,77 @@ class ShardReader:
         self._span_offsets   = charts["span_offsets"]
 
         self._mel: np.ndarray | None = None
+        self._mel_fd: int | None = None
+        self._owner_pid: int | None = None
+        self.mel_io = self._resolve_mel_io(mel_io)
 
     def __len__(self) -> int:
         return len(self.records)
 
+    # -- mel access -------------------------------------------------------- #
+
+    @property
+    def mel_bytes(self) -> int:
+        return self.mel_frames * MEL_BINS * 2
+
+    def _resolve_mel_io(self, requested: str) -> str:
+        if requested != "auto":
+            return requested
+        ram = _total_ram_bytes()
+        if ram and self.mel_bytes <= ram * MEL_MMAP_RAM_FRACTION:
+            return "mmap"
+        return "read"
+
+    def describe_mel_io(self) -> str:
+        ram = _total_ram_bytes()
+        ram_text = f"{ram / 1024 ** 3:.1f} GB RAM" if ram else "RAM unknown"
+        note = ("resident pages grow to the size of the file"
+                if self.mel_io == "mmap" else "one pread per window, no resident pages")
+        return (f"mel I/O: {self.mel_io} ({self.mel_bytes / 1024 ** 3:.2f} GB mels.dat, "
+                f"{ram_text}) -- {note}")
+
+    def _reset_if_forked(self) -> None:
+        """Drop handles inherited across a fork so each worker opens its own."""
+        pid = os.getpid()
+        if self._owner_pid == pid:
+            return
+        self._mel = None
+        self._mel_fd = None
+        self._owner_pid = pid
+
     @property
     def mel(self) -> np.ndarray:
+        self._reset_if_forked()
         if self._mel is None:
             self._mel = np.memmap(
                 self.dir / MEL_FILENAME, dtype=np.float16, mode="r",
                 shape=(self.mel_frames, MEL_BINS),
             )
         return self._mel
+
+    @property
+    def _fd(self) -> int:
+        self._reset_if_forked()
+        if self._mel_fd is None:
+            self._mel_fd = os.open(self.dir / MEL_FILENAME, os.O_RDONLY)
+        return self._mel_fd
+
+    def _read_frames(self, frame_start: int, count: int) -> np.ndarray:
+        """[count, 128] float32, read without mapping the file."""
+        row_bytes = MEL_BINS * 2
+        want = count * row_bytes
+        offset = frame_start * row_bytes
+        chunks, got = [], 0
+        while got < want:
+            block = os.pread(self._fd, want - got, offset + got)
+            if not block:
+                break                              # Short file; caller zero-pads.
+            chunks.append(block)
+            got += len(block)
+        raw = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+        frames = len(raw) // row_bytes
+        return np.frombuffer(raw, dtype=np.float16, count=frames * MEL_BINS) \
+                 .reshape(frames, MEL_BINS).astype(np.float32)
 
     def mel_window(self, idx: int, start: int, width: int) -> np.ndarray:
         """
@@ -359,10 +462,21 @@ class ShardReader:
         lo = max(start, 0)
         hi = min(start + width, length)
         if hi > lo:
-            chunk = self.mel[offset + lo: offset + hi]
-            out[lo - start: hi - start] = chunk.astype(np.float32)
+            if self.mel_io == "mmap":
+                chunk = self.mel[offset + lo: offset + hi].astype(np.float32)
+            else:
+                chunk = self._read_frames(offset + lo, hi - lo)
+            out[lo - start: lo - start + chunk.shape[0]] = chunk
 
         return np.ascontiguousarray(out.T)
+
+    def __getstate__(self) -> dict:
+        """Never pickle an open handle to a dataloader worker."""
+        state = dict(self.__dict__)
+        state["_mel"] = None
+        state["_mel_fd"] = None
+        state["_owner_pid"] = None
+        return state
 
     def mel_length(self, idx: int) -> int:
         return self.mel_spans[self.records[idx]["mel_key"]][1]

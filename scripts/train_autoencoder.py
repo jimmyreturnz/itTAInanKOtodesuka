@@ -15,6 +15,15 @@ validation pass so it is impossible to finish a run without knowing.
 If the gate will not clear at 16x compression, drop one entry from
 --channel-mult for 8x and retrain. A first stage that loses notes puts a
 ceiling on everything downstream that no amount of diffusion training removes.
+
+Interruption
+------------
+Same contract as stage 2, and for the same reason -- this stage also runs on a
+preemptible machine. Checkpoints are written atomically, on a clock as well as
+on a step count and at the end of every epoch, and --resume picks up at the
+batch it stopped on. Previously the only save in the whole loop sat inside the
+`--val-every` branch: a session killed at step 499 with `--val-every 500` had
+written nothing at all and lost every hour of it.
 """
 
 from __future__ import annotations
@@ -35,9 +44,12 @@ from taiko.data.frames import describe
 from taiko.data.preprocessed_dataset import (
     WINDOW_FRAMES_DEFAULT, WindowedDataset, print_split_stats, split_indices,
 )
-from taiko.data.shards import ShardReader
+from taiko.data.shards import MEL_IO_MODES, ShardReader
 from taiko.data.tensor_repr import CHART_CHANNEL_NAMES, ONSET_CHANNELS
 from taiko.model.autoencoder import AutoencoderConfig, ChartAutoencoder
+from taiko.train import (
+    CheckpointSaver, SaveTrigger, install_stop_handlers, load_checkpoint, memory_line,
+)
 
 GATE_A_F1 = 0.98
 
@@ -160,19 +172,6 @@ def validate(model, loader, device, max_batches: int) -> float:
     return total / max(seen, 1)
 
 
-def save(path: Path, model, optimizer, scaler, step, epoch, best, config,
-         threshold: float = 0.5):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "model": unwrap(model).state_dict(),
-        "config": vars(config),
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
-        "step": step, "epoch": epoch, "best_f1": best,
-        # Decoding must use the threshold the gate was measured at, or the
-        # generated chart has a different note count than the score implies.
-        "onset_threshold": threshold,
-    }, path)
 
 
 def main() -> int:
@@ -191,8 +190,27 @@ def main() -> int:
     ap.add_argument("--channel-mult", type=int, nargs="+", default=[1, 1, 2, 2, 4],
                     help="one entry per level; compression is 2^(len-1)")
     ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--val-workers", type=int, default=0,
+                    help="workers for the validation loader; 0 keeps two fewer "
+                         "processes and prefetch queues resident between passes")
+    ap.add_argument("--prefetch-factor", type=int, default=2,
+                    help="batches queued per worker; each costs "
+                         "batch x window x 128 floats of host RAM")
+    ap.add_argument("--mel-io", default="read", choices=list(MEL_IO_MODES),
+                    help="'read' preads each window and holds no pages; 'mmap' is "
+                         "faster but its resident set grows to the size of mels.dat")
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--val-batches", type=int, default=20)
+    ap.add_argument("--save-every", type=int, default=500,
+                    help="save last.pt every N steps (0 to disable)")
+    ap.add_argument("--save-every-min", type=float, default=10.0,
+                    help="save last.pt every N minutes; this is what bounds "
+                         "the cost of an OOM kill (0 to disable)")
+    ap.add_argument("--no-epoch-save", dest="epoch_save", action="store_false",
+                    default=True, help="do not save at the end of every epoch")
+    ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--max-hours", type=float, default=None,
+                    help="stop cleanly before a session limit, saving first")
     ap.add_argument("--fp16", action="store_true", default=True)
     ap.add_argument("--fp32", dest="fp16", action="store_false")
     ap.add_argument("--single-gpu", action="store_true")
@@ -212,7 +230,8 @@ def main() -> int:
         p = torch.cuda.get_device_properties(i)
         print(f"  cuda:{i}  {p.name}  {p.total_memory / 1024**3:.1f} GB")
 
-    reader = ShardReader(args.shards)
+    reader = ShardReader(args.shards, mel_io=args.mel_io)
+    print(reader.describe_mel_io())
     train_idx, val_idx = split_indices(reader, val_ratio=0.05)
     print_split_stats(reader, train_idx, "Train")
     print_split_stats(reader, val_idx, "Val")
@@ -229,14 +248,21 @@ def main() -> int:
     )
 
     batch = args.batch_size * max(n_gpus, 1)
-    loader_kwargs = dict(
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=args.num_workers > 0,
-    )
+
+    def loader_kwargs(workers: int, persistent: bool) -> dict:
+        return dict(
+            num_workers=workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=persistent and workers > 0,
+            prefetch_factor=args.prefetch_factor if workers > 0 else None,
+        )
+
     train_loader = DataLoader(train_ds, batch_size=batch, shuffle=True,
-                              drop_last=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=batch, shuffle=False, **loader_kwargs)
+                              drop_last=True, **loader_kwargs(args.num_workers, True))
+    # Not persistent: the validation loader runs twice per --val-every steps and
+    # would otherwise hold workers and prefetch queues for the whole run.
+    val_loader = DataLoader(val_ds, batch_size=batch, shuffle=False,
+                            **loader_kwargs(args.val_workers, False))
 
     config = AutoencoderConfig(
         middle_channels=args.middle_channels,
@@ -261,24 +287,77 @@ def main() -> int:
     optimizer = torch.optim.AdamW(unwrap(model).parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
-    step, start_epoch, best_f1, best_threshold = 0, 0, 0.0, 0.5
-    if args.resume and args.resume.exists():
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        unwrap(model).load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scaler.load_state_dict(ckpt["scaler"])
-        step, start_epoch = ckpt["step"], ckpt["epoch"]
-        best_f1 = ckpt.get("best_f1", 0.0)
-        best_threshold = ckpt.get("onset_threshold", 0.5)
-        print(f"Resumed from {args.resume}: step {step}, best F1 {best_f1:.4f}")
+    batches_per_epoch = len(train_loader)
 
-    total_steps = args.epochs * len(train_loader)
-    print(f"\n{len(train_loader)} steps/epoch, {total_steps} total\n")
+    step, start_epoch, best_f1, best_threshold, batch_offset = 0, 0, 0.0, 0.5, 0
+    if args.resume:
+        ckpt, source = load_checkpoint(args.resume, map_location=device)
+        if ckpt is None:
+            print(f"No checkpoint at {args.resume}; starting from scratch.")
+        else:
+            unwrap(model).load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scaler.load_state_dict(ckpt["scaler"])
+            step, start_epoch = ckpt["step"], ckpt["epoch"]
+            best_f1 = ckpt.get("best_f1", 0.0)
+            best_threshold = ckpt.get("onset_threshold", 0.5)
+            batch_offset = int(ckpt.get("batch_in_epoch", 0))
+            if batch_offset >= batches_per_epoch:
+                start_epoch, batch_offset = start_epoch + 1, 0
+            print(f"Resumed from {source}: step {step}, epoch {start_epoch + 1}, "
+                  f"batch {batch_offset}/{batches_per_epoch}, best F1 {best_f1:.4f}")
+
+    # One definition of what a checkpoint holds, read by every save site.
+    state = {"step": step, "epoch": start_epoch, "batch_in_epoch": batch_offset,
+             "best_f1": best_f1, "threshold": best_threshold}
+
+    def payload() -> dict:
+        return {
+            "model": unwrap(model).state_dict(),
+            "config": vars(config),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "step": state["step"],
+            "epoch": state["epoch"],
+            "batch_in_epoch": state["batch_in_epoch"],
+            "best_f1": state["best_f1"],
+            # Decoding must use the threshold the gate was measured at, or the
+            # generated chart has a different note count than the score implies.
+            "onset_threshold": state["threshold"],
+        }
+
+    trigger = SaveTrigger(args.save_every, args.save_every_min)
+    saver = CheckpointSaver(args.out, payload, trigger)
+    stop_signal = install_stop_handlers()
+
+    total_steps = args.epochs * batches_per_epoch
+    print(f"\n{batches_per_epoch} steps/epoch, {total_steps} total")
+    print(f"Checkpointing to {args.out}: {trigger.summary()}")
+    if args.max_hours:
+        print(f"Will stop cleanly after {args.max_hours:.1f} hours")
+    print()
 
     t0 = time.time()
     model.train()
+    stop = False
+    epoch = start_epoch
+    reason = "finished"
+
     for epoch in range(start_epoch, args.epochs):
-        for batch_data in train_loader:
+        if stop:
+            break
+
+        done_in_epoch, batch_offset = batch_offset, 0
+        budget = batches_per_epoch - done_in_epoch
+        if budget <= 0:
+            continue
+        state["epoch"] = epoch
+
+        for i, batch_data in enumerate(train_loader):
+            if i >= budget:
+                break
+            done_in_epoch += 1
+
             lr = lr_at(step, args.warmup, total_steps, args.lr)
             for group in optimizer.param_groups:
                 group["lr"] = lr
@@ -296,15 +375,18 @@ def main() -> int:
             scaler.step(optimizer)
             scaler.update()
             step += 1
+            state["step"] = step
+            state["batch_in_epoch"] = done_in_epoch
 
-            if step % 50 == 0:
+            if step % args.log_every == 0:
                 print(f"epoch {epoch + 1:3d} step {step:7d}  "
                       f"loss {log['total_loss']:.4f}  "
                       f"don {log['recall_don']:.2f} kat {log['recall_kat']:.2f} "
                       f"big {log['recall_big_don']:.2f} roll {log['recall_roll']:.2f}  "
-                      f"lr {lr:.2e}  {time.time() - t0:.0f}s")
+                      f"lr {lr:.2e}  {time.time() - t0:.0f}s  {memory_line()}",
+                      flush=True)
 
-            if step % args.val_every == 0:
+            if args.val_every and step % args.val_every == 0:
                 val_loss = validate(model, val_loader, device, args.val_batches)
                 gate = onset_reconstruction_f1(
                     unwrap(model), val_loader, device, args.val_batches
@@ -328,12 +410,46 @@ def main() -> int:
                 if gate["f1"] > best_f1:
                     best_f1 = gate["f1"]
                     best_threshold = gate["threshold"]
-                    save(args.out / "best.pt", model, optimizer, scaler,
-                         step, epoch, best_f1, config, best_threshold)
+                    state["best_f1"] = best_f1
+                    state["threshold"] = best_threshold
+                    saver.save("best.pt")
                     print(f"      new best -> {args.out / 'best.pt'}")
 
-                save(args.out / "last.pt", model, optimizer, scaler,
-                     step, epoch, best_f1, config, gate["threshold"])
+                state["threshold"] = gate["threshold"]
+                saver.save("last.pt", "validation")
+                state["threshold"] = best_threshold
+
+            saver.maybe_save(step)
+
+            if stop_signal:
+                reason = f"{stop_signal.reason} at step {step}"
+                stop = True
+                break
+
+            if args.max_hours and (time.time() - t0) / 3600 >= args.max_hours:
+                print(f"\nReached {args.max_hours}h; saving and stopping.")
+                reason = f"--max-hours at step {step}"
+                stop = True
+                break
+
+        # ---- end of epoch ------------------------------------------------- #
+        if done_in_epoch >= batches_per_epoch:
+            state["epoch"] = epoch + 1
+            state["batch_in_epoch"] = 0
+        if not stop and args.epoch_save:
+            saver.save("last.pt", f"end of epoch {epoch + 1}")
+
+    saver.save("last.pt", reason)
+    if stop:
+        print(f"\n{'=' * 60}")
+        print(f"Stopped early ({reason}) at step {step}, best onset F1 {best_f1:.4f}")
+        print(f"Epoch {state['epoch'] + 1}, batch {state['batch_in_epoch']}"
+              f"/{batches_per_epoch} -- --resume picks up exactly here")
+        print(f"Memory at exit: {memory_line()}")
+        print("\nThe latent scale is calibrated only on a completed run; resume "
+              "with:")
+        print(f"  python scripts/train_autoencoder.py --resume {args.out / 'last.pt'}")
+        return 0 if best_f1 >= GATE_A_F1 else 2
 
     # ---- calibrate the latent scale on the final weights ------------------ #
     print("\nCalibrating latent scale ...")
@@ -347,8 +463,9 @@ def main() -> int:
         ({"chart": b["chart"]} for b in calib_loader), device=device, max_batches=64,
     )
     print(f"  latent scale {scale:.4f}  (latent std was {1 / scale:.4f})")
-    save(ckpt_path, model, optimizer, scaler, step, args.epochs, best_f1,
-         config, best_threshold)
+    state.update(step=step, epoch=args.epochs, batch_in_epoch=0,
+                 best_f1=best_f1, threshold=best_threshold)
+    saver.save("best.pt", "calibrated")
 
     print(f"\n{'=' * 60}")
     print(f"Best onset F1: {best_f1:.4f} at threshold {best_threshold:.2f}   "

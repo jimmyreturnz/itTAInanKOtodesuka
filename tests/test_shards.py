@@ -15,7 +15,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 
 from taiko.data.osu_parser import TimingPoint
-from taiko.data.shards import MEL_BINS, ShardReader, ShardWriter, encode_chart, decode_chart_window
+from taiko.data.shards import (
+    MEL_BINS, ShardReader, ShardWriter, decode_chart_window, encode_chart,
+)
 from taiko.data.tensor_repr import (
     CH_DENDEN, CH_DON, CH_KAT, CH_ROLL, N_CHART_CHANNELS, build_timing_stream,
 )
@@ -155,6 +157,85 @@ def test_missing_dataset_says_what_to_run():
             print("  missing dataset message   ok")
             return
     raise AssertionError("expected FileNotFoundError")
+
+
+def _small_dataset(tmp: str) -> None:
+    rng = np.random.default_rng(3)
+    with ShardWriter(tmp) as w:
+        for s in range(3):
+            key = f"song{s}"
+            w.add_mel(key, rng.standard_normal((MEL_BINS, 4000)).astype(np.float32))
+            w.add_map({"mel_key": key}, _make_chart(4000, seed=s),
+                      [TimingPoint(time=0, beat_length=500.0, meter=4, uninherited=True)],
+                      key)
+
+
+def test_mel_io_paths_return_identical_windows():
+    """
+    pread and mmap must be interchangeable.
+
+    They are not an optimisation choice if they disagree anywhere -- the whole
+    point of offering both is that the cheap one on host memory can be selected
+    without changing a single training sample.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _small_dataset(tmp)
+        mapped = ShardReader(tmp, mel_io="mmap")
+        read   = ShardReader(tmp, mel_io="read")
+        rng = np.random.default_rng(0)
+        checked = 0
+        for _ in range(60):
+            i = int(rng.integers(0, len(mapped)))
+            # Deliberately includes starts before zero and past the end, where
+            # the zero-padding branches differ between the two paths.
+            start = int(rng.integers(-200, mapped.mel_length(i) + 200))
+            a = mapped.mel_window(i, start, 512)
+            b = read.mel_window(i, start, 512)
+            assert a.shape == b.shape == (MEL_BINS, 512), (a.shape, b.shape)
+            assert np.array_equal(a, b), f"map {i} start {start}"
+            checked += 1
+        print(f"  mmap == pread windows     ok  ({checked} windows)")
+
+
+def test_auto_mel_io_declines_to_map_a_large_corpus():
+    """
+    "auto" exists because a memmap's resident set grows to the size of the file.
+
+    A corpus that is a large fraction of RAM must not be mapped: that is the
+    failure this option was added to prevent, and a default that maps it anyway
+    is the same bug with a new name.
+    """
+    import taiko.data.shards as shards
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _small_dataset(tmp)
+        reader = ShardReader(tmp, mel_io="auto")
+        assert reader.mel_io == "mmap", "a tiny corpus should still be mapped"
+
+        real_ram = shards._total_ram_bytes
+        try:
+            shards._total_ram_bytes = lambda: reader.mel_bytes * 2
+            assert ShardReader(tmp, mel_io="auto").mel_io == "read"
+            shards._total_ram_bytes = lambda: 0          # RAM unknown
+            assert ShardReader(tmp, mel_io="auto").mel_io == "read"
+        finally:
+            shards._total_ram_bytes = real_ram
+        print("  auto declines big memmaps ok")
+
+
+def test_reader_survives_being_pickled_to_a_worker():
+    """Dataloader workers get the reader by pickle; handles must not travel."""
+    import pickle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _small_dataset(tmp)
+        for mode in ("mmap", "read"):
+            reader = ShardReader(tmp, mel_io=mode)
+            want = reader.mel_window(0, 100, 256)
+            clone = pickle.loads(pickle.dumps(reader))
+            assert clone._mel is None and clone._mel_fd is None
+            assert np.array_equal(clone.mel_window(0, 100, 256), want)
+        print("  reader pickles cleanly    ok")
 
 
 if __name__ == "__main__":
