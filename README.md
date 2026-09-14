@@ -1,5 +1,7 @@
 # tAIkoMapper
 
+Warning: this project is still WIP, as of now, github is used to update the codebase when needed only.
+
 Generates osu!taiko charts from audio, with controllable difficulty and style.
 
 A latent diffusion model in the shape of MuG-Diffusion, adapted for taiko: a
