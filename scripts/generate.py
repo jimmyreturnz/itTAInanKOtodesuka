@@ -123,7 +123,8 @@ def resolve_timing(args, total_frames: int) -> tuple[list[TimingPoint], str]:
         return [tp], "supplied"
 
     from taiko.timing import detect_timing
-    result = detect_timing(args.audio, verbose=True)
+    extra = {} if args.bias_ms is None else {"bias_ms": args.bias_ms}
+    result = detect_timing(args.audio, verbose=True, **extra)
     return result.timing_points, f"detected ({result.method})"
 
 
@@ -211,6 +212,9 @@ def main() -> int:
     timing.add_argument("--bpm", type=float, default=None, help="one known tempo")
     timing.add_argument("--offset", type=float, default=None, help="first beat, ms")
     timing.add_argument("--meter", type=int, default=4)
+    timing.add_argument("--bias-ms", type=float, default=None,
+                        help="shift detected red lines by this many ms "
+                             "(default: DECODER_BIAS_MS)")
 
     ap.add_argument("--cfg-scale", type=float, default=4.0)
     ap.add_argument("--steps", type=int, default=50)

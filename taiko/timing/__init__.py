@@ -7,7 +7,7 @@ taiko/timing -- super timing: red lines from audio, BPM changes included.
 
 Pipeline: beat evidence (activations.py) -> a beat for every beat of the song
 (tracker.py) -> constant-tempo sections, fitted, human-rounded, merged and
-polished to ~1 ms (sections.py) -> red lines on downbeats.
+polished against the beats' averaged attack (sections.py) -> red lines on downbeats.
 
 Timing is still worth checking by ear. What this removes is the work of
 finding the BPMs and offsets; a section that needs a nudge is a one-line edit
@@ -23,7 +23,7 @@ import numpy as np
 
 from taiko.data.osu_parser import TimingPoint
 from taiko.timing.activations import (
-    Activations, beat_this_activations, fine_envelope, load_mono,
+    Activations, beat_this_activations, load_mono,
     onset_activations, timingnet_activations,
 )
 from taiko.timing.sections import (
@@ -39,6 +39,11 @@ DEFAULT_TIMINGNET = Path("checkpoints/timing/best.pt")
 # red line. Measured by scripts/benchmark_timing.py against ranked maps (it
 # prints the recommended value as the median signed offset error). Zero until
 # measured -- a guess here would be worse than none.
+#
+# One data point so far: USAO - SUPERNOVA timed by ear in the osu! editor
+# (global and local offset 0) at 394 ms, where the beats' attacks begin at
+# 408 ms in our decode (libsndfile/mpg123, gapless trimming). That suggests
+# about -14 ms, but one song timed by ear is not a calibration.
 DECODER_BIAS_MS = 0.0
 
 
@@ -143,8 +148,7 @@ def detect_timing(
     sections = drop_ragged_edges(sections)
 
     if polish:
-        env, env_fps = fine_envelope(y)
-        shifts = polish_offsets(sections, env, env_fps)
+        shifts = polish_offsets(sections, y, 22_050)
         moved = [s for s in shifts if s != 0.0]
         if moved:
             notes.append(f"onset polish moved {len(moved)} section(s) by "

@@ -227,36 +227,75 @@ def merge_sections(sections: list[FittedSection], times: np.ndarray,
 # Offset polish and downbeats
 # --------------------------------------------------------------------------- #
 
-def polish_offsets(sections: list[FittedSection], envelope: np.ndarray, env_fps: float,
-                   search_ms: float = 8.0, step_ms: float = 0.5) -> list[float]:
+def attack_envelope(y: np.ndarray, sr: int, band=(150.0, 8000.0), win_ms: float = 2.0) -> np.ndarray:
     """
-    Nudge each section's offset to where the onset envelope lines up best.
+    Causal band-limited RMS, one value per sample.
 
-    The score is the envelope summed over the section's beat and half-beat
-    positions. Returns the shift applied to each section, in ms. A shift is
-    kept only if it improves the score by more than 2%, so a flat envelope
-    (a pad, a vocal intro) does not drag the grid around.
+    Causal on purpose: a zero-phase filter rings *before* a transient and
+    would pull the measured attack early; a causal one can only react after
+    the sound has started.
     """
+    import scipy.signal as sg
+    sos = sg.butter(4, band, "bandpass", fs=sr, output="sos")
+    x = sg.sosfilt(sos, np.asarray(y, dtype=np.float64))
+    w = max(1, int(win_ms / 1000.0 * sr))
+    return np.sqrt(np.convolve(x * x, np.ones(w) / w, mode="full")[:len(x)])
+
+
+def polish_offsets(sections: list[FittedSection], y: np.ndarray, sr: int,
+                   search_ms: float = 40.0, step_ms: float = 0.5, rise: float = 0.15,
+                   min_beats: int = 16, min_contrast: float = 1.2) -> list[float]:
+    """
+    Put each section's grid where its beats' attacks begin.
+
+    The attack envelope is averaged over every beat of the section -- folded
+    at the fitted period -- which turns hundreds of noisy transients into one
+    clean profile. The offset moves to where that profile's rise toward the
+    peak nearest the grid first crosses `rise` of the way up: where the
+    transient *starts*, which is what timing by ear lines up to.
+
+    The previous polish scored a 1 ms envelope beat by beat and barely moved
+    anything on real music: on USAO - SUPERNOVA it left the grid at 421 ms
+    while the folded profile's attacks begin at 408 in the same decode.
+
+    Returns the shift applied to each section, in ms. A section is left alone
+    if it is too short or its profile has too little contrast to trust (a
+    pad or a vocal intro).
+    """
+    env = attack_envelope(y, sr)
+    t_axis = np.arange(len(env)) * 1000.0 / sr
+    lags = np.arange(-search_ms, search_ms + 1e-9, step_ms)
     shifts = []
-    grid_t = np.arange(len(envelope)) * 1000.0 / env_fps
     for sec in sections:
-        k = np.arange(0, sec.n_beats, 0.5)
-        weights = np.where(k % 1 == 0, 1.0, 0.5)
-        base = sec.offset_ms + k * sec.ms_per_beat
-
-        def score(d: float) -> float:
-            return float(np.sum(weights * np.interp(base + d, grid_t, envelope,
-                                                    left=0.0, right=0.0)))
-
-        deltas = np.arange(-search_ms, search_ms + 1e-9, step_ms)
-        scores = np.array([score(d) for d in deltas])
-        best = float(deltas[int(np.argmax(scores))])
-        s0 = score(0.0)
-        if scores.max() > s0 * 1.02 + 1e-9:
-            sec.offset_ms += best
-            shifts.append(best)
-        else:
+        if sec.n_beats < min_beats:
             shifts.append(0.0)
+            continue
+        beats = sec.offset_ms + np.arange(sec.n_beats) * sec.ms_per_beat
+        profile = np.zeros(len(lags))
+        for b in beats:
+            profile += np.interp(b + lags, t_axis, env, left=0.0, right=0.0)
+        profile /= len(beats)
+
+        # The peak nearest the grid, not the global one: a loud off-beat
+        # element can outweigh the beat itself.
+        peaks = [i for i in range(1, len(profile) - 1)
+                 if profile[i] >= profile[i - 1] and profile[i] >= profile[i + 1]]
+        if not peaks:
+            shifts.append(0.0)
+            continue
+        top = profile.max()
+        strong = [i for i in peaks if profile[i] >= 0.6 * top]
+        pk = min(strong, key=lambda i: abs(lags[i]))
+        lo_i = int(np.argmin(profile[:pk + 1]))
+        lo = profile[lo_i]
+        if lo <= 0 or profile[pk] / lo < min_contrast:
+            shifts.append(0.0)
+            continue
+        th = lo + rise * (profile[pk] - lo)
+        start = lo_i + int(np.argmax(profile[lo_i:pk + 1] > th))
+        delta = float(lags[start])
+        sec.offset_ms += delta
+        shifts.append(delta)
     return shifts
 
 

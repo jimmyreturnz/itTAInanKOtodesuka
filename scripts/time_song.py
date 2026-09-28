@@ -42,6 +42,9 @@ def main() -> int:
     ap.add_argument("--leniency", type=float, default=12.0,
                     help="ms a beat may sit off a rounded BPM's grid")
     ap.add_argument("--meter", type=int, default=4)
+    ap.add_argument("--bias-ms", type=float, default=None,
+                    help="constant shift added to every red line. Default: "
+                         "DECODER_BIAS_MS (see scripts/benchmark_timing.py)")
     ap.add_argument("--title", default=None)
     ap.add_argument("--artist", default="")
     ap.add_argument("--device", default="cpu")
@@ -53,6 +56,8 @@ def main() -> int:
         return 1
 
     kwargs = {}
+    if args.bias_ms is not None:
+        kwargs["bias_ms"] = args.bias_ms
     if args.bpm_range:
         kwargs["bpm_range"] = tuple(args.bpm_range)
         kwargs["prior_bpm"] = None

@@ -249,7 +249,10 @@ answer key. `taiko/timing` follows Mapperatorinator's super-timing recipe:
 - shifted-audio ensembling
 - section fitting with human-rounded BPMs
 - activation-decided tempo-change boundaries
-- a 1 ms onset polish
+- an offset polish that averages each section's attacks over all its beats.
+  On SUPERNOVA it moved the offset 421 → 408 ms, onto the attack start; by ear
+  in osu! it is 394. The remaining ~14 ms is probably a decoder/playback
+  offset that only the ranked-map benchmark can measure.
 
 `beat_this` and a no-model onset envelope stay as fallbacks. It recovers
 synthetic click tracks exactly, including a BPM change. Real-music accuracy is

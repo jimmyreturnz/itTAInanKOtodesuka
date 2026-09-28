@@ -366,10 +366,19 @@ How it works (`taiko/timing/`):
    then .5, .1, .01), keeping the roundest value that still fits every beat.
 6. **Boundaries.** The exact beat where each tempo change happens is decided
    from the activation.
-7. **Polish.** Each offset is nudged against a 1 ms attack envelope.
+7. **Polish.** The attack envelope is averaged over every beat of each
+   section, and the offset moves to where that averaged attack begins, which is
+   what timing by ear lines up to.
 
 On synthetic click tracks it recovers BPM and offset exactly: steady 174 and
-240 BPM, and a 150 → 200 change, all at 0.0 ms error. Real music is harder.
+240 BPM, and a 150 → 200 change, all within 1 ms. Real music is harder.
+
+On USAO - SUPERNOVA it gives 212 BPM at 408 ms, which is where the beats'
+attacks begin in our decode. Timed by ear in the osu! editor, with no offsets
+set, it is 394 ms. That constant ~14 ms gap between our decoder and osu!
+playback is what `--bias-ms` (and `DECODER_BIAS_MS`) exist for. Pass
+`--bias-ms -14` for now; the benchmark below measures the real value across
+many ranked songs.
 Measure it on your own held-out ranked songs before trusting it:
 
 ```bash

@@ -71,30 +71,6 @@ def onset_activations(y: np.ndarray, sr: int = SR, hop: int = 110) -> Activation
                        sr / hop, "onset")
 
 
-def fine_envelope(y: np.ndarray, sr: int = SR, hop: int = 22,
-                  win_ms: float = 2.0) -> tuple[np.ndarray, float]:
-    """
-    ~1 ms attack envelope, for polishing offsets.
-
-    Rising log-energy of the percussive, high-passed signal in 2 ms windows.
-    A spectral-flux envelope was tried first and sat 2 ms late on click tracks
-    with exactly known onsets: its 23 ms analysis window peaks after the
-    attack has begun. Measured in the time domain the error was 0.0 ms, which
-    is what the last step of timing needs -- everything before it is only as
-    good as this.
-    """
-    import librosa
-    import scipy.signal as sg
-    b, a = sg.butter(2, 150.0 / (sr / 2), "high")
-    x = sg.lfilter(b, a, np.asarray(y, dtype=np.float64)).astype(np.float32)
-    perc = librosa.effects.percussive(x, margin=2.0).astype(np.float64)
-    win = max(1, int(win_ms / 1000.0 * sr))
-    energy = np.convolve(perc ** 2, np.ones(win) / win, mode="same")[::hop]
-    log_e = np.log(energy + 1e-8)
-    env = np.maximum(np.diff(log_e, prepend=log_e[0]), 0.0)
-    return env, sr / hop
-
-
 # --------------------------------------------------------------------------- #
 # Shifted ensembles for frame-level networks
 # --------------------------------------------------------------------------- #
