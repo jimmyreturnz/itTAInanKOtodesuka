@@ -24,9 +24,11 @@ Two fixes to how conditioning works
    a companion mask bit so the two are distinguishable.
 
 The timing stream enters as its own conditioning channel rather than as
-something the model must infer, and is pooled to each level with average
-pooling: phase is continuous, so averaging is meaningful where it would not be
-for a pulse train.
+something the model must infer. It arrives twice: average-pooled to each level
+(the original path, kept so older checkpoints still load), and -- in models
+built with features >= 2 -- through TimingEncoder, which learns its pooling.
+Averaging alone was not enough: a latent frame is about one beat long, and the
+mean of a phasor over one turn is zero. See taiko/model/timing_encoder.py.
 """
 
 from __future__ import annotations
@@ -81,10 +83,11 @@ class ConditionEmbedding(nn.Module):
     a train/inference skew waiting to happen.
     """
 
-    def __init__(self, dim: int, n_styles: int = N_STYLES):
+    def __init__(self, dim: int, n_styles: int = N_STYLES, context: bool = False):
         super().__init__()
 
         d_scalar = max(16, dim // 8)
+        self.context = context
         d_style  = max(16, dim // 6)
         d_motif  = max(32, dim // 3)
 
@@ -100,6 +103,19 @@ class ConditionEmbedding(nn.Module):
         )
 
         total = d_scalar * 3 + d_style + d_motif
+
+        # Density context (features >= 2): the window's own note density, and
+        # whether it and the map-wide density were given at all. Map-wide NPS
+        # alone told every window of a 7 NPS map -- the quiet intro included --
+        # that it was a 7 NPS window, which is a direct instruction to fill
+        # quiet sections. Appended last so an older checkpoint's out_proj
+        # columns stay where they were; see taiko/train/warm_start.py.
+        if context:
+            self.ctx_proj = nn.Linear(3, d_scalar)
+            total += d_scalar
+        else:
+            self.ctx_proj = None
+
         self.out_proj = nn.Sequential(nn.SiLU(), nn.Linear(total, dim))
 
         # The learned unconditional embedding. Guidance extrapolates away from
@@ -116,9 +132,17 @@ class ConditionEmbedding(nn.Module):
         motif: torch.Tensor | None = None,
         motif_mask: torch.Tensor | None = None,
         drop_mask: torch.Tensor | None = None,
+        window_nps: torch.Tensor | None = None,
+        window_known: torch.Tensor | None = None,
+        map_nps_known: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
+            window_nps:    [B] this window's normalised note density.
+            window_known:  [B] 1 where window_nps is a real request, 0 where it
+                           is unspecified. Absent means unspecified.
+            map_nps_known: [B] 1 where avg/peak NPS are real requests. Absent
+                           means they are.
             drop_mask: [B] bool. True replaces that sample's conditioning with
                 the learned null embedding. Callers own this -- the layer does
                 not sample it -- so the training loop and the guidance path use
@@ -144,6 +168,12 @@ class ConditionEmbedding(nn.Module):
             self.style_emb(style.reshape(B)),
             self.motif_proj(torch.cat([motif, motif_mask], dim=-1)),
         ]
+        if self.ctx_proj is not None:
+            ones = torch.ones(B, 1, device=device, dtype=difficulty.dtype)
+            known = ones * 0 if window_known is None else scalar(window_known)
+            wnps = scalar(window_nps) * known
+            mknown = ones if map_nps_known is None else scalar(map_nps_known)
+            parts.append(self.ctx_proj(torch.cat([wnps, known, mknown], dim=-1)))
         emb = self.out_proj(torch.cat(parts, dim=-1))
 
         if drop_mask is not None:
@@ -257,10 +287,20 @@ class TaikoDiffusionUNet(nn.Module):
         n_styles:       int = N_STYLES,
         audio_channels: list[int] | None = None,
         timing_channels: int = N_TIMING_CHANNELS,
+        timing_feature_channels: int = 0,
+        density_context: bool = False,
         use_checkpoint: bool = True,
         use_s4:         bool = True,
     ):
+        """
+        timing_feature_channels: channels per level from TimingEncoder, or 0
+            for the original pooled-phasor-only model. They are concatenated
+            *after* everything else each projection reads, so a checkpoint
+            without them can be widened into this shape with its existing
+            columns untouched (taiko/train/warm_start.py).
+        """
         super().__init__()
+        self.timing_feature_channels = timing_feature_channels
 
         channel_mult = tuple(channel_mult or (1, 2, 3, 4))
         self.num_levels = len(channel_mult)
@@ -278,7 +318,8 @@ class TaikoDiffusionUNet(nn.Module):
         self.audio_channels = list(audio_channels)
 
         self.time_emb = TimestepEmbedding(d_model=128, dim=emb_dim)
-        self.cond_emb = ConditionEmbedding(dim=emb_dim, n_styles=n_styles)
+        self.cond_emb = ConditionEmbedding(dim=emb_dim, n_styles=n_styles,
+                                           context=density_context)
 
         self.conv_in = nn.Conv1d(z_channels, base_channels, 3, padding=1)
 
@@ -293,7 +334,8 @@ class TaikoDiffusionUNet(nn.Module):
         for lvl, mult in enumerate(channel_mult):
             out_ch = base_channels * mult
             self.enc_proj.append(
-                nn.Conv1d(in_ch + self.audio_channels[lvl] + timing_channels, out_ch, 1)
+                nn.Conv1d(in_ch + self.audio_channels[lvl] + timing_channels
+                          + timing_feature_channels, out_ch, 1)
             )
             self.enc_res.append(nn.ModuleList([
                 ResBlock(out_ch, out_ch, emb_dim, num_groups, dropout, use_checkpoint)
@@ -327,7 +369,7 @@ class TaikoDiffusionUNet(nn.Module):
             out_ch  = base_channels * channel_mult[enc_lvl]
             self.dec_proj.append(nn.Conv1d(
                 in_ch + self.audio_channels[enc_lvl] + timing_channels
-                + self.skip_channels[enc_lvl],
+                + self.skip_channels[enc_lvl] + timing_feature_channels,
                 out_ch, 1,
             ))
             self.dec_res.append(nn.ModuleList([
@@ -378,6 +420,10 @@ class TaikoDiffusionUNet(nn.Module):
         motif_mask: torch.Tensor | None = None,
         drop_mask: torch.Tensor | None = None,
         cond_emb: torch.Tensor | None = None,
+        timing_features: list[torch.Tensor] | None = None,
+        window_nps: torch.Tensor | None = None,
+        window_known: torch.Tensor | None = None,
+        map_nps_known: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -386,7 +432,12 @@ class TaikoDiffusionUNet(nn.Module):
             cond_emb:       a precomputed conditioning embedding, which lets the
                             guidance path reuse one null embedding instead of
                             rebuilding it every step.
+            timing_features: TimingEncoder output, one map per level. Required
+                            when the U-Net was built with timing_feature_channels.
         """
+        if self.timing_feature_channels and timing_features is None:
+            raise ValueError("this U-Net takes timing_features; pass the "
+                             "TimingEncoder output")
         if len(audio_features) != self.num_levels:
             raise ValueError(
                 f"got {len(audio_features)} audio feature maps for "
@@ -395,7 +446,9 @@ class TaikoDiffusionUNet(nn.Module):
 
         if cond_emb is None:
             cond_emb = self.cond_emb(
-                difficulty, style, avg_nps, peak_nps, motif, motif_mask, drop_mask
+                difficulty, style, avg_nps, peak_nps, motif, motif_mask, drop_mask,
+                window_nps=window_nps, window_known=window_known,
+                map_nps_known=map_nps_known,
             )
         emb = self.time_emb(t) + cond_emb
 
@@ -412,7 +465,10 @@ class TaikoDiffusionUNet(nn.Module):
         for lvl in range(self.num_levels):
             audio = _match_length(audio_features[lvl], h.shape[-1])
             tm    = _match_length(timings[lvl], h.shape[-1])
-            h = self.enc_proj[lvl](torch.cat([h, audio, tm], dim=1))
+            parts = [h, audio, tm]
+            if self.timing_feature_channels:
+                parts.append(_match_length(timing_features[lvl], h.shape[-1]))
+            h = self.enc_proj[lvl](torch.cat(parts, dim=1))
             for block in self.enc_res[lvl]:
                 h = block(h, emb)
             if self.enc_s4[lvl] is not None:
@@ -429,7 +485,10 @@ class TaikoDiffusionUNet(nn.Module):
             h = _match_length(h, skip.shape[-1])
             audio = _match_length(audio_features[enc_lvl], h.shape[-1])
             tm    = _match_length(timings[enc_lvl], h.shape[-1])
-            h = self.dec_proj[lvl](torch.cat([h, audio, tm, skip], dim=1))
+            parts = [h, audio, tm, skip]
+            if self.timing_feature_channels:
+                parts.append(_match_length(timing_features[enc_lvl], h.shape[-1]))
+            h = self.dec_proj[lvl](torch.cat(parts, dim=1))
             for block in self.dec_res[lvl]:
                 h = block(h, emb)
             if self.dec_s4[lvl] is not None:

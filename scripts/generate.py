@@ -48,41 +48,19 @@ from taiko.data.tensor_repr import (
 )
 from taiko.data.timing_refine import apply_timing_refinement
 from taiko.data.osu_writer import OsuTaikoSerializer
-from taiko.model.diffusion import TaikoDiffusion
+from taiko.model.diffusion import load_diffusion
 from taiko.model.sampling import generate_song
 
 
 def load_model(diffusion_ckpt: Path, ae_ckpt: Path, device: torch.device):
-    ckpt = torch.load(diffusion_ckpt, map_location="cpu", weights_only=False)
-    profile = ckpt.get("profile", "p1")
-
-    model = TaikoDiffusion(
-        autoencoder_ckpt=str(ae_ckpt),
-        profile=profile,
-        prediction_type=ckpt.get("prediction_type", "v"),
-    )
-    model.unet_model.load_state_dict(ckpt["unet"])
-    model.wave_model.load_state_dict(ckpt["wave"])
-
-    # Sample from the EMA weights. They are what validation measured and what
-    # the model is actually good at; the live weights are wherever the last
-    # gradient step happened to leave them.
-    ema_state = ckpt.get("ema")
-    if ema_state:
-        shadow = ema_state["shadow"]
-        with torch.no_grad():
-            for param, value in zip(model.trainable_parameters(), shadow):
-                param.data.copy_(value.to(param.dtype))
-        print(f"Using EMA weights ({ema_state['step']} updates)")
+    model, threshold, ckpt = load_diffusion(diffusion_ckpt, ae_ckpt, device, verbose=True)
+    if ckpt.get("ema"):
+        print(f"Using EMA weights ({ckpt['ema']['step']} updates)")
     else:
         print("WARNING: checkpoint has no EMA weights; sample quality will suffer")
-
-    ae_ckpt_data = torch.load(ae_ckpt, map_location="cpu", weights_only=False)
-    threshold = ae_ckpt_data.get("onset_threshold", 0.5)
-
-    model = model.to(device).eval()
-    print(f"Model: profile {profile}, step {ckpt.get('step', '?')}, "
-          f"val {ckpt.get('best_val', float('nan')):.5f}, onset threshold {threshold}")
+    print(f"Model: profile {ckpt.get('profile', 'p1')}, features {model.features}, "
+          f"step {ckpt.get('step', '?')}, val {ckpt.get('best_val', float('nan')):.5f}, "
+          f"onset threshold {threshold}")
     return model, threshold, ckpt
 
 

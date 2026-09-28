@@ -76,14 +76,49 @@ class SpectralFlux(nn.Module):
     """
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
-        diff = mel[:, :, 1:] - mel[:, :, :-1]
-        flux = F.relu(diff).sum(dim=1, keepdim=True)
-        flux = F.pad(flux, (1, 0))
+        flux = raw_flux(mel)
 
-        # Per-clip normalisation: absolute flux scales with mix loudness, which
-        # is not something the chart should depend on.
+        # Normalised to the loudest transient *in this window*. The comment
+        # here used to call that per-clip, but the clip is a 30 s window, so a
+        # quiet breakdown's faint hi-hats were scaled up to look exactly as
+        # strong as the chorus's snare. Kept as-is because trained weights
+        # depend on it; features >= 2 add an absolute version alongside.
         peak = flux.amax(dim=2, keepdim=True).clamp(min=1e-5)
         return flux / peak
+
+
+# The mel is already normalised per *song* (peak-referenced dB in [-1, 1]), so
+# flux and energy computed from it are comparable across every window of one
+# song without any further normalisation. These constants only bring them into
+# roughly [0, 1] for the network; they are not tuned against anything.
+ABS_FLUX_SCALE = 8.0
+LOUD_TOP_BINS = 32
+
+
+def raw_flux(mel: torch.Tensor) -> torch.Tensor:
+    """Positive spectral difference summed over bins, [B, 1, T]."""
+    diff = mel[:, :, 1:] - mel[:, :, :-1]
+    flux = F.relu(diff).sum(dim=1, keepdim=True)
+    return F.pad(flux, (1, 0))
+
+
+def song_level(mel: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    (absolute flux, loudness), each [B, 1, T] and comparable across windows.
+
+    Loudness is the mean of the LOUD_TOP_BINS loudest mel bins per frame. A
+    plain mean over all 128 is dominated by bins sitting at the -80 dB floor
+    and barely moves: on a loud EDM master it spanned 0.56-0.66 between the
+    5th and 95th percentile. The top bins track what a listener hears as
+    volume, and the result is stretched so half-scale energy maps to 0.
+    Together these let the network tell a quiet section from a loud one,
+    which the window-normalised flux alone cannot.
+    """
+    flux = (raw_flux(mel) / ABS_FLUX_SCALE).clamp(0.0, 4.0)
+    k = min(LOUD_TOP_BINS, mel.shape[1])
+    top = mel.topk(k, dim=1).values.mean(dim=1, keepdim=True)     # [-1, 1]
+    loud = (top.clamp(min=0.0)).clamp(0.0, 1.0)
+    return flux, loud
 
 
 class OnsetStem(nn.Module):
@@ -95,17 +130,26 @@ class OnsetStem(nn.Module):
     of how busy the span was overall.
     """
 
-    def __init__(self, compression: int, out_channels: int):
+    def __init__(self, compression: int, out_channels: int, absolute: bool = False):
         super().__init__()
         self.compression = compression
+        self.absolute = absolute
         self.flux = SpectralFlux()
-        self.proj = nn.Conv1d(2, out_channels, kernel_size=3, padding=1)
+        # With `absolute`, four song-level channels follow the original two:
+        # absolute flux max/mean and loudness max/mean. They come last so an
+        # older checkpoint's two input columns keep their meaning.
+        self.proj = nn.Conv1d(6 if absolute else 2, out_channels, kernel_size=3, padding=1)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        pool_max = lambda x: F.max_pool1d(x, self.compression, ceil_mode=True)   # noqa: E731
+        pool_avg = lambda x: F.avg_pool1d(x, self.compression, ceil_mode=True)   # noqa: E731
+
         flux = self.flux(mel)
-        pooled_max  = F.max_pool1d(flux, self.compression, ceil_mode=True)
-        pooled_mean = F.avg_pool1d(flux, self.compression, ceil_mode=True)
-        return self.proj(torch.cat([pooled_max, pooled_mean], dim=1))
+        parts = [pool_max(flux), pool_avg(flux)]
+        if self.absolute:
+            abs_flux, loud = song_level(mel)
+            parts += [pool_max(abs_flux), pool_avg(abs_flux), pool_max(loud), pool_avg(loud)]
+        return self.proj(torch.cat(parts, dim=1))
 
 
 # --------------------------------------------------------------------------- #
@@ -191,6 +235,7 @@ class MelEncoder1D(nn.Module):
         num_groups:       int = 8,
         attention_levels: set[int] | None = None,
         onset_channels:   int = 32,
+        absolute_onsets:  bool = False,
     ):
         super().__init__()
 
@@ -231,7 +276,7 @@ class MelEncoder1D(nn.Module):
             layers.append(nn.Conv1d(ch, stem_out, 1))
         self.stem = nn.Sequential(*layers)
 
-        self.onset_stem = OnsetStem(compression, onset_channels)
+        self.onset_stem = OnsetStem(compression, onset_channels, absolute=absolute_onsets)
         self.merge = nn.Conv1d(stem_out + onset_channels, stem_out, 1)
 
         # --- one level per U-Net level ------------------------------------- #

@@ -78,3 +78,9 @@ CFG_DROPOUT = 0.15
 # above. See taiko/data/motif.py for why this is not optional.
 MOTIF_DIM_DROPOUT = 0.3
 MOTIF_JITTER      = 0.05
+
+# Density context (models built with features >= 2). Each is dropped
+# independently so every combination of "given / unspecified" is trained, which
+# is what lets generation leave either one out without asking for zero.
+MAP_NPS_DROPOUT    = 0.2
+WINDOW_NPS_DROPOUT = 0.3

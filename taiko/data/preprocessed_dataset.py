@@ -238,6 +238,8 @@ class WindowedDataset(Dataset):
             "motif":       torch.from_numpy(motif),
             "motif_mask":  torch.from_numpy(motif_mask),
             "local_nps":   torch.tensor(onsets / window_sec, dtype=torch.float32),
+            "window_nps":  torch.tensor(normalise_avg_nps(onsets / window_sec),
+                                        dtype=torch.float32),
             "map_index":   torch.tensor(idx, dtype=torch.long),
         }
 
@@ -255,6 +257,7 @@ class WindowedDataset(Dataset):
             "motif":      torch.zeros(MOTIF_DIM),
             "motif_mask": torch.zeros(MOTIF_DIM),
             "local_nps":  torch.tensor(0.0),
+            "window_nps": torch.tensor(0.0),
             "map_index":  torch.tensor(-1, dtype=torch.long),
         }
 

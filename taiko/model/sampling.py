@@ -24,6 +24,8 @@ compute of tiling with none, which is a small price for seamlessness.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import numpy as np
 import torch
 
@@ -84,6 +86,7 @@ def generate_song_latent(
     peak_nps: float | None = None,
     motif: torch.Tensor | np.ndarray | None = None,
     motif_mask: torch.Tensor | np.ndarray | None = None,
+    window_nps: float | Sequence[float] | None = None,
     window_frames: int = 1536,
     overlap_frames: int = 768,
     ddim_steps: int = 50,
@@ -91,6 +94,7 @@ def generate_song_latent(
     eta: float = 0.0,
     generator: torch.Generator | None = None,
     progress: bool = True,
+    batch_windows: int = 16,
 ) -> torch.Tensor:
     """
     Generate the latent for a whole song.
@@ -98,10 +102,23 @@ def generate_song_latent(
     Args:
         mel:    [1, 128, T] at chart resolution
         timing: [1, 3, T] beat grid over the same frames
+        avg_nps, peak_nps: normalised map-wide density. None means
+                        "unspecified" on models built with features >= 2; on
+                        generation-1 models it means zero, which is never what
+                        you want -- generate.py fills it from the NPS prior.
+        window_nps:     normalised density per window (a list as long as
+                        `plan_windows` returns), one value for all windows, or
+                        None to leave it to the model. Ignored by generation-1
+                        models.
         window_frames:  must match training, and be a multiple of the
                         autoencoder compression
         overlap_frames: how much neighbouring windows share. Half a window is a
                         good default; less starts to show at boundaries.
+        batch_windows:  how many windows share one U-Net forward. Windows and
+                        both guidance branches are stacked into one batch, so a
+                        five-minute song is ~50 forwards per chunk instead of
+                        ~1,900 batch-1 calls. Lower it if a long song runs out
+                        of memory on a small card.
 
     Returns:
         [1, z_channels, T // compression]
@@ -111,6 +128,7 @@ def generate_song_latent(
     scheduler = model.scheduler
     compression = model.compression
     cfg_scale = model.cfg_scale if cfg_scale is None else cfg_scale
+    features = getattr(model, "features", 1)
 
     if window_frames % compression != 0:
         raise ValueError(
@@ -123,45 +141,79 @@ def generate_song_latent(
 
     total_frames = mel.shape[-1]
     windows = plan_windows(total_frames, window_frames, overlap_frames)
+    n_win = len(windows)
 
     latent_total = total_frames // compression
     latent_window = window_frames // compression
     latent_overlap = overlap_frames // compression
 
-    # --- per-window conditioning, built once --------------------------------- #
-    def as_batch(value, fill, dt=torch.float32):
-        if value is None:
-            return torch.full((1,), fill, device=device, dtype=dt)
-        return torch.full((1,), float(value), device=device, dtype=dt) if dt.is_floating_point \
-            else torch.full((1,), int(value), device=device, dtype=dt)
+    # --- conditioning, one row per window ------------------------------------ #
+    def column(value, fill, dt=torch.float32):
+        v = fill if value is None else value
+        return torch.full((n_win,), float(v) if dt.is_floating_point else int(v),
+                          device=device, dtype=dt)
 
-    diff_t  = as_batch(difficulty, 0.5)
-    style_t = as_batch(style, STYLE_NULL, torch.long)
-    anps_t  = as_batch(avg_nps, 0.0)
-    pnps_t  = as_batch(peak_nps, 0.0)
+    diff_t  = column(difficulty, 0.5)
+    style_t = column(style, STYLE_NULL, torch.long)
+    anps_t  = column(avg_nps, 0.0)
+    pnps_t  = column(peak_nps, 0.0)
 
     if motif is None:
-        motif_t = torch.zeros(1, MOTIF_DIM, device=device, dtype=dtype)
-        mask_t  = torch.zeros(1, MOTIF_DIM, device=device, dtype=dtype)
+        motif_t = torch.zeros(n_win, MOTIF_DIM, device=device, dtype=dtype)
+        mask_t  = torch.zeros(n_win, MOTIF_DIM, device=device, dtype=dtype)
     else:
         motif_t = torch.as_tensor(np.asarray(motif), device=device, dtype=dtype).reshape(1, -1)
         mask_t = (
             torch.ones_like(motif_t) if motif_mask is None
             else torch.as_tensor(np.asarray(motif_mask), device=device, dtype=dtype).reshape(1, -1)
         )
+        motif_t, mask_t = motif_t.expand(n_win, -1), mask_t.expand(n_win, -1)
 
-    cond_emb = model.unet_model.cond_emb(diff_t, style_t, anps_t, pnps_t, motif_t, mask_t)
-    uncond_emb = model.unet_model.cond_emb.unconditional(1, device, cond_emb.dtype)
+    density = {}
+    if features >= 2:
+        if window_nps is None:
+            wnps_t = torch.zeros(n_win, device=device)
+            wknown = torch.zeros(n_win, device=device)
+        else:
+            values = np.asarray(window_nps, dtype=np.float32).reshape(-1)
+            if values.size not in (1, n_win):
+                raise ValueError(f"window_nps has {values.size} values for {n_win} windows")
+            values = np.broadcast_to(values, (n_win,))
+            wnps_t = torch.as_tensor(values.copy(), device=device)
+            wknown = torch.ones(n_win, device=device)
+        mknown = torch.full((n_win,), 0.0 if avg_nps is None else 1.0, device=device)
+        density = dict(window_nps=wnps_t, window_known=wknown, map_nps_known=mknown)
 
-    # Audio features and timing are deterministic functions of the input, so
-    # they are computed once per window instead of once per window per step --
-    # 50x less audio encoding for a 50-step sample.
-    cached = []
-    for start, end in windows:
-        window_mel = mel[:, :, start:end]
-        features = model.wave_model(window_mel)
-        window_timing = model.downsample_timing(timing[:, :, start:end], latent_window)
-        cached.append((start // compression, features, window_timing))
+    cond_emb = model.unet_model.cond_emb(
+        diff_t, style_t, anps_t, pnps_t, motif_t, mask_t, **density,
+    )
+    uncond_emb = model.unet_model.cond_emb.unconditional(n_win, device, cond_emb.dtype)
+
+    # --- audio and timing features, per window, computed once ----------------- #
+    # They are deterministic functions of the input, so they are computed once
+    # instead of once per step -- 50x less encoding for a 50-step sample.
+    # Windows are always full width: a song shorter than one window is padded,
+    # since every window in a batch must share one shape.
+    def window_slice(x: torch.Tensor, start: int, fill: float) -> torch.Tensor:
+        piece = x[:, :, start:start + window_frames]
+        if piece.shape[-1] < window_frames:
+            piece = torch.nn.functional.pad(
+                piece, (0, window_frames - piece.shape[-1]), value=fill)
+        return piece
+
+    # -1 is silence on the normalised mel scale; 0 would be mid-loudness.
+    mel_w = torch.cat([window_slice(mel, s, -1.0) for s, _ in windows], dim=0)
+    tim_w = torch.cat([window_slice(timing, s, 0.0) for s, _ in windows], dim=0)
+
+    audio_levels: list[list[torch.Tensor]] = []
+    timing_latents, timing_levels = [], []
+    for lo in range(0, n_win, batch_windows):
+        hi = min(lo + batch_windows, n_win)
+        audio_levels.append(model.wave_model(mel_w[lo:hi]))
+        timing_latents.append(model.downsample_timing(tim_w[lo:hi], latent_window))
+        timing_levels.append(model.encode_timing(tim_w[lo:hi]) if features >= 2 else None)
+
+    starts = [s // compression for s, _ in windows]
 
     blend = _blend_weights(latent_window, latent_overlap // 2, device, dtype)
     blend = blend.reshape(1, 1, -1)
@@ -173,13 +225,14 @@ def generate_song_latent(
     sequence = scheduler.timestep_sequence(ddim_steps)
     if progress:
         print(
-            f"  {len(windows)} windows x {len(sequence)} steps "
+            f"  {n_win} windows x {len(sequence)} steps "
             f"({total_frames} frames, {latent_total} latent)"
         )
 
+    guided = cfg_scale != 1.0
+
     for i, t_val in enumerate(sequence):
         t_prev_val = sequence[i + 1] if i + 1 < len(sequence) else 0
-        t = torch.full((1,), t_val, device=device, dtype=torch.long)
         t_prev = torch.full((1,), t_prev_val, device=device, dtype=torch.long)
 
         # Accumulate each window's prediction into a shared canvas, weighted by
@@ -188,30 +241,52 @@ def generate_song_latent(
         numerator = torch.zeros_like(z)
         denominator = torch.zeros(1, 1, latent_total, device=device, dtype=dtype)
 
-        for latent_start, features, window_timing in cached:
-            lo = latent_start
-            hi = min(lo + latent_window, latent_total)
-            span = hi - lo
-            z_window = z[:, :, lo:hi]
+        for chunk, lo in enumerate(range(0, n_win, batch_windows)):
+            hi = min(lo + batch_windows, n_win)
+            n = hi - lo
 
-            if span < latent_window:
-                z_window = torch.nn.functional.pad(z_window, (0, latent_window - span))
+            z_rows = []
+            for w in range(lo, hi):
+                piece = z[:, :, starts[w]:starts[w] + latent_window]
+                if piece.shape[-1] < latent_window:
+                    piece = torch.nn.functional.pad(piece, (0, latent_window - piece.shape[-1]))
+                z_rows.append(piece)
+            z_batch = torch.cat(z_rows, dim=0)
 
+            audio = audio_levels[chunk]
+            tlat = timing_latents[chunk]
+            tfeat = timing_levels[chunk]
+            emb = cond_emb[lo:hi]
+
+            if guided:
+                # Conditional and unconditional in the same forward.
+                z_batch = torch.cat([z_batch, z_batch], dim=0)
+                audio = [torch.cat([a, a], dim=0) for a in audio]
+                tlat = torch.cat([tlat, tlat], dim=0)
+                if tfeat is not None:
+                    tfeat = [torch.cat([f, f], dim=0) for f in tfeat]
+                emb = torch.cat([emb, uncond_emb[lo:hi]], dim=0)
+
+            t = torch.full((z_batch.shape[0],), t_val, device=device, dtype=torch.long)
             pred = model.unet_model(
-                z_window, t, features, window_timing,
-                difficulty=diff_t, style=style_t, cond_emb=cond_emb,
+                z_batch, t, audio, tlat,
+                difficulty=diff_t[:1].expand(z_batch.shape[0]),
+                style=style_t[:1].expand(z_batch.shape[0]),
+                cond_emb=emb, timing_features=tfeat,
             )
-            if cfg_scale != 1.0:
-                uncond = model.unet_model(
-                    z_window, t, features, window_timing,
-                    difficulty=diff_t, style=style_t, cond_emb=uncond_emb,
-                )
-                pred = uncond + cfg_scale * (pred - uncond)
+            if guided:
+                cond, uncond = pred[:n], pred[n:]
+                pred = uncond + cfg_scale * (cond - uncond)
 
-            numerator[:, :, lo:hi] += (pred * blend)[:, :, :span]
-            denominator[:, :, lo:hi] += blend[:, :, :span]
+            for row, w in enumerate(range(lo, hi)):
+                a = starts[w]
+                b = min(a + latent_window, latent_total)
+                span = b - a
+                numerator[:, :, a:b] += (pred[row:row + 1] * blend)[:, :, :span]
+                denominator[:, :, a:b] += blend[:, :, :span]
 
         prediction = numerator / denominator.clamp(min=1e-6)
+        t = torch.full((1,), t_val, device=device, dtype=torch.long)
         z = scheduler.ddim_step(prediction, z, t, t_prev, eta=eta)
 
         if progress and (i % 10 == 0 or i == len(sequence) - 1):

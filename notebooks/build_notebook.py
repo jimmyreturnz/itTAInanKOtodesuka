@@ -589,6 +589,16 @@ code("""
 BATCH_ARGS = ["--batch-size", "32", "--no-grad-checkpoint"]
 GRAD_ACCUM = "1"                               # 32/GPU x 2 GPUs = effective 64
 
+# Model generation. 2 feeds the beat grid through a learned timing encoder
+# (average pooling had erased it at common taiko tempos -- 4% of the signal
+# survived at 180 BPM, none at 187.5), adds song-level loudness so quiet
+# sections look quiet, and conditions on each window's own density. Resuming a
+# checkpoint trained before this widens it in place: the log prints
+# "Warm start: widening a features-1 checkpoint", step 0 reproduces the old
+# model exactly, and the learning rate ramps back up over --rewarm steps. Set
+# "1" only to keep training the old architecture unchanged.
+FEATURES = "2"
+
 # What is left of the session, measured rather than guessed. SESSION_HOURS is
 # Kaggle's cap; the cells above have already spent part of it, and a hard-coded
 # "10.5" silently becomes 12.5 when the setup cells take two hours, at which
@@ -600,6 +610,8 @@ DIFF_ARGS = [
     "--shards", str(SHARDS),
     "--out", str(CKPT / "diffusion"),
     "--profile", PROFILE,
+    "--features", FEATURES,
+    "--rewarm", "500",
     "--window-frames", "1536",
     *BATCH_ARGS,
     "--grad-accum", GRAD_ACCUM,

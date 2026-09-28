@@ -47,7 +47,7 @@ from taiko.data.tensor_repr import build_timing_stream, tensor_to_beatmap
 from taiko.eval.metrics import (
     note_statistics, onset_f1, pattern_divergence, snap_validity, unplayability,
 )
-from taiko.model.diffusion import TaikoDiffusion
+from taiko.model.diffusion import load_diffusion
 from taiko.model.sampling import generate_song
 
 GATE_B_F1 = 0.40
@@ -62,26 +62,7 @@ TARGETS = {
 
 
 def load_model(diffusion_ckpt: Path, ae_ckpt: Path, device, use_ema: bool = True):
-    ckpt = torch.load(diffusion_ckpt, map_location="cpu", weights_only=False)
-    model = TaikoDiffusion(
-        autoencoder_ckpt=str(ae_ckpt),
-        profile=ckpt.get("profile", "p1"),
-        prediction_type=ckpt.get("prediction_type", "v"),
-        verbose=False,
-    )
-    model.unet_model.load_state_dict(ckpt["unet"])
-    model.wave_model.load_state_dict(ckpt["wave"])
-
-    if use_ema and ckpt.get("ema"):
-        with torch.no_grad():
-            for param, shadow in zip(model.trainable_parameters(), ckpt["ema"]["shadow"]):
-                param.data.copy_(shadow.to(param.dtype))
-
-    threshold = torch.load(
-        ae_ckpt, map_location="cpu", weights_only=False
-    ).get("onset_threshold", 0.5)
-
-    return model.to(device).eval(), threshold, ckpt
+    return load_diffusion(diffusion_ckpt, ae_ckpt, device, use_ema=use_ema)
 
 
 def dominant_tempo(points: list[TimingPoint]) -> tuple[float, float, int]:

@@ -34,13 +34,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from taiko.data.conditioning import CFG_DROPOUT, STYLE_NULL
+from taiko.data.conditioning import (
+    CFG_DROPOUT, MAP_NPS_DROPOUT, STYLE_NULL, WINDOW_NPS_DROPOUT,
+)
 from taiko.data.motif import MOTIF_DIM
 from taiko.model.audio_encoder import MelEncoder1D
 from taiko.model.autoencoder import AutoencoderConfig, ChartAutoencoder
 from taiko.model.model_config import DiffusionProfile, get_profile
 from taiko.model.noise_scheduler import NoiseScheduler
+from taiko.model.timing_encoder import TimingEncoder
 from taiko.model.unet import TaikoDiffusionUNet
+
+# Model generations. 1 is the original: timing reaches the U-Net only as a
+# pooled phasor. 2 adds TimingEncoder, song-level onset/loudness channels and
+# window-density conditioning. A generation-1 checkpoint can be widened into
+# generation 2 without losing what it learned -- see taiko/train/warm_start.py.
+FEATURES_LATEST = 2
+TIMING_FEATURE_CHANNELS = 32
 
 
 def _frozen_train(self, mode: bool = True):
@@ -127,8 +137,12 @@ class TaikoDiffusion(nn.Module):
         z_channels: int = 16,
         n_mels: int = 128,
         verbose: bool = True,
+        features: int = FEATURES_LATEST,
     ):
         super().__init__()
+        if features not in (1, 2):
+            raise ValueError(f"unknown features generation {features}")
+        self.features = features
 
         if isinstance(profile, str):
             profile = get_profile(profile)
@@ -178,6 +192,14 @@ class TaikoDiffusion(nn.Module):
             channel_mult=profile.audio_channel_mult,
             compression=self.compression,
             n_levels=len(profile.unet_channel_mult),
+            absolute_onsets=features >= 2,
+        )
+
+        # ---- timing encoder (features >= 2) ------------------------------ #
+        self.timing_model = (
+            TimingEncoder(self.compression, len(profile.unet_channel_mult),
+                          channels=TIMING_FEATURE_CHANNELS)
+            if features >= 2 else None
         )
 
         # ---- U-Net -------------------------------------------------------- #
@@ -187,6 +209,8 @@ class TaikoDiffusion(nn.Module):
             channel_mult=profile.unet_channel_mult,
             num_res_blocks=profile.unet_num_res_blocks,
             audio_channels=self.wave_model.out_channels,
+            timing_feature_channels=TIMING_FEATURE_CHANNELS if features >= 2 else 0,
+            density_context=features >= 2,
             use_checkpoint=profile.use_checkpoint,
             use_s4=profile.use_s4,
         )
@@ -201,13 +225,32 @@ class TaikoDiffusion(nn.Module):
             print(
                 f"Profile {profile.name}: U-Net {self.unet_model.count_parameters()}, "
                 f"audio {self.wave_model.count_parameters()}, "
-                f"compression {self.compression}x, {prediction_type}-prediction"
+                f"compression {self.compression}x, {prediction_type}-prediction, "
+                f"features {features}"
             )
 
     # ------------------------------------------------------------------ #
 
     def trainable_parameters(self) -> list[nn.Parameter]:
-        return list(self.unet_model.parameters()) + list(self.wave_model.parameters())
+        return [p for _, p in self.named_trainable_parameters()]
+
+    def named_trainable_parameters(self) -> list[tuple[str, nn.Parameter]]:
+        """
+        Trainable parameters with checkpoint-style names ("unet.x", "wave.y",
+        "timing.z"), in the order the optimiser and EMA hold them. Names are
+        what let a checkpoint from an older generation be mapped onto this one.
+        """
+        out = [(f"unet.{n}", p) for n, p in self.unet_model.named_parameters()]
+        out += [(f"wave.{n}", p) for n, p in self.wave_model.named_parameters()]
+        if self.timing_model is not None:
+            out += [(f"timing.{n}", p) for n, p in self.timing_model.named_parameters()]
+        return out
+
+    def encode_timing(self, timing: torch.Tensor) -> list[torch.Tensor] | None:
+        """Full-rate timing stream -> per-level features, or None for generation 1."""
+        if self.timing_model is None:
+            return None
+        return self.timing_model(timing)
 
     @torch.no_grad()
     def encode(self, chart: torch.Tensor) -> torch.Tensor:
@@ -237,6 +280,7 @@ class TaikoDiffusion(nn.Module):
         peak_nps: torch.Tensor | None = None,
         motif: torch.Tensor | None = None,
         motif_mask: torch.Tensor | None = None,
+        window_nps: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Training loss. Returns (loss, metrics) where metrics is a stacked tensor
@@ -256,10 +300,27 @@ class TaikoDiffusion(nn.Module):
 
         audio_features = self.wave_model(mel)
         timing_latent = self.downsample_timing(timing, z.shape[-1])
+        timing_features = self.encode_timing(timing)
 
         # Classifier-free guidance dropout lives here, not inside the embedding
         # layer, so the training path and the sampling path share one mechanism.
         drop_mask = self._cfg_drop_mask(B, device)
+
+        density = {}
+        if self.features >= 2:
+            # Each density signal is independently "unspecified" some of the
+            # time, so generation can omit either without it meaning zero.
+            map_known = (torch.rand(B, device=device) >= MAP_NPS_DROPOUT).to(z.dtype)
+            win_known = (torch.rand(B, device=device) >= WINDOW_NPS_DROPOUT).to(z.dtype)
+            if window_nps is None:
+                window_nps = torch.zeros(B, device=device)
+                win_known = torch.zeros_like(win_known)
+            if avg_nps is not None:
+                avg_nps = avg_nps * map_known.to(avg_nps.dtype)
+            if peak_nps is not None:
+                peak_nps = peak_nps * map_known.to(peak_nps.dtype)
+            density = dict(window_nps=window_nps, window_known=win_known,
+                           map_nps_known=map_known)
 
         prediction = self.unet_model(
             z_t, t, audio_features, timing_latent,
@@ -267,6 +328,8 @@ class TaikoDiffusion(nn.Module):
             avg_nps=avg_nps, peak_nps=peak_nps,
             motif=motif, motif_mask=motif_mask,
             drop_mask=drop_mask,
+            timing_features=timing_features,
+            **density,
         )
 
         # The latent mask marks frames whose chart frames were all padding.
@@ -389,11 +452,21 @@ class TaikoDiffusion(nn.Module):
 
         audio_features = self.wave_model(mel.to(device))
         timing_latent = self.downsample_timing(timing.to(device), latent_frames)
+        timing_features = self.encode_timing(timing.to(device=device, dtype=dtype))
+
+        density = {}
+        if self.features >= 2:
+            density = dict(
+                window_nps=torch.zeros(B, device=device),
+                window_known=torch.zeros(B, device=device),
+                map_nps_known=torch.full((B,), 0.0 if avg_nps is None else 1.0,
+                                         device=device),
+            )
 
         # Both conditioning embeddings are built once. They do not depend on the
         # timestep, so recomputing them 50 times is pure waste.
         cond_emb = self.unet_model.cond_emb(
-            diff_t, style_t, anps_t, pnps_t, motif_t, mask_t,
+            diff_t, style_t, anps_t, pnps_t, motif_t, mask_t, **density,
         )
         uncond_emb = self.unet_model.cond_emb.unconditional(B, device, cond_emb.dtype)
 
@@ -411,12 +484,14 @@ class TaikoDiffusion(nn.Module):
             pred = self.unet_model(
                 z, t, audio_features, timing_latent,
                 difficulty=diff_t, style=style_t, cond_emb=cond_emb,
+                timing_features=timing_features,
             )
 
             if cfg_scale != 1.0:
                 uncond = self.unet_model(
                     z, t, audio_features, timing_latent,
                     difficulty=diff_t, style=style_t, cond_emb=uncond_emb,
+                    timing_features=timing_features,
                 )
                 pred = uncond + cfg_scale * (pred - uncond)
 
@@ -429,3 +504,45 @@ class TaikoDiffusion(nn.Module):
 
     def make_ema(self, decay: float = 0.9995, warmup: int = 1000) -> EMA:
         return EMA(self.trainable_parameters(), decay=decay, warmup=warmup)
+
+
+def load_diffusion(diffusion_ckpt, ae_ckpt, device, use_ema: bool = True,
+                   verbose: bool = False):
+    """
+    Build the model a checkpoint was trained as, load it, and return
+    (model, onset_threshold, checkpoint dict).
+
+    EMA weights are used by default: they are what validation measured and
+    what the model is actually good at; the live weights are wherever the last
+    gradient step happened to leave them. The EMA shadow is stored in
+    `trainable_parameters()` order, which is the same order the model builds
+    for the checkpoint's own features generation.
+    """
+    ckpt = torch.load(diffusion_ckpt, map_location="cpu", weights_only=False)
+    model = TaikoDiffusion(
+        autoencoder_ckpt=str(ae_ckpt),
+        profile=ckpt.get("profile", "p1"),
+        prediction_type=ckpt.get("prediction_type", "v"),
+        features=int(ckpt.get("features", 1)),
+        verbose=verbose,
+    )
+    model.unet_model.load_state_dict(ckpt["unet"])
+    model.wave_model.load_state_dict(ckpt["wave"])
+    if model.timing_model is not None:
+        model.timing_model.load_state_dict(ckpt["timing"])
+
+    ema_state = ckpt.get("ema")
+    if use_ema and ema_state:
+        shadow = ema_state["shadow"]
+        params = model.trainable_parameters()
+        if len(shadow) != len(params):
+            raise ValueError(f"EMA holds {len(shadow)} tensors, model has {len(params)}")
+        with torch.no_grad():
+            for param, value in zip(params, shadow):
+                param.data.copy_(value.to(param.dtype))
+
+    threshold = torch.load(
+        ae_ckpt, map_location="cpu", weights_only=False
+    ).get("onset_threshold", 0.5)
+
+    return model.to(device).eval(), threshold, ckpt

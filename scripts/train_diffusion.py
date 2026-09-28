@@ -79,12 +79,13 @@ from taiko.data.preprocessed_dataset import (
     WINDOW_FRAMES_DEFAULT, WindowedDataset, print_split_stats, split_indices,
 )
 from taiko.data.shards import MEL_IO_MODES, ShardReader
-from taiko.model.diffusion import EMA, TaikoDiffusion
+from taiko.model.diffusion import EMA, FEATURES_LATEST, TaikoDiffusion
 from taiko.model.model_config import PROFILES, get_profile
 from taiko.train import (
     EXIT_LOW_MEMORY, CheckpointSaver, MemoryTrend, SaveTrigger, headroom_gb,
     install_stop_handlers, load_checkpoint, memory_line, memory_mb, memory_report,
 )
+from taiko.train.warm_start import warm_start
 
 
 def unwrap(model: nn.Module) -> TaikoDiffusion:
@@ -103,7 +104,7 @@ def lr_at(step: int, warmup: int, total: int, peak: float, floor: float = 1e-6) 
 def batch_to(batch: dict, device: torch.device) -> dict:
     """Only the tensors the model consumes, moved once."""
     keys = ("chart", "mel", "timing", "difficulty", "style", "valid_mask",
-            "avg_nps", "peak_nps", "motif", "motif_mask")
+            "avg_nps", "peak_nps", "motif", "motif_mask", "window_nps")
     return {k: batch[k].to(device, non_blocking=True) for k in keys}
 
 
@@ -156,6 +157,17 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=2000)
     ap.add_argument("--ema-decay", type=float, default=0.9995)
     ap.add_argument("--prediction-type", default="v", choices=["v", "epsilon"])
+    ap.add_argument("--features", type=int, default=FEATURES_LATEST, choices=[1, 2],
+                    help="model generation. 2 adds the timing encoder, song-level "
+                         "onset/loudness channels and window-density conditioning. "
+                         "Resuming a generation-1 checkpoint at 2 widens it in "
+                         "place (taiko/train/warm_start.py): step 0 reproduces "
+                         "the old model exactly, and training continues from it.")
+    ap.add_argument("--rewarm", type=int, default=500,
+                    help="after a warm start, ramp the learning rate back up "
+                         "over this many steps. The new inputs start at zero "
+                         "with empty Adam moments; full lr on the first step "
+                         "would move them in one lurch.")
     ap.add_argument("--ranked-only", action="store_true",
                     help="train only on ranked maps (recommended for the final run)")
     ap.add_argument("--num-workers", type=int, default=4)
@@ -291,6 +303,7 @@ def main() -> int:
                                   # modifies it and passing args.profile would
                                   # silently re-fetch the unmodified original
         prediction_type=args.prediction_type,
+        features=args.features,
     )
     model.first_stage.check_window(args.window_frames)
     model = model.to(device)
@@ -320,6 +333,7 @@ def main() -> int:
     # the epoch from zero and quietly repeated up to an epoch of work on every
     # single resume, which over twenty resumes is days.
     step, start_epoch, best_val, batch_offset = 0, 0, float("inf"), 0
+    warm_start_step = None
     if args.resume:
         ckpt, source = load_checkpoint(args.resume, map_location=device)
         if ckpt is None:
@@ -329,12 +343,28 @@ def main() -> int:
                 print(f"ERROR: checkpoint is profile {ckpt.get('profile')!r}, "
                       f"you asked for {args.profile!r}. Shapes will not match.")
                 return 1
-            inner.unet_model.load_state_dict(ckpt["unet"])
-            inner.wave_model.load_state_dict(ckpt["wave"])
-            optimizer.load_state_dict(ckpt["optimizer"])
+            saved_features = int(ckpt.get("features", 1))
+            if saved_features > inner.features:
+                print(f"ERROR: checkpoint is features {saved_features}, this run "
+                      f"builds features {inner.features}. Pass --features "
+                      f"{saved_features}.")
+                return 1
+            if saved_features < inner.features:
+                print(f"Warm start: widening a features-{saved_features} checkpoint "
+                      f"into features {inner.features}")
+                report = warm_start(inner, ckpt, optimizer=optimizer, ema=ema)
+                print(report.summary())
+                warm_start_step = int(ckpt["step"])
+            else:
+                inner.unet_model.load_state_dict(ckpt["unet"])
+                inner.wave_model.load_state_dict(ckpt["wave"])
+                if inner.timing_model is not None:
+                    inner.timing_model.load_state_dict(ckpt["timing"])
+                optimizer.load_state_dict(ckpt["optimizer"])
+                if ckpt.get("ema"):
+                    ema.load_state_dict(ckpt["ema"])
+                warm_start_step = ckpt.get("warm_start_step")
             scaler.load_state_dict(ckpt["scaler"])
-            if ckpt.get("ema"):
-                ema.load_state_dict(ckpt["ema"])
             step = ckpt["step"]
             start_epoch = ckpt["epoch"]
             best_val = ckpt["best_val"]
@@ -367,6 +397,10 @@ def main() -> int:
         return {
             "unet": node.unet_model.state_dict(),
             "wave": node.wave_model.state_dict(),
+            "timing": (node.timing_model.state_dict()
+                       if node.timing_model is not None else None),
+            "features": node.features,
+            "warm_start_step": warm_start_step,
             "ema": ema.state_dict() if ema else None,
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
@@ -441,6 +475,8 @@ def main() -> int:
             done_in_epoch += 1
 
             lr_now = lr_at(step, args.warmup, total_steps, lr)
+            if warm_start_step is not None and args.rewarm > 0:
+                lr_now *= min(1.0, (step - warm_start_step + 1) / args.rewarm)
             for group in optimizer.param_groups:
                 group["lr"] = lr_now
 
