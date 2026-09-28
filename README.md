@@ -130,15 +130,7 @@ works with `--single-gpu`. Preprocessing is CPU-only and needs no GPU at all.
 ## Credits
 
 Architecture follows [MuG-Diffusion](https://github.com/Keytoyze/Mug-Diffusion)
-by Keytoyze — latent diffusion over chart arrays with multi-scale audio
-conditioning, adapted here from osu!mania to osu!taiko.
-
-Super timing borrows its central ideas from OliBomby's
-[Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) (MIT). Those
-ideas are: learning timing from ranked red lines, averaging passes over
-sub-frame-shifted audio, fitting whole sections, and "human-rounding" BPMs. The
-code in `taiko/timing/` is a separate implementation for frame activations
-rather than generated tokens.
+by Keytoyze
 
 ## Licence
 
