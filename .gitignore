@@ -20,7 +20,7 @@ runs/
 # Ignoring the directory rather than naming files keeps a deleted generator
 # from leaving its output untracked, which is what happened to
 # data/unranked_review.csv when export_unranked_csv.py was removed.
-data/
+/data/
 *.npy
 
 # Dataset caches
