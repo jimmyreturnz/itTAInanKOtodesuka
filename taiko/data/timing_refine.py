@@ -19,7 +19,10 @@ from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
 from taiko.data.tensor_repr import FRAME_MS
 
 EPSILON_MS = 10.0
-GRID_DIVISORS = [1, 2, 4, 3, 6, 8, 16, 12]  # Mug order, taiko-relevant snaps
+# Mug order, taiko-relevant snaps. 1/16 is left out: its grid is ~21 ms at
+# 180 BPM, so with a 10 ms tolerance it accepts almost any time and quietly
+# snaps notes that belong to nothing onto a snap taiko maps rarely use.
+GRID_DIVISORS = [1, 2, 4, 3, 6, 8, 12]
 
 
 def _normalize_bpm(bpm: float) -> float:
@@ -135,8 +138,9 @@ def snap_ms_to_grid(time_ms: float, bpm: float, offset_ms: float) -> int:
         meter = (time_ms - offset_ms) / gap
         meter_round = round(meter)
         if abs(meter - meter_round) < EPSILON_MS / gap:
-            return int(meter_round * gap + offset_ms)
-    return int(time_ms)
+            # round, not int: truncation moved every snapped note up to 1 ms early.
+            return int(round(meter_round * gap + offset_ms))
+    return int(round(time_ms))
 
 
 def snap_beatmap_notes(bm: TaikoBeatmap, bpm: float, offset_ms: float) -> TaikoBeatmap:

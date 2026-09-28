@@ -194,7 +194,12 @@ class NoiseScheduler(nn.Module):
 
         if eta > 0:
             out = out + sigma * torch.randn_like(x_t)
-        return out
+
+        # The sequence ends on t = 0 with t_prev = 0, where the update above
+        # re-noises x0 to level 0 and hands back x_t rather than the estimate.
+        # The last step should return the clean prediction itself.
+        final = (t_prev >= t).reshape(-1, *((1,) * (x_t.dim() - 1)))
+        return torch.where(final, x0, out)
 
     @torch.no_grad()
     def p_sample(

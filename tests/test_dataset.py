@@ -203,6 +203,57 @@ def test_rate_augmentation_keeps_everything_in_step():
     print(f"  rate augmentation in step ok  (beat {beat:.1f} frames)")
 
 
+def test_rate_augmentation_keeps_every_note_exactly_once():
+    """
+    Resampling single-frame onsets with nearest-neighbour dropped 9% of notes at
+    rate 1.1 and doubled 10% of them at 0.9. Every note must survive, one frame
+    wide, and holds must stay contiguous.
+    """
+    from taiko.data.preprocessed_dataset import _rate_augment
+    from taiko.data.tensor_repr import CH_ROLL
+
+    W = 1536
+    mel = np.zeros((MEL_BINS, W), dtype=np.float32)
+    timing = np.zeros((3, W), dtype=np.float32)
+    valid = np.ones(W, dtype=np.float32)
+    chart = np.zeros((N_CHART_CHANNELS, W), dtype=np.float32)
+    notes = np.arange(10, 1300, 5)
+    chart[CH_DON, notes] = 1.0
+    chart[CH_ROLL, 1320:1360] = 1.0
+
+    for rate in (0.9, 0.95, 1.05, 1.1):
+        _, c2, _, _ = _rate_augment(mel, chart, timing, valid, rate)
+        on = c2[CH_DON] > 0.5
+        rising = int((on & ~np.concatenate([[False], on[:-1]])).sum())
+        expected = int((((notes + 0.5) / rate - 0.5) < W - 0.5).sum())
+        assert int(on.sum()) == rising == expected, (rate, int(on.sum()), rising, expected)
+
+        roll = np.flatnonzero(c2[CH_ROLL] > 0.5)
+        if roll.size:
+            assert np.all(np.diff(roll) == 1), f"roll split at rate {rate}"
+    print("  rate augmentation keeps every note once ok")
+
+
+def test_phase_before_first_red_line_continues_the_grid():
+    """
+    The span before the first red line extends that red line's grid backwards.
+    Its phase used to be measured from 0 ms, so any offset that was not a whole
+    number of beats put the intro on a grid shifted from the one after it.
+    """
+    from taiko.data.tensor_repr import TM_COS, TM_SIN, build_timing_stream
+
+    beat = 333.333
+    for offset in (1100, 1234, 777):
+        tp = TimingPoint(time=offset, beat_length=beat, meter=4, uninherited=True)
+        s = build_timing_stream([tp], 200)
+        phase = np.angle(s[TM_COS] + 1j * s[TM_SIN]) / (2 * np.pi) % 1.0
+        frames_ms = np.arange(200) * FRAME_MS
+        expected = ((frames_ms - offset) / beat) % 1.0
+        err = np.abs((phase - expected + 0.5) % 1.0 - 0.5)
+        assert err.max() < 1e-4, (offset, float(err.max()))
+    print("  phase before first red line ok")
+
+
 def test_valid_mask_marks_the_tail():
     # A chart shorter than the window is the only case that can overrun: for
     # longer charts the sampler bounds the start so the window always fits.

@@ -22,7 +22,7 @@ class stops the run instead of quietly wasting a week of GPU time.
 
 Augmentation
 ------------
-Rate augmentation resamples mel, chart and timing together. Stretching time
+Rate augmentation stretches mel, chart and timing together. Stretching time
 stretches the beat grid with it, so the timing stream stays truthful about the
 augmented audio -- resampling the sin/cos phasor is right once its radius is
 restored (see _rate_augment), which is one
@@ -50,7 +50,8 @@ from taiko.data.motif import (
 )
 from taiko.data.shards import MEL_BINS, ShardReader
 from taiko.data.tensor_repr import (
-    N_CHART_CHANNELS, N_TIMING_CHANNELS, ONSET_CHANNELS, TM_COS, TM_SIN,
+    HOLD_CHANNELS, N_CHART_CHANNELS, N_TIMING_CHANNELS, ONSET_CHANNELS, TM_COS,
+    TM_SIN,
 )
 
 # Window sizes in frames (20 ms each).
@@ -185,6 +186,7 @@ class WindowedDataset(Dataset):
         valid_mask = np.zeros(W, dtype=np.float32)
         valid_mask[:valid_len] = 1.0
 
+        rate = 1.0
         if self.augment and py_rng.random() < self.rate_p:
             rate = py_rng.uniform(*self.rate_range)
             mel, chart, timing, valid_mask = _rate_augment(mel, chart, timing, valid_mask, rate)
@@ -197,8 +199,11 @@ class WindowedDataset(Dataset):
         record = reader.records[idx]
 
         difficulty = float(record.get("difficulty", 0.0))
-        avg_nps    = float(record.get("avg_nps", 0.0))
-        peak_nps   = float(record.get("peak_nps", 0.0))
+        # Playing the song `rate` times faster packs the same notes into less
+        # time, so density rises with it. Leaving these at the original values
+        # told the model a 1.1x window was as dense as the 1.0x one.
+        avg_nps    = float(record.get("avg_nps", 0.0)) * rate
+        peak_nps   = float(record.get("peak_nps", 0.0)) * rate
         style      = int(record.get("style", STYLE_NULL))
 
         if self.augment:
@@ -268,8 +273,14 @@ def _rate_augment(
     """
     Resample all four arrays by the same factor, then pad or crop back to width.
 
-    Chart uses nearest-neighbour so onsets stay crisp single frames; mel and
-    timing use linear because both are continuous signals.
+    Mel and timing use linear interpolation because both are continuous
+    signals. The chart is not resampled at all: its events are *moved*.
+    Nearest-neighbour resampling of single-frame onsets skips source frames when
+    compressing (rate 1.1 dropped 9% of notes) and repeats them when stretching
+    (rate 0.9 made 10% of notes two frames wide, which decodes as a double hit).
+    Each onset frame is instead mapped to where interpolation puts that instant
+    and written back as exactly one frame; hold channels have their start and
+    end moved the same way and are refilled between them.
 
     The timing phasor then needs renormalising. Linear interpolation between two
     points on the unit circle traces the chord rather than the arc, so the radius
@@ -291,7 +302,7 @@ def _rate_augment(
         return out[0].numpy()
 
     mel    = resample(mel,    "linear")
-    chart  = resample(chart,  "nearest")
+    chart  = _move_chart_events(chart, W, new_w)
     timing = resample(timing, "linear")
     radius = np.sqrt(timing[TM_SIN] ** 2 + timing[TM_COS] ** 2)
     ok = radius > 1e-6
@@ -307,6 +318,41 @@ def _rate_augment(
         return np.ascontiguousarray(np.concatenate([arr, pad], axis=-1))
 
     return fit(mel), fit(chart), fit(timing), fit(valid)
+
+
+def _move_chart_events(chart: np.ndarray, old_w: int, new_w: int) -> np.ndarray:
+    """
+    Re-place chart events on a grid of `new_w` frames.
+
+    Uses the same coordinate map as F.interpolate(align_corners=False), so an
+    onset lands on exactly the frame where the resampled mel carries its
+    transient: source frame f -> (f + 0.5) * new_w / old_w - 0.5.
+    """
+    scale = new_w / old_w
+
+    def move(frames: np.ndarray) -> np.ndarray:
+        out = np.round((frames + 0.5) * scale - 0.5).astype(np.int64)
+        return np.clip(out, 0, new_w - 1)
+
+    out = np.zeros((chart.shape[0], new_w), dtype=chart.dtype)
+
+    for ch in ONSET_CHANNELS:
+        on = np.flatnonzero(chart[ch] > 0.5)
+        if on.size:
+            out[ch, move(on)] = 1.0
+
+    for ch in HOLD_CHANNELS:
+        above = chart[ch] > 0.5
+        if not above.any():
+            continue
+        padded = np.concatenate([[False], above, [False]])
+        edges = np.diff(padded.astype(np.int8))
+        starts = move(np.flatnonzero(edges == 1))
+        ends = move(np.flatnonzero(edges == -1) - 1)
+        for s0, e0 in zip(starts, ends):
+            out[ch, s0:max(e0, s0) + 1] = 1.0
+
+    return out
 
 
 # --------------------------------------------------------------------------- #

@@ -74,6 +74,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from taiko.data.frames import describe
+from taiko.data.nps_prior import fit_nps_prior
 from taiko.data.preprocessed_dataset import (
     WINDOW_FRAMES_DEFAULT, WindowedDataset, print_split_stats, split_indices,
 )
@@ -246,6 +247,10 @@ def main() -> int:
     print_split_stats(reader, train_idx, "Train")
     print_split_stats(reader, val_idx, "Val")
 
+    # Typical density per star rating, shipped inside every checkpoint so
+    # generation can ask for a realistic density instead of zero.
+    nps_prior = fit_nps_prior(reader.records[i] for i in train_idx)
+
     train_ds = WindowedDataset(
         reader, train_idx, window_frames=args.window_frames,
         random_window=True, augment=True, samples_per_epoch=args.samples_per_epoch,
@@ -374,6 +379,7 @@ def main() -> int:
             "window_frames": args.window_frames,
             "prediction_type": args.prediction_type,
             "autoencoder_ckpt": str(args.ae),
+            "nps_prior": nps_prior,
         }
 
     trigger = SaveTrigger(args.save_every, args.save_every_min)

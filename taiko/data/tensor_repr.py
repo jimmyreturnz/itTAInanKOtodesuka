@@ -89,23 +89,25 @@ DEFAULT_METER       = 4
 def _red_line_segments(
     timing_points: list[TimingPoint],
     total_ms: float,
-) -> list[tuple[float, float, float, int]]:
+) -> list[tuple[float, float, float, int, float]]:
     """
     Split the map into spans of constant tempo.
 
-    Returns a list of (start_ms, end_ms, ms_per_beat, meter). Green lines carry
-    slider velocity only and never move the beat grid, so they are ignored here.
-    Timing points are assumed already sorted by time.
+    Returns a list of (start_ms, end_ms, ms_per_beat, meter, origin_ms). The
+    origin is where that span's grid has phase zero -- its red line. It is kept
+    apart from start_ms because the span before the first red line starts at
+    0 ms but belongs to the first red line's grid; measuring its phase from 0 ms
+    shifted the intro's beats unless the offset was a whole number of beats.
+
+    Green lines carry slider velocity only and never move the beat grid, so
+    they are ignored here. Timing points are assumed already sorted by time.
     """
-    reds = [
-        tp for tp in timing_points
-        if tp.uninherited and tp.beat_length > 0
-    ]
+    reds = red_lines(timing_points)
 
     if not reds:
-        return [(0.0, total_ms, DEFAULT_MS_PER_BEAT, DEFAULT_METER)]
+        return [(0.0, total_ms, DEFAULT_MS_PER_BEAT, DEFAULT_METER, 0.0)]
 
-    segments: list[tuple[float, float, float, int]] = []
+    segments: list[tuple[float, float, float, int, float]] = []
 
     # Audio before the first red line still needs a grid; extend the first
     # tempo backwards rather than leaving a dead zone at the start of the map.
@@ -113,6 +115,7 @@ def _red_line_segments(
         segments.append((
             0.0, float(reds[0].time),
             float(reds[0].beat_length), max(1, reds[0].meter),
+            float(reds[0].time),
         ))
 
     for i, tp in enumerate(reds):
@@ -122,9 +125,18 @@ def _red_line_segments(
         segments.append((
             float(tp.time), end,
             float(tp.beat_length), max(1, tp.meter),
+            float(tp.time),
         ))
 
     return segments
+
+
+def red_lines(timing_points: list[TimingPoint]) -> list[TimingPoint]:
+    """Uninherited timing points with a usable beat length, in time order."""
+    return sorted(
+        (tp for tp in timing_points if tp.uninherited and tp.beat_length > 0),
+        key=lambda tp: tp.time,
+    )
 
 
 def build_timing_stream(
@@ -152,13 +164,13 @@ def build_timing_stream(
     total_ms = (start_frame + n_frames) * FRAME_MS
     frame_ms = (np.arange(n_frames, dtype=np.float64) + start_frame) * FRAME_MS
 
-    for start_ms, end_ms, ms_per_beat, meter in _red_line_segments(timing_points, total_ms):
+    for start_ms, end_ms, ms_per_beat, meter, origin_ms in _red_line_segments(timing_points, total_ms):
         lo = max(0, int(np.floor(start_ms / FRAME_MS)) - start_frame)
         hi = min(n_frames, int(np.ceil(end_ms / FRAME_MS)) - start_frame)
         if hi <= lo or ms_per_beat <= 0:
             continue
 
-        t = frame_ms[lo:hi] - start_ms
+        t = frame_ms[lo:hi] - origin_ms
 
         beat_phase = (t / ms_per_beat) % 1.0
         stream[TM_SIN, lo:hi] = np.sin(2 * np.pi * beat_phase)
