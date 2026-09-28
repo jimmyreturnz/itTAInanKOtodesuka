@@ -278,8 +278,15 @@ def tensor_to_beatmap(
     audio_filename: str = "audio.mp3",
     overall_difficulty: float = 5.0,
     meter: int = DEFAULT_METER,
+    timing_points: Optional[list[TimingPoint]] = None,
 ) -> TaikoBeatmap:
-    """Convert a [6, T] chart back into a beatmap."""
+    """
+    Convert a [6, T] chart back into a beatmap.
+
+    `timing_points`, when given, are written as the map's red lines -- every
+    one of them, so a song with BPM changes keeps them. `bpm`/`offset_ms` are
+    the single-tempo shorthand and are ignored when a list is supplied.
+    """
     if chart.shape[0] < N_CHART_CHANNELS:
         raise ValueError(
             f"expected {N_CHART_CHANNELS} chart channels, got {chart.shape[0]}"
@@ -297,7 +304,12 @@ def tensor_to_beatmap(
     bm.slider_tick_rate   = 1.0
     bm.approach_rate      = overall_difficulty
 
-    bm.timing_points = [TimingPoint(
+    reds = red_lines(timing_points) if timing_points else []
+    bm.timing_points = [
+        TimingPoint(time=tp.time, beat_length=tp.beat_length,
+                    meter=max(1, tp.meter), uninherited=True)
+        for tp in reds
+    ] or [TimingPoint(
         time=int(round(offset_ms)),
         beat_length=60_000.0 / max(bpm, 1e-6),
         meter=max(1, meter),

@@ -14,7 +14,8 @@ from typing import Optional
 
 import numpy as np
 
-from taiko.data.beat_snap import SNAP_DIVISORS, detect_bpm
+from taiko.data.beat_snap import detect_bpm
+from taiko.data.grid import Grid
 from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
 from taiko.data.tensor_repr import FRAME_MS
 
@@ -133,24 +134,35 @@ def fit_timing_from_notes(
 
 def snap_ms_to_grid(time_ms: float, bpm: float, offset_ms: float) -> int:
     """Snap one timestamp to the nearest taiko subdivision (Mug format_time)."""
-    for div in GRID_DIVISORS:
-        gap = 60_000.0 / (bpm * div)
-        meter = (time_ms - offset_ms) / gap
-        meter_round = round(meter)
-        if abs(meter - meter_round) < EPSILON_MS / gap:
-            # round, not int: truncation moved every snapped note up to 1 ms early.
-            return int(round(meter_round * gap + offset_ms))
-    return int(round(time_ms))
+    return snap_ms_to(Grid.single(bpm, offset_ms), time_ms)
+
+
+def snap_ms_to(grid: Grid, time_ms: float) -> int:
+    """Snap against whichever red line owns `time_ms`."""
+    snapped = grid.snap(time_ms, GRID_DIVISORS, EPSILON_MS)
+    # round, not int: truncation moved every snapped note up to 1 ms early.
+    return int(round(time_ms if snapped is None else snapped))
 
 
 def snap_beatmap_notes(bm: TaikoBeatmap, bpm: float, offset_ms: float) -> TaikoBeatmap:
-    """Snap all note start/end times to the grid and dedupe within one frame."""
+    """Snap all note start/end times to one tempo's grid."""
+    return snap_beatmap_to_grid(bm, Grid.single(bpm, offset_ms))
+
+
+def snap_beatmap_to_grid(bm: TaikoBeatmap, grid: Grid) -> TaikoBeatmap:
+    """
+    Snap all note start/end times to the grid and dedupe within one frame.
+
+    Each note is snapped against the red line in force at its own time, so a
+    song with BPM changes keeps every section on its own grid instead of
+    forcing the whole map onto the first tempo.
+    """
     snapped: list[TaikoNote] = []
     for note in bm.notes:
-        t = snap_ms_to_grid(note.time, bpm, offset_ms)
+        t = snap_ms_to(grid, note.time)
         end = note.end_time
         if note.is_long and end > note.time:
-            end = snap_ms_to_grid(end, bpm, offset_ms)
+            end = snap_ms_to(grid, end)
             if end <= t:
                 end = t + int(FRAME_MS)
         snapped.append(TaikoNote(time=t, note_type=note.note_type, end_time=end))
@@ -195,6 +207,7 @@ def apply_timing_refinement(
     trust_given_tempo: bool = True,
     meter: int = 4,
     verbose: bool = True,
+    timing_points: Optional[list[TimingPoint]] = None,
 ) -> TaikoBeatmap:
     """
     Snap generated notes onto a beat grid.
@@ -213,6 +226,22 @@ def apply_timing_refinement(
     if not bm.notes:
         if verbose:
             print("[timing] no notes, nothing to snap")
+        return bm
+
+    if timing_points:
+        # A full red-line list (imported, or from super timing) is the most
+        # trustworthy grid there is; snap each note to its own section.
+        grid = Grid(timing_points)
+        before = [n.time for n in bm.notes]
+        snap_beatmap_to_grid(bm, grid)
+        if verbose:
+            moved = sum(1 for a, b in zip(before, [n.time for n in bm.notes]) if a != b)
+            bpms = ", ".join(f"{s.bpm:.2f}" for s in grid.sections[:6])
+            more = f" (+{len(grid.sections) - 6} more)" if len(grid.sections) > 6 else ""
+            print(f"[timing] snapping to {len(grid.sections)} red line(s): {bpms}{more}")
+            print(f"[timing] {moved}/{len(before)} notes moved onto the grid")
+        bm.timing_points = grid.timing_points()
+        bm.compute_stats()
         return bm
 
     if audio_bpm is None or audio_offset_ms is None:

@@ -5,18 +5,25 @@ Generate a playable .osz from an audio file.
 
     python scripts/generate.py --audio song.mp3 --difficulty 5.5
     python scripts/generate.py --audio song.mp3 --difficulty 7 --style stream
+    python scripts/generate.py --audio song.mp3 --timing-from "my timed map.osu"
     python scripts/generate.py --audio song.mp3 --preset tech --bpm 180 --offset 317
     python scripts/generate.py --audio song.mp3 --reference "some map.osu"
 
-Conditioning actually reaches the model here. The previous version passed
-neither NPS nor motif and used constructor arguments the model no longer
-accepted, so it raised on import -- and had it run, every generation would have
-been unconditional regardless of the flags, because unsupplied conditioning is
-the null embedding.
+Tempo is an input, not something the model invents, and getting the grid right
+is most of getting the chart right. In order of preference:
 
-Tempo is an input, not something the model invents. Give --bpm and --offset when
-you know them; otherwise they are detected from the audio and printed so you can
-correct them. Getting the grid right is most of getting the chart right.
+    --timing-from map.osu   red lines from a map you already timed (every one,
+                            so BPM changes survive)
+    --bpm B --offset O      one tempo you know
+    (neither)               detected: super timing (taiko/timing), which finds
+                            BPM changes and fits each section to about 1 ms.
+                            Its red lines are printed; check them, and pass
+                            --timing-from next time if one needs fixing.
+
+Density: when --avg-nps / --peak-nps are left out, the typical density for the
+requested star rating is used, from the table fitted on the training data
+(stored in the checkpoint, or nps_prior.json beside it). Passing nothing used
+to mean asking for zero notes per second.
 """
 
 from __future__ import annotations
@@ -32,24 +39,26 @@ import numpy as np
 import torch
 
 from taiko.data.audio import MelExtractor
-from taiko.data.beat_snap import detect_bpm
+from taiko.data.audio_activity import Activity, activity, activity_score, gate_notes
 from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
     style_to_int,
 )
-from taiko.data.frames import FRAME_MS, describe, frames_to_sec
+from taiko.data.frames import describe, frames_to_sec
+from taiko.data.grid import Grid
 from taiko.data.motif import (
     MOTIF_NAMES, PRESETS, beat_frames_from_bpm, compute_motif, describe_motif,
     get_preset,
 )
-from taiko.data.osu_parser import OsuTaikoParser
+from taiko.data.nps_prior import load_prior, lookup
+from taiko.data.osu_parser import OsuTaikoParser, TimingPoint
+from taiko.data.osu_writer import OsuTaikoSerializer
 from taiko.data.tensor_repr import (
-    beatmap_to_tensors, tensor_to_beatmap, timing_stream_from_bpm,
+    beatmap_to_tensors, build_timing_stream, red_lines, tensor_to_beatmap,
 )
 from taiko.data.timing_refine import apply_timing_refinement
-from taiko.data.osu_writer import OsuTaikoSerializer
 from taiko.model.diffusion import load_diffusion
-from taiko.model.sampling import generate_song
+from taiko.model.sampling import generate_song, plan_windows
 
 
 def load_model(diffusion_ckpt: Path, ae_ckpt: Path, device: torch.device):
@@ -99,6 +108,78 @@ def resolve_motif(args, parser: OsuTaikoParser) -> tuple[np.ndarray | None, np.n
     return None, None
 
 
+def resolve_timing(args, total_frames: int) -> tuple[list[TimingPoint], str]:
+    """Red lines to generate against, and where they came from."""
+    if args.timing_from:
+        bm = OsuTaikoParser().parse_file(Path(args.timing_from))
+        reds = red_lines(bm.timing_points)
+        if not reds:
+            raise ValueError(f"{args.timing_from} has no red lines")
+        return reds, f"imported from {Path(args.timing_from).name}"
+
+    if args.bpm is not None:
+        tp = TimingPoint(time=int(round(args.offset or 0.0)), beat_length=60_000.0 / args.bpm,
+                         meter=args.meter, uninherited=True)
+        return [tp], "supplied"
+
+    from taiko.timing import detect_timing
+    result = detect_timing(args.audio, verbose=True)
+    return result.timing_points, f"detected ({result.method})"
+
+
+def resolve_density(args, ckpt: dict, features: int) -> tuple[float | None, float | None, str]:
+    """(avg_nps, peak_nps) in real units, or None for "unspecified"."""
+    prior = ckpt.get("nps_prior")
+    source = "checkpoint"
+    if prior is None:
+        beside = Path(args.diffusion).parent / "nps_prior.json"
+        if beside.exists():
+            prior, source = load_prior(beside), str(beside)
+
+    if args.avg_nps is not None or args.peak_nps is not None:
+        avg, peak = args.avg_nps, args.peak_nps
+        # One given, the other missing: keep the corpus's peak/average ratio
+        # for this difficulty rather than sending the missing one as zero.
+        if prior is not None:
+            typ_avg, typ_peak = lookup(prior, args.difficulty)
+            ratio = typ_peak / max(typ_avg, 1e-6)
+        else:
+            ratio = 1.6
+        if peak is None:
+            peak = avg * ratio
+        if avg is None:
+            avg = peak / ratio
+        return avg, peak, "supplied"
+
+    if prior is not None:
+        avg, peak = lookup(prior, args.difficulty)
+        return avg, peak, f"typical for {args.difficulty:.1f}* ({source})"
+
+    if features >= 2:
+        return None, None, "unspecified (the model decides)"
+    raise SystemExit(
+        "This checkpoint predates the density table, and without one the model\n"
+        "would be asked for zero notes per second. Either pass --avg-nps and\n"
+        "--peak-nps, or make the table once:\n"
+        "    python scripts/fit_nps_prior.py --shards <shards> "
+        f"--out {Path(args.diffusion).parent / 'nps_prior.json'}"
+    )
+
+
+def window_densities(mel: np.ndarray, avg_nps: float, windows, act: Activity) -> list[float]:
+    """
+    Per-window density targets that rise and fall with the music: the map's
+    average scaled by how busy each window's audio is relative to the song.
+    Clipped so no window is asked for less than 30% or more than 160% of it.
+    """
+    song = float(act.flux.mean()) + 1e-6
+    out = []
+    for start, end in windows:
+        busy = float(act.flux[start:end].mean()) / song
+        out.append(normalise_avg_nps(avg_nps * float(np.clip(busy, 0.3, 1.6))))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate an osu!taiko map from audio")
     ap.add_argument("--audio", required=True, type=Path)
@@ -115,12 +196,21 @@ def main() -> int:
                     help="an .osu file to copy the style of")
     ap.add_argument("--motif", type=float, nargs="+", default=None,
                     help="16 raw motif values (advanced)")
-    ap.add_argument("--avg-nps", type=float, default=None)
+    ap.add_argument("--avg-nps", type=float, default=None,
+                    help="default: typical for --difficulty, from the training data")
     ap.add_argument("--peak-nps", type=float, default=None)
+    ap.add_argument("--window-density", choices=["off", "auto"], default="off",
+                    help="features-2 models only. 'auto' asks each window for a "
+                         "density that follows how busy its audio is; 'off' "
+                         "leaves that to the model, which learned it from the "
+                         "audio")
 
-    ap.add_argument("--bpm", type=float, default=None, help="skip tempo detection")
-    ap.add_argument("--offset", type=float, default=None, help="first beat, ms")
-    ap.add_argument("--meter", type=int, default=4)
+    timing = ap.add_argument_group("timing")
+    timing.add_argument("--timing-from", default=None,
+                        help="an .osu whose red lines to use (all of them)")
+    timing.add_argument("--bpm", type=float, default=None, help="one known tempo")
+    timing.add_argument("--offset", type=float, default=None, help="first beat, ms")
+    timing.add_argument("--meter", type=int, default=4)
 
     ap.add_argument("--cfg-scale", type=float, default=4.0)
     ap.add_argument("--steps", type=int, default=50)
@@ -129,10 +219,15 @@ def main() -> int:
     ap.add_argument("--window-frames", type=int, default=None,
                     help="default: whatever the checkpoint trained with")
     ap.add_argument("--overlap", type=int, default=None)
+    ap.add_argument("--batch-windows", type=int, default=16,
+                    help="windows per U-Net forward; lower it on a small GPU")
     ap.add_argument("--threshold", type=float, default=None,
                     help="override the checkpoint's onset threshold")
     ap.add_argument("--no-refine", action="store_true",
                     help="skip the post-generation grid snap")
+    ap.add_argument("--quiet-gate", action="store_true",
+                    help="drop isolated notes in the song's quietest passages "
+                         "that have no attack under them (streams are kept)")
     args = ap.parse_args()
 
     print(describe())
@@ -142,6 +237,9 @@ def main() -> int:
         if not Path(path).exists():
             print(f"ERROR: {what} not found: {path}")
             return 1
+    if args.timing_from and not Path(args.timing_from).exists():
+        print(f"ERROR: timing map not found: {args.timing_from}")
+        return 1
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, ckpt_threshold, ckpt = load_model(args.diffusion, args.ae, device)
@@ -155,31 +253,38 @@ def main() -> int:
     mel = MelExtractor().extract(args.audio)
     total_frames = mel.shape[1]
     print(f"  {total_frames} frames = {frames_to_sec(total_frames):.1f}s")
+    act = activity(mel)
 
     # ---- tempo -------------------------------------------------------- #
-    if args.bpm is not None:
-        bpm = args.bpm
-        offset = args.offset if args.offset is not None else 0.0
-        print(f"Tempo: {bpm:.1f} BPM, offset {offset:.0f} ms  (supplied)")
-    else:
-        print("Detecting tempo ...")
-        bpm, beats = detect_bpm(args.audio)
-        offset = float(beats[0] * 1000) if len(beats) else 0.0
-        if args.offset is not None:
-            offset = args.offset
-        print(f"Tempo: {bpm:.1f} BPM, offset {offset:.0f} ms  (detected)")
-        print("  If the chart feels off-grid, re-run with the real values:")
-        print(f"    --bpm <bpm> --offset <ms>")
-
-    timing = timing_stream_from_bpm(bpm, offset, total_frames, meter=args.meter)
+    points, timing_source = resolve_timing(args, total_frames)
+    grid = Grid(points)
+    print(f"\nTiming ({timing_source}):")
+    for sec in grid.sections[:12]:
+        print(f"  {sec.offset_ms:9.0f} ms  {sec.bpm:8.3f} BPM  {sec.meter}/4")
+    if len(grid.sections) > 12:
+        print(f"  ... {len(grid.sections) - 12} more red lines")
+    timing = build_timing_stream(points, total_frames)
 
     # ---- conditioning -------------------------------------------------- #
     parser = OsuTaikoParser()
     motif, motif_mask = resolve_motif(args, parser)
     style = style_to_int(args.style) if args.style else STYLE_NULL
+    avg_nps, peak_nps, density_source = resolve_density(args, ckpt, model.features)
+
+    win_nps = None
+    if args.window_density == "auto":
+        if model.features < 2:
+            print("  (--window-density needs a features-2 model; ignored)")
+        elif avg_nps is None:
+            print("  (--window-density auto needs a map density; ignored)")
+        else:
+            win_nps = window_densities(mel, avg_nps, plan_windows(total_frames, window, overlap), act)
 
     print(f"\nGenerating:")
     print(f"  difficulty  {args.difficulty}*")
+    print(f"  density     " + (f"{avg_nps:.2f} avg / {peak_nps:.2f} peak nps"
+                               if avg_nps is not None and peak_nps is not None
+                               else "unspecified") + f"  ({density_source})")
     print(f"  style       {args.style or 'unspecified'}")
     print(f"  guidance    {args.cfg_scale}   steps {args.steps}")
     print(f"  window      {window} frames, overlap {overlap}")
@@ -194,22 +299,25 @@ def main() -> int:
         timing=torch.from_numpy(timing).unsqueeze(0),
         difficulty=normalise_difficulty(args.difficulty),
         style=style,
-        avg_nps=normalise_avg_nps(args.avg_nps) if args.avg_nps else None,
-        peak_nps=normalise_peak_nps(args.peak_nps) if args.peak_nps else None,
+        avg_nps=normalise_avg_nps(avg_nps) if avg_nps is not None else None,
+        peak_nps=normalise_peak_nps(peak_nps) if peak_nps is not None else None,
         motif=motif,
         motif_mask=motif_mask,
+        window_nps=win_nps,
         window_frames=window,
         overlap_frames=overlap,
         ddim_steps=args.steps,
         cfg_scale=args.cfg_scale,
         eta=args.eta,
         generator=generator,
+        batch_windows=args.batch_windows,
     )[0].cpu().numpy()
 
     # ---- decode -------------------------------------------------------- #
     style_label = args.preset or args.style or "AI"
     bm = tensor_to_beatmap(
-        chart, bpm=bpm, offset_ms=offset, threshold=threshold, meter=args.meter,
+        chart, bpm=grid.sections[0].bpm, offset_ms=grid.sections[0].offset_ms,
+        threshold=threshold, meter=args.meter, timing_points=points,
         title=args.audio.stem, artist="",
         version=f"{style_label.capitalize()} {args.difficulty:.1f}",
         audio_filename=args.audio.name,
@@ -218,12 +326,15 @@ def main() -> int:
 
     if not args.no_refine and bm.note_count > 0:
         print("\nSnapping to the beat grid ...")
-        apply_timing_refinement(
-            bm, audio_path=args.audio, audio_bpm=bpm,
-            audio_offset_ms=offset, meter=args.meter,
-            trust_given_tempo=True, verbose=True,
-        )
+        apply_timing_refinement(bm, timing_points=points, verbose=True)
 
+    if args.quiet_gate and bm.notes:
+        kept, dropped = gate_notes(bm.notes, act, grid)
+        bm.notes = kept
+        bm.compute_stats()
+        print(f"\nQuiet gate: dropped {len(dropped)} isolated note(s) in quiet passages")
+
+    score = activity_score(bm.notes, act, grid)
     print(f"\nResult:")
     print(f"  notes     {bm.note_count}")
     print(f"  nps       {bm.notes_per_second:.2f}")
@@ -231,6 +342,10 @@ def main() -> int:
     print(f"  big       {bm.big_ratio:.1%}")
     print(f"  rolls     {bm.roll_count}   dendens {bm.denden_count}")
     print(f"  duration  {bm.duration_ms / 1000:.1f}s")
+    print(f"  quiet-section notes    {score.quiet_note_rate:.1%} of notes")
+    print(f"  strong onsets left empty  {len(score.missed_times_ms)}/{score.strong_onsets}"
+          + (f"  e.g. at {', '.join(_mmss(t) for t in score.missed_times_ms[:6])}"
+             if score.missed_times_ms else ""))
 
     if bm.note_count == 0:
         print("\nThe map is empty. Try a lower --threshold or a lower --cfg-scale;")
@@ -250,6 +365,10 @@ def main() -> int:
     print(f"\nSaved {osz_path}")
     print("Open it with osu! to import.")
     return 0
+
+
+def _mmss(ms: int) -> str:
+    return f"{ms // 60000}:{(ms // 1000) % 60:02d}.{ms % 1000:03d}"
 
 
 if __name__ == "__main__":

@@ -16,9 +16,21 @@ what comes back, which is the only honest way to test a control -- a model can
 condition on difficulty perfectly in the loss and still ignore it at sampling
 time if guidance is misconfigured.
 
-Every chart is generated from the reference map's own tempo, so this measures
-the model rather than the tempo detector. Use --detect-bpm to include detection
-error in the numbers, which is what a user actually experiences.
+Every chart is generated from the reference map's own red lines -- all of them,
+so BPM changes are included -- which measures the model rather than a tempo
+detector.
+
+Two audio-agreement numbers sit beside F1, each shown against the ranked map's
+own value for the same song (see taiko/data/audio_activity.py):
+
+    quiet notes   share of notes placed in the song's quietest 20% of frames
+    onset misses  share of strong on-grid attacks with no note within 40 ms
+
+--grid-probe re-generates each map with its grid shifted a third of a beat and
+reports how often the notes follow the shifted grid rather than the original.
+1.0 means the model places notes from the beat grid it is given; 0.0 means it
+ignores the grid and follows the audio's own beat; 0.5 means neither. It is
+the direct test that the timing input reaches the model at all.
 """
 
 from __future__ import annotations
@@ -35,10 +47,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import torch
 
+from taiko.data.audio_activity import ON_GRID_MS, activity, activity_score
 from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
 )
-from taiko.data.frames import describe
+from taiko.data.frames import FRAME_MS, describe
+from taiko.data.grid import Grid
 from taiko.data.motif import beat_frames_from_timing, compute_motif
 from taiko.data.osu_parser import TimingPoint
 from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
@@ -73,6 +87,34 @@ def dominant_tempo(points: list[TimingPoint]) -> tuple[float, float, int]:
     return 60_000.0 / tp.beat_length, float(tp.time), max(1, tp.meter)
 
 
+def grid_follow_fraction(sample, points: list[TimingPoint], frames: int,
+                         threshold: float) -> float:
+    """
+    Generate against the map's grid shifted by a third of a beat, then ask
+    which grid the notes sit on.
+
+    A third of a beat lands on neither grid's binary positions (1/1, 1/2, 1/4),
+    so each note on one of those can be attributed unambiguously. Returns
+    on_shifted / (on_shifted + on_original).
+    """
+    shifted = [TimingPoint(time=int(round(tp.time + tp.beat_length / 3.0)),
+                           beat_length=tp.beat_length, meter=tp.meter,
+                           uninherited=tp.uninherited)
+               if tp.uninherited else tp for tp in points]
+    timing = torch.from_numpy(build_timing_stream(shifted, frames)).unsqueeze(0)
+    chart = sample(timing)
+    notes = tensor_to_beatmap(chart, bpm=120, offset_ms=0, threshold=threshold,
+                              timing_points=shifted).notes
+    if not notes:
+        return float("nan")
+    times = np.asarray([n.time for n in notes], dtype=np.float64)
+    binary = [1, 2, 4]
+    on_shift = Grid(shifted).distances_ms(times, binary) <= ON_GRID_MS
+    on_orig = Grid(points).distances_ms(times, binary) <= ON_GRID_MS
+    a, b = int((on_shift & ~on_orig).sum()), int((on_orig & ~on_shift).sum())
+    return a / (a + b) if a + b else float("nan")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--diffusion", type=Path, default=Path("checkpoints/diffusion/best.pt"))
@@ -91,6 +133,9 @@ def main() -> int:
                          "a big gap between this and the default run means the "
                          "model is reading the answer off its conditioning.")
     ap.add_argument("--no-ema", action="store_true")
+    ap.add_argument("--grid-probe", action="store_true",
+                    help="also generate against a grid shifted by 1/3 beat and "
+                         "measure whether the notes follow it (doubles the cost)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -143,22 +188,34 @@ def main() -> int:
         requested_sr = float(record.get("difficulty", 5.0))
         requested_nps = float(record.get("avg_nps", 0.0))
 
-        generated_chart = generate_song(
-            model, mel=mel, timing=timing,
-            difficulty=normalise_difficulty(requested_sr),
-            style=int(record.get("style", STYLE_NULL)),
-            avg_nps=normalise_avg_nps(requested_nps) if requested_nps else None,
-            peak_nps=normalise_peak_nps(float(record.get("peak_nps", 0.0))) or None,
-            motif=motif, motif_mask=motif_mask,
-            window_frames=window, overlap_frames=window // 2,
-            ddim_steps=args.steps, cfg_scale=args.cfg_scale,
-            progress=False,
-        )[0].cpu().numpy()
+        def sample(timing_tensor: torch.Tensor) -> np.ndarray:
+            return generate_song(
+                model, mel=mel, timing=timing_tensor,
+                difficulty=normalise_difficulty(requested_sr),
+                style=int(record.get("style", STYLE_NULL)),
+                avg_nps=normalise_avg_nps(requested_nps) if requested_nps else None,
+                peak_nps=normalise_peak_nps(float(record.get("peak_nps", 0.0))) or None,
+                motif=motif, motif_mask=motif_mask,
+                window_frames=window, overlap_frames=window // 2,
+                ddim_steps=args.steps, cfg_scale=args.cfg_scale,
+                progress=False,
+                generator=torch.Generator(device=device).manual_seed(args.seed + idx),
+            )[0].cpu().numpy()
 
         generated = tensor_to_beatmap(
-            generated_chart, bpm=bpm, offset_ms=offset,
-            threshold=threshold, meter=meter,
+            sample(timing), bpm=bpm, offset_ms=offset,
+            threshold=threshold, meter=meter, timing_points=points,
         )
+
+        grid = Grid(points)
+        act = activity(mel[0].numpy())
+        span = (0.0, frames * FRAME_MS)
+        gen_act = activity_score(generated.notes, act, grid, span_ms=span)
+        ref_act = activity_score(reference.notes, act, grid, span_ms=span)
+
+        follows = float("nan")
+        if args.grid_probe:
+            follows = grid_follow_fraction(sample, points, frames, threshold)
 
         f1 = onset_f1(generated.notes, reference.notes)
         snap = snap_validity(generated.notes, generated.timing_points)
@@ -183,11 +240,19 @@ def main() -> int:
             "reference_notes": reference_stats.n_notes,
             "don_ratio": stats.don_ratio,
             "big_ratio": stats.big_ratio,
+            "quiet_note_rate": gen_act.quiet_note_rate,
+            "ref_quiet_note_rate": ref_act.quiet_note_rate,
+            "onset_miss_rate": gen_act.strong_onset_miss_rate,
+            "ref_onset_miss_rate": ref_act.strong_onset_miss_rate,
+            "strong_onsets": gen_act.strong_onsets,
+            "grid_follow": follows,
         })
 
         print(f"  [{n + 1}/{len(chosen)}] F1 {f1.f1:.3f}  "
               f"snap {snap.valid_fraction:.3f}  "
               f"notes {stats.n_notes} vs {reference_stats.n_notes}  "
+              f"quiet {gen_act.quiet_note_rate:.2f}/{ref_act.quiet_note_rate:.2f}  "
+              f"miss {gen_act.strong_onset_miss_rate:.2f}/{ref_act.strong_onset_miss_rate:.2f}  "
               f"{rows[-1]['map'][:44]}")
 
     if not rows:
@@ -224,6 +289,12 @@ def main() -> int:
         "don_ratio": mean("don_ratio"),
         "big_ratio": mean("big_ratio"),
         "note_ratio": mean("generated_notes") / max(mean("reference_notes"), 1e-6),
+        "quiet_note_rate": mean("quiet_note_rate"),
+        "ref_quiet_note_rate": mean("ref_quiet_note_rate"),
+        "onset_miss_rate": mean("onset_miss_rate"),
+        "ref_onset_miss_rate": mean("ref_onset_miss_rate"),
+        "grid_follow": (float(np.nanmean([r["grid_follow"] for r in rows]))
+                        if args.grid_probe else float("nan")),
     }
 
     print(f"\n{'=' * 62}")
@@ -246,6 +317,15 @@ def main() -> int:
     print(f"  {'note count ratio':<16s} {summary['note_ratio']:>8.4f}   "
           f"(1.0 = same density as the reference)")
     print(f"  {'don ratio':<16s} {summary['don_ratio']:>8.4f}")
+
+    print(f"\n  audio agreement           model   ranked map")
+    print(f"  {'quiet-section notes':<24s}{summary['quiet_note_rate']:>7.3f}   "
+          f"{summary['ref_quiet_note_rate']:>7.3f}   share of notes in the quietest 20%")
+    print(f"  {'missed strong onsets':<24s}{summary['onset_miss_rate']:>7.3f}   "
+          f"{summary['ref_onset_miss_rate']:>7.3f}   share of loud on-grid attacks left empty")
+    if args.grid_probe:
+        print(f"  {'grid follow':<24s}{summary['grid_follow']:>7.3f}   "
+              f"(1 = follows the given grid, 0 = ignores it)")
 
     gate_b = summary["onset_f1"] > GATE_B_F1
     print(f"\n  GATE B  onset F1 > {GATE_B_F1}: "
