@@ -71,6 +71,9 @@ python scripts/pack_dataset.py --scan "D:/osu!/Songs"
 
 # 3. Your PC: make a map
 python scripts/generate.py --audio song.mp3 --difficulty 5.5 --preset stream
+
+# Or just time the song (red lines only, BPM changes included)
+python scripts/time_song.py --audio song.mp3
 ```
 
 Style can also be copied from a map you like:
@@ -104,10 +107,11 @@ Neither replaces playing the maps. Import ten into osu! at every milestone.
 
 ```
 taiko/data/       time grid, parsing, chart tensors, shards, motif vector
-taiko/model/      autoencoder, audio encoder, U-Net, scheduler, sampling
+taiko/model/      autoencoder, audio + timing encoders, U-Net, scheduler, sampling
+taiko/timing/     super timing: red lines from audio, BPM changes included
 taiko/eval/       chart quality metrics
 scripts/          pack_dataset, train_autoencoder, train_diffusion,
-                  evaluate, generate
+                  evaluate, generate, time_song, train_timing, benchmark_timing
 notebooks/        Kaggle training notebook
 tests/            run any file directly: python tests/test_dataset.py
 ```
@@ -128,6 +132,13 @@ works with `--single-gpu`. Preprocessing is CPU-only and needs no GPU at all.
 Architecture follows [MuG-Diffusion](https://github.com/Keytoyze/Mug-Diffusion)
 by Keytoyze — latent diffusion over chart arrays with multi-scale audio
 conditioning, adapted here from osu!mania to osu!taiko.
+
+Super timing borrows its central ideas from OliBomby's
+[Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) (MIT). Those
+ideas are: learning timing from ranked red lines, averaging passes over
+sub-frame-shifted audio, fitting whole sections, and "human-rounding" BPMs. The
+code in `taiko/timing/` is a separate implementation for frame activations
+rather than generated tokens.
 
 ## Licence
 

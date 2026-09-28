@@ -16,3 +16,9 @@ python-dotenv>=1.0.0
 
 # Progress output
 tqdm>=4.65.0
+
+# Super timing (taiko/timing). scipy comes with librosa; listed because the
+# timing polish uses it directly. beat-this is optional -- one of three beat
+# sources, and its weights download on first use.
+scipy>=1.10.0
+# beat-this>=1.1.0

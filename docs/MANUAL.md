@@ -234,6 +234,36 @@ SIGTERM and the notebook's interrupt button now save before exiting. `SIGKILL`
 from the OOM killer cannot be caught by anything, which is why the periodic
 save above is the real defence.
 
+### Resuming a run trained before features 2
+
+Stage 2 now builds **features 2** by default (the `FEATURES` switch in section
+7). It adds three things the first run was missing:
+
+- **A timing encoder.** The beat grid used to be average-pooled over 320 ms
+  latent frames, about one beat long, and the mean of a phasor over one beat is
+  zero. At 180 BPM only 4% of the signal survived; at 187.5 BPM, none.
+- **Song-level loudness and onset strength.** Quiet sections now look quiet to
+  the model.
+- **Each window's own note density** as a condition, so a calm intro is no
+  longer told it is as dense as the chorus.
+
+Resuming a checkpoint trained before this needs nothing special. The log says
+
+```
+Warm start: widening a features-1 checkpoint into features 2
+  copied unchanged   ...
+  widened (zero-init new columns)  10
+```
+
+and training continues from the same step. The new inputs start at exactly
+zero, so the first step computes the same function the old model did
+(`tests/test_warm_start.py` checks this to the bit), and the learning rate ramps
+back up over `--rewarm 500` steps. Expect the loss to stay where it was and then
+drift lower as the model starts reading the grid.
+
+**The notebook clones `main`.** Merge this branch into `main` before the next
+Kaggle session, or none of this reaches the run.
+
 ### Resuming lands where it stopped
 
 The checkpoint records the position within the epoch, and `--resume` runs only
@@ -278,19 +308,85 @@ python scripts/generate.py --audio "song.mp3" --difficulty 5.5
 
 Output lands in `outputs/` as a `.osz`. Double-click to import into osu!.
 
+**Checkpoints trained before the density table.** If `generate.py` says the
+checkpoint predates it, run this once. It writes `nps_prior.json` next to the
+checkpoint, and generation picks it up:
+
+```bash
+python scripts/fit_nps_prior.py --shards data/processed/shards \
+    --out checkpoints/diffusion/nps_prior.json
+```
+
+Without the table, leaving out `--avg-nps` asked the model for zero notes per
+second.
+
 ### Getting the tempo right
 
 This matters more than any other flag. The model generates *against* a beat
-grid you supply, so a wrong tempo produces a chart that is internally
-consistent and completely off the music.
+grid, so a wrong tempo produces a chart that is internally consistent and
+completely off the music. Three ways in, best first:
 
 ```bash
-python scripts/generate.py --audio song.mp3 --difficulty 5.5 --bpm 174 --offset 812
+# 1. Red lines from a map you (or anyone) already timed -- all of them,
+#    so BPM changes come along
+python scripts/generate.py --audio song.mp3 --difficulty 7 --timing-from "timed.osu"
+
+# 2. One tempo you know
+python scripts/generate.py --audio song.mp3 --difficulty 7 --bpm 174 --offset 812
+
+# 3. Nothing: super timing detects it (below) and prints the red lines
+python scripts/generate.py --audio song.mp3 --difficulty 7
 ```
 
-Without `--bpm` the tempo is detected and printed. Detection is decent but not
-reliable — if the result feels off-beat, open the audio in the osu! editor, use
-its timing panel to find the real BPM and offset, and pass them.
+### Timing a song without generating anything
+
+```bash
+python scripts/time_song.py --audio song.mp3 --title "SUPERNOVA" --artist USAO --osz
+```
+
+This writes `outputs/<title> [Timing].osu` (and an `.osz` with the audio),
+containing red lines and no notes. Open it in the editor, fix anything that
+sounds off, then generate from it with `--timing-from`.
+
+How it works (`taiko/timing/`):
+
+1. **Beat evidence.** From TimingNet if `checkpoints/timing/best.pt` exists,
+   else `beat_this` if its weights download, else a percussive onset envelope.
+   Neural sources run 8 times on audio shifted by a fraction of a frame and
+   are averaged. That gives resolution finer than their 20 ms frames, the trick
+   Mapperatorinator's super timing uses.
+2. **Beats.** A beat for every beat of the song, by dynamic programming against
+   a local tempo curve.
+3. **Sections.** The beats are split into constant-tempo sections. BPM changes
+   become new red lines, and a steady song stays at one.
+4. **Fit.** Each section is fitted with one straight line through all its
+   beats. That is where the precision comes from: no single beat is accurate
+   to a millisecond, but a line through hundreds of them is.
+5. **Rounding.** The BPM is rounded like a mapper would round it (integer,
+   then .5, .1, .01), keeping the roundest value that still fits every beat.
+6. **Boundaries.** The exact beat where each tempo change happens is decided
+   from the activation.
+7. **Polish.** Each offset is nudged against a 1 ms attack envelope.
+
+On synthetic click tracks it recovers BPM and offset exactly: steady 174 and
+240 BPM, and a 150 → 200 change, all at 0.0 ms error. Real music is harder.
+Measure it on your own held-out ranked songs before trusting it:
+
+```bash
+python scripts/benchmark_timing.py --shards data/processed/shards \
+    --songs "D:/osu!/Songs" --backends onset beat_this timingnet --n-songs 60
+```
+
+The report's `bias ms` column is the constant offset between our audio decoder
+and osu!'s. If it is consistent across backends, set it as `DECODER_BIAS_MS` in
+`taiko/timing/__init__.py`, with the sign flipped.
+
+**Training TimingNet** takes about one Kaggle session. It learns beats and
+barlines from the ranked maps' red lines, on exactly the music it will time:
+
+```bash
+python scripts/train_timing.py --shards data/processed/shards --out checkpoints/timing
+```
 
 ### Controlling difficulty and style
 
@@ -323,8 +419,11 @@ character.
 | Empty map | lower `--threshold`, or the model is undertrained |
 | Ignores your settings | raise `--cfg-scale` to 6-8 |
 | Repetitive, mechanical | lower `--cfg-scale` to 2-3 |
-| Off-beat | supply `--bpm` and `--offset` |
+| Off-beat | `--timing-from` a timed map, or `--bpm` and `--offset` |
 | Notes slightly off-grid | drop `--no-refine` so snapping runs |
+| Notes over quiet passages | `--quiet-gate`; on a features-2 model also try `--window-density auto` |
+| Obvious sounds left empty | the run prints how many strong on-grid onsets got no note, and where; lower `--threshold` a little |
+| Slow on a long song / out of memory | `--batch-windows 4` |
 
 `--seed 42` makes a run reproducible; changing it gives a different map for the
 same settings.
@@ -344,6 +443,20 @@ python scripts/evaluate.py --n-maps 40
 | sr_correlation | > 0.85 | asking for a difficulty does nothing |
 | nps_error | < 1.0 | density control does not work |
 | unplayability | < 0.005 | it produces patterns humans cannot hit |
+
+Beside those, two numbers track the most common complaints. Each is shown
+next to the ranked map's own value for the same song, because human mappers
+don't score zero on either:
+
+| Metric | Meaning | Bad sign |
+|---|---|---|
+| quiet-section notes | share of notes placed in the song's quietest 20% of frames | well above the ranked map's |
+| missed strong onsets | share of loud attacks on the grid that got no note | well above the ranked map's |
+
+`--grid-probe` regenerates each map against its grid shifted by a third of a
+beat and reports **grid follow**. 1.0 means the notes follow the grid they are
+given; 0.0 means the model ignores it. Run it before and after the features-2
+warm start. It is the direct test that the beat grid now reaches the model.
 
 The leakage probe is worth running once:
 

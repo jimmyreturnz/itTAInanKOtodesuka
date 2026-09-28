@@ -29,7 +29,7 @@ Not a hosted service. Not a research artifact. The thing being optimised is
 | **D3** | **Kaggle free tier only.** 2xT4, 30 GPU-h/week, 12 h sessions. No rented GPU. | Rented compute is cheaper in wall-clock but not worth the setup and workaround cost. Consequence: the speed work below is mandatory, not optional, and checkpoint-resume is the most safety-critical path in the repo. |
 | **D4** | **Full `tiny` rehearsal on real data before committing to `p1`.** Pack → stage 1 → stage 2 (~20k steps) → Gate B → generate a `.osz` → play it. | Everything verified so far ran on a *synthetic* corpus. Real data brings mel cache misses, charts longer than audio, memmap behaviour on Kaggle disk, DataParallel at real batch sizes, and the resume loop under a real 12 h cutoff. Finding any of those in week three costs far more than a weekend now. Gate A is meaningful at `tiny`; Gate B is advisory only, since capacity may fail it for its own reasons. |
 | **D5** | **Keep `--window-frames 1536`. Use `--grad-accum 16`** → effective batch 64. | Effective batch is currently **4** (2/GPU × 2 GPUs), the smallest in any working diffusion recipe; typical is 32–256. Diffusion gradients are unusually noisy because each sample draws a random timestep, so a tiny batch makes every step worth less — which is how a run silently becomes a 200-hour run. Shortening the window was considered and rejected: half the window is half the compute *and* half the audio, so throughput in audio-seconds/sec is a wash, and it would cost the 30 s structural horizon that long-song coherence needs. |
-| **D6** | **Timing = pretrained beat tracker + mandatory manual override.** Not a trained model. | osu! timing needs single-digit-ms accuracy to be rankable; SOTA trackers (`beat_this`, madmom DBN, BeatNet) reach ~±20–30 ms. That ceiling is the task, not the architecture, so training our own lands in the same place after months. Three input paths, in order of preference: import from an existing `.osu`; automatic tracker seed; manual entry. **Timing is not the AI's job** — the product is "I have a timed song, write me the notes". |
+| **D6** | **Timing = super timing + manual override.** *Revised 2026-09-28; see below.* Originally "pretrained beat tracker, not a trained model". | osu! timing needs single-digit-ms accuracy to be rankable; SOTA trackers (`beat_this`, madmom DBN, BeatNet) reach ~±20–30 ms. That ceiling is the task, not the architecture, so training our own lands in the same place after months. Three input paths, in order of preference: import from an existing `.osu`; automatic tracker seed; manual entry. **Timing is not the AI's job** — the product is "I have a timed song, write me the notes". |
 | **D7** | **Distributable desktop app serving a local web GUI**, like TaikoEditor. Auto-updater for app code and model weights, versioned independently. | Local inference means no GPU bill, no upload path, no auth, and no abuse surface — the entire security story collapses to nothing. A retrained model ships as a ~150 MB asset bump, not a reinstall. |
 | **D8** | **Shipped app runs ONNX Runtime with the DirectML execution provider.** PyTorch stays for training and local development. | ~400 MB installer versus ~3 GB, and **any DX12 GPU** works — NVIDIA, AMD, Intel Arc, integrated. Under the PyTorch path every non-NVIDIA user falls back to CPU. Nothing in the model resists export: `s4_block.py` is depthwise conv + SiLU gating, no FFT, no complex tensors. This is a coverage decision, not a speed one. |
 | **D9** | **Stay on `p1` (35.4M params). Bank schedule slack as more training runs, not more parameters.** | Nobody has trained this on real data even once; the highest-value use of spare quota is a second and third run informed by what the first got wrong. `p2` is a bad deal regardless — 55M params but it delivers *less* audio capacity to the U-Net than `p1` (`DEVELOPMENT_PLAN.md` §4.3). **Contingency:** if Gate B passes clearly but maps read *bland* rather than mistimed, that is a capacity symptom — define `p3` (192 base channels, ~70M, `p1`'s encoder shape) as a flag, not a redesign. |
@@ -214,6 +214,52 @@ minutes and replace the Schedule paragraph above with it.**
 12. Packaged installer. The updater checks a `version.json` on GitHub Releases, downloads the changed asset, verifies SHA-256, swaps. Weights versioned separately from code. ~40 lines, no update framework.
 
 ---
+
+### Done 2026-09-28: timing reaches the model, and the paused run resumes into it
+
+A review with probes found the beat grid barely reached the U-Net. It was
+average-pooled over 320 ms latent frames, about one beat long, so the signal
+left was 45% at 120 BPM, 4% at 180, 0% at 187.5, and sign-flipped at 240.
+Features generation 2 fixes it:
+
+- a learned **TimingEncoder** (harmonic phase features, strided convolution)
+- **song-level loudness and onset strength** in the onset stem, which
+  previously normalised flux per 30 s window
+- a **window-density condition** in place of the map-wide density alone
+
+A features-1 checkpoint widens into features 2 on resume, with new columns
+zero-initialised, so the paused run continues rather than restarting. Also
+fixed:
+
+- rate augmentation dropped 9% of notes at 1.1× and doubled 10% at 0.9×
+- the beat phase before the first red line was measured from 0 ms
+- generation sent `nps = 0` when the density flags were omitted
+
+Work-order items 6, 7 and 9 are done:
+
+- batched sampler
+- multi-BPM through generation
+- `--timing-from`, plus automatic timing
+
+**D6 revised.** A general beat tracker is no longer the plan's centre. Rhythm-game
+music is where such trackers are weakest, and the ranked corpus is an in-domain
+answer key. `taiko/timing` follows Mapperatorinator's super-timing recipe:
+
+- TimingNet trained on red lines (`scripts/train_timing.py`, one session)
+- shifted-audio ensembling
+- section fitting with human-rounded BPMs
+- activation-decided tempo-change boundaries
+- a 1 ms onset polish
+
+`beat_this` and a no-model onset envelope stay as fallbacks. It recovers
+synthetic click tracks exactly, including a BPM change. Real-music accuracy is
+**not yet measured**: run `scripts/benchmark_timing.py` on held-out ranked
+songs, all three backends, before relying on it. Manual override is still
+first-class: `--timing-from`, or edit the `time_song.py` output in the editor.
+
+**Next:** resume stage 2 at features 2 on Kaggle. Run `evaluate.py --grid-probe`
+before and after about 10k steps; grid follow should rise. Then train
+TimingNet and run the timing benchmark.
 
 ## Deferred, deliberately
 
