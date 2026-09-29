@@ -4,7 +4,7 @@ scripts/evaluate.py
 Measures whether the model is any good, against held-out maps it never saw.
 
     python scripts/evaluate.py --diffusion checkpoints/diffusion/best.pt
-    python scripts/evaluate.py --diffusion ... --n-maps 50 --steps 30
+    python scripts/evaluate.py --diffusion ... --n-maps 50 --steps 30 --seeds 3
 
 Gate B is onset F1 above 0.40. It is the alignment gate: a model that ignores
 the audio and emits plausible taiko rhythms scores near zero here however good
@@ -12,34 +12,47 @@ its loss curve looks, because matching the reference chart requires matching the
 song. Nothing else in this repository can tell those two situations apart.
 
 Difficulty and NPS controllability are measured by asking for values and seeing
-what comes back, which is the only honest way to test a control -- a model can
-condition on difficulty perfectly in the loss and still ignore it at sampling
-time if guidance is misconfigured.
+what comes back, which is the only honest way to test a control.
 
 Every chart is generated from the reference map's own red lines -- all of them,
 so BPM changes are included -- which measures the model rather than a tempo
 detector.
 
+What is scored, and why there are several versions of each chart
+-----------------------------------------------------------------
+The chart model works on 20 ms frames, so a note decoded straight from its
+output sits on a frame boundary, up to 10 ms from where it belongs. The
+step-53k evaluation scored those raw frame times against the beat grid at a
+5 ms tolerance and reported snap validity 0.566. A chart placed *perfectly*
+and passed through the same frames scores about 0.5 on that measure -- it was
+reading frame quantisation, not the model. So each map is now decoded two
+ways and scored before and after post-processing:
+
+    legacy raw     frame decode, as before           (kept for comparison)
+    legacy final   + grid snap, what generate.py shipped until now
+    grid raw       decode_on_grid: every note on a legal subdivision
+    grid final     + repair: the playability fixes, counted   <- the gate
+
+and the ranked map, decoded through the same frames, is the control: its
+"old measure" snap validity shows the ceiling the representation imposes.
+
+The headline metrics (TARGETS, Gate B) are on "grid final", which is what
+generate.py now produces. Every variant is in the JSON.
+
 Two audio-agreement numbers sit beside F1, each shown against the ranked map's
-own value for the same song (see taiko/data/audio_activity.py):
-
-    quiet notes   share of notes placed in the song's quietest 20% of frames
-    onset misses  share of strong on-grid attacks with no note within 40 ms
-
---grid-probe re-generates each map with its grid shifted a third of a beat and
-reports how often the notes follow the shifted grid rather than the original.
-1.0 means the model places notes from the beat grid it is given; 0.0 means it
-ignores the grid and follows the audio's own beat; 0.5 means neither. It is
-the direct test that the timing input reaches the model at all.
+own value for the same song (see taiko/data/audio_activity.py). --grid-probe
+re-generates each map with its grid shifted a third of a beat and reports how
+often notes follow the shifted grid: 1.0 follows the grid it is given, 0.0
+ignores it.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import statistics
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -51,13 +64,16 @@ from taiko.data.audio_activity import ON_GRID_MS, activity, activity_score
 from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
 )
+from taiko.data.decode import decode_on_grid
 from taiko.data.frames import FRAME_MS, describe
 from taiko.data.grid import Grid
 from taiko.data.motif import beat_frames_from_timing, compute_motif
 from taiko.data.osu_parser import TimingPoint
 from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
+from taiko.data.repair import repair
 from taiko.data.shards import ShardReader, decode_timing_points
 from taiko.data.tensor_repr import build_timing_stream, tensor_to_beatmap
+from taiko.data.timing_refine import apply_timing_refinement
 from taiko.eval.metrics import (
     note_statistics, onset_f1, pattern_divergence, snap_validity, unplayability,
 )
@@ -74,9 +90,38 @@ TARGETS = {
     "unplayability":  ("<", 0.005),
 }
 
+# Half a frame: the most any frame-decoded time can be off its true position.
+RAW_TOLERANCE_MS = FRAME_MS / 2
+
+VARIANTS = ("legacy_raw", "legacy_final", "grid_raw", "grid_final")
+SHIPPED = "grid_final"
+
+SR_BANDS = [(0, 2.0, "kantan <2*"), (2.0, 3.0, "futsuu 2-3*"), (3.0, 4.0, "muzukashii 3-4*"),
+            (4.0, 5.5, "oni 4-5.5*"), (5.5, 7.0, "inner 5.5-7*"), (7.0, 99, "extreme 7*+")]
+BPM_BANDS = [(0, 140, "<140"), (140, 180, "140-180"), (180, 220, "180-220"), (220, 999, "220+")]
+
 
 def load_model(diffusion_ckpt: Path, ae_ckpt: Path, device, use_ema: bool = True):
     return load_diffusion(diffusion_ckpt, ae_ckpt, device, use_ema=use_ema)
+
+
+def checkpoint_header(path: Path, ckpt: dict) -> dict:
+    """
+    Which file was evaluated and how it relates to the newest one.
+
+    The step-53k handover could only guess that "model step 53,664" meant
+    best.pt while training had reached 54,925 in last.pt. Say it outright.
+    """
+    header = {"evaluated": str(path), "step": ckpt.get("step"),
+              "best_val": ckpt.get("best_val"), "features": ckpt.get("features", 1)}
+    last = path.parent / "last.pt"
+    if last.exists() and last.resolve() != path.resolve():
+        try:
+            other = torch.load(last, map_location="cpu", weights_only=False, mmap=True)
+            header["latest_training_step"] = other.get("step")
+        except Exception as exc:                                  # noqa: BLE001
+            header["latest_training_step"] = f"unreadable ({type(exc).__name__})"
+    return header
 
 
 def dominant_tempo(points: list[TimingPoint]) -> tuple[float, float, int]:
@@ -85,6 +130,201 @@ def dominant_tempo(points: list[TimingPoint]) -> tuple[float, float, int]:
         return 150.0, 0.0, 4
     tp = reds[0]
     return 60_000.0 / tp.beat_length, float(tp.time), max(1, tp.meter)
+
+
+def decode_variants(probs: np.ndarray, points, grid: Grid, threshold: float,
+                    bpm: float, offset: float, meter: int) -> dict:
+    legacy_raw = tensor_to_beatmap(probs, bpm=bpm, offset_ms=offset, threshold=threshold,
+                                   meter=meter, timing_points=points)
+    legacy_final = copy.deepcopy(legacy_raw)
+    if legacy_final.notes:
+        apply_timing_refinement(legacy_final, timing_points=points, verbose=False)
+    grid_raw = decode_on_grid(probs, points, threshold=threshold)
+    grid_final = copy.deepcopy(grid_raw)
+    fixes = repair(grid_final, grid)
+    return {"legacy_raw": legacy_raw, "legacy_final": legacy_final,
+            "grid_raw": grid_raw, "grid_final": grid_final, "_repair": fixes}
+
+
+def violation_counts(play) -> dict:
+    return {"too_fast": play.too_fast, "big_note_streams": play.big_note_streams,
+            "overlapping_longs": play.overlapping_longs,
+            "zero_length_longs": play.zero_length_longs}
+
+
+def score_variants(variants: dict, reference, act, grid: Grid, span) -> dict:
+    """Flat metrics for one generated sample, every variant."""
+    row: dict = {}
+    points = reference.timing_points
+    for name in VARIANTS:
+        bm = variants[name]
+        f1 = onset_f1(bm.notes, reference.notes)
+        play = unplayability(bm.notes)
+        pre = "" if name == SHIPPED else f"{name}_"
+        row[f"{pre}onset_f1"] = f1.f1
+        row[f"{pre}snap_validity"] = snap_validity(bm.notes, points).valid_fraction
+        row[f"{pre}unplayability"] = play.rate
+        for k, v in violation_counts(play).items():
+            row[f"{pre}{k}"] = v
+        if name == SHIPPED:
+            stats = note_statistics(bm)
+            act_score = activity_score(bm.notes, act, grid, span_ms=span)
+            row.update({
+                "onset_precision": f1.precision, "onset_recall": f1.recall,
+                "onset_mae_ms": f1.mean_abs_error_ms,
+                "pattern_kl": pattern_divergence(bm.notes, reference.notes),
+                "realised_nps": stats.avg_nps, "generated_notes": stats.n_notes,
+                "don_ratio": stats.don_ratio, "big_ratio": stats.big_ratio,
+                "quiet_note_rate": act_score.quiet_note_rate,
+                "onset_miss_rate": act_score.strong_onset_miss_rate,
+            })
+    # The old measure, kept so the new numbers can be read against the handover.
+    raw = variants["legacy_raw"]
+    row["legacy_snap_old"] = row.pop("legacy_raw_snap_validity")
+    row["legacy_snap_raw"] = snap_validity(raw.notes, points,
+                                           tolerance_ms=RAW_TOLERANCE_MS).valid_fraction
+    fixes = variants["_repair"]
+    row["repair_rate"] = fixes.rate
+    row["repair_fixes"] = fixes.total
+    return row
+
+
+def average_rows(rows: list[dict]) -> dict:
+    """Mean over seeds; the spread of the key metrics is kept as *_sd."""
+    out = {}
+    for k in rows[0]:
+        vals = [r[k] for r in rows]
+        out[k] = float(np.mean(vals))
+    if len(rows) > 1:
+        for k in ("onset_f1", "snap_validity", "unplayability"):
+            out[f"{k}_sd"] = float(np.std([r[k] for r in rows]))
+    return out
+
+
+def summarise(rows: list[dict]) -> dict:
+    def mean(key: str) -> float:
+        vals = [r[key] for r in rows if key in r and r[key] == r[key]]
+        return float(statistics.fmean(vals)) if vals else float("nan")
+
+    requested = [r["requested_sr"] for r in rows]
+    realised = [r["realised_nps"] for r in rows]
+    sr_correlation = (
+        float(np.corrcoef(requested, realised)[0, 1])
+        if len(rows) > 2 and statistics.pstdev(requested) > 1e-6
+           and statistics.pstdev(realised) > 1e-6
+        else float("nan")
+    )
+    with_nps = [r for r in rows if r["requested_nps"] > 0]
+    nps_error = (float(statistics.fmean(abs(r["realised_nps"] - r["requested_nps"])
+                                        for r in with_nps)) if with_nps else float("nan"))
+
+    keys = sorted({k for r in rows for k in r if isinstance(r[k], (int, float))})
+    summary = {k: mean(k) for k in keys if k not in ("requested_sr", "requested_nps", "bpm")}
+    summary.update({
+        "n_maps": len(rows),
+        "sr_correlation": sr_correlation,
+        "nps_error": nps_error,
+        "note_ratio": mean("generated_notes") / max(mean("reference_notes"), 1e-6),
+        "groups": {
+            "difficulty": group(rows, "requested_sr", SR_BANDS),
+            "bpm": group(rows, "bpm", BPM_BANDS),
+        },
+    })
+    return summary
+
+
+def group(rows: list[dict], key: str, bands) -> dict:
+    out = {}
+    for lo, hi, label in bands:
+        sel = [r for r in rows if lo <= r[key] < hi]
+        if not sel:
+            continue
+        out[label] = {
+            "maps": len(sel),
+            "onset_f1": float(np.mean([r["onset_f1"] for r in sel])),
+            "snap_validity": float(np.mean([r["snap_validity"] for r in sel])),
+            "unplayability": float(np.mean([r["unplayability"] for r in sel])),
+            "note_ratio": float(np.sum([r["generated_notes"] for r in sel])
+                                / max(np.sum([r["reference_notes"] for r in sel]), 1)),
+            "quiet_note_rate": float(np.mean([r["quiet_note_rate"] for r in sel])),
+            "onset_miss_rate": float(np.mean([r["onset_miss_rate"] for r in sel])),
+        }
+    return out
+
+
+def report(summary: dict, args) -> bool:
+    print(f"\n{'=' * 70}")
+    print(f"{summary['n_maps']} held-out maps, {args.steps} steps, guidance {args.cfg_scale}, "
+          f"{args.seeds} seed(s) each")
+    print(f"{'=' * 70}")
+
+    for key, (direction, target) in TARGETS.items():
+        value = summary[key]
+        if value != value:
+            verdict = "n/a"
+        else:
+            ok = value > target if direction == ">" else value < target
+            verdict = "PASS" if ok else "below target" if direction == ">" else "over target"
+        print(f"  {key:<16s} {value:>8.4f}   target {direction} {target:<7.3f}  {verdict}")
+
+    print(f"\n  snap validity, by what is measured            model    ranked map")
+    print(f"  {'raw frames @5 ms  (the old measure)':<44s}{summary['legacy_snap_old']:>7.3f}"
+          f"   {summary['ref_snap_old']:>7.3f}   <- ceiling of the representation")
+    print(f"  {'raw frames @10 ms (half a frame)':<44s}{summary['legacy_snap_raw']:>7.3f}"
+          f"   {summary['ref_snap_raw']:>7.3f}")
+    print(f"  {'legacy decode + snap @5 ms':<44s}{summary['legacy_final_snap_validity']:>7.3f}")
+    print(f"  {'grid decode @5 ms':<44s}{summary['grid_raw_snap_validity']:>7.3f}")
+    print(f"  {'grid decode + repair @5 ms  (shipped)':<44s}{summary['snap_validity']:>7.3f}")
+
+    print(f"\n  playability            too fast  big streams  long overlap  zero longs    rate")
+    for label, pre in (("legacy raw", "legacy_raw_"), ("legacy final", "legacy_final_"),
+                       ("grid raw", "grid_raw_"), ("grid + repair", ""), ("ranked map", "ref_")):
+        print(f"  {label:<20s}{summary[pre + 'too_fast']:>10.2f}"
+              f"{summary[pre + 'big_note_streams']:>13.2f}{summary[pre + 'overlapping_longs']:>14.2f}"
+              f"{summary[pre + 'zero_length_longs']:>12.2f}{summary[pre + 'unplayability']:>9.4f}")
+    print(f"  repair changed {summary['repair_rate']:.1%} of notes on average "
+          f"(high means the model itself still breaks the rules)")
+
+    print(f"\n  onset F1: legacy raw {summary['legacy_raw_onset_f1']:.4f}  "
+          f"legacy final {summary['legacy_final_onset_f1']:.4f}  "
+          f"grid raw {summary['grid_raw_onset_f1']:.4f}  shipped {summary['onset_f1']:.4f}")
+    print(f"  {'onset precision':<16s} {summary['onset_precision']:>8.4f}")
+    print(f"  {'onset recall':<16s} {summary['onset_recall']:>8.4f}")
+    print(f"  {'onset MAE (ms)':<16s} {summary['onset_mae_ms']:>8.2f}")
+    print(f"  {'pattern KL':<16s} {summary['pattern_kl']:>8.4f}")
+    print(f"  {'note count ratio':<16s} {summary['note_ratio']:>8.4f}   "
+          f"(1.0 = same density as the reference)")
+    print(f"  {'don ratio':<16s} {summary['don_ratio']:>8.4f}")
+    if args.seeds > 1:
+        print(f"  seed spread (sd): F1 {summary.get('onset_f1_sd', float('nan')):.4f}  "
+              f"snap {summary.get('snap_validity_sd', float('nan')):.4f}  "
+              f"unplay {summary.get('unplayability_sd', float('nan')):.4f}")
+
+    print(f"\n  audio agreement           model   ranked map")
+    print(f"  {'quiet-section notes':<24s}{summary['quiet_note_rate']:>7.3f}   "
+          f"{summary['ref_quiet_note_rate']:>7.3f}   share of notes in the quietest 20%")
+    print(f"  {'missed strong onsets':<24s}{summary['onset_miss_rate']:>7.3f}   "
+          f"{summary['ref_onset_miss_rate']:>7.3f}   share of loud on-grid attacks left empty")
+    if args.grid_probe:
+        print(f"  {'grid follow':<24s}{summary['grid_follow']:>7.3f}   "
+              f"(1 = follows the given grid, 0 = ignores it)")
+
+    for name, table in summary["groups"].items():
+        print(f"\n  by {name:<18s} maps   F1     snap   unplay  notes  quiet  miss")
+        for label, g in table.items():
+            print(f"  {label:<21s}{g['maps']:>4d}  {g['onset_f1']:.3f}  {g['snap_validity']:.3f}  "
+                  f"{g['unplayability']:.4f}  {g['note_ratio']:.2f}   {g['quiet_note_rate']:.2f}   "
+                  f"{g['onset_miss_rate']:.2f}")
+
+    gate_b = summary["onset_f1"] > GATE_B_F1
+    print(f"\n  GATE B  onset F1 > {GATE_B_F1}: "
+          f"{'PASSED' if gate_b else 'FAILED'}  ({summary['onset_f1']:.4f})")
+    if not gate_b:
+        print("\n  The model is not following the audio. More steps will not fix")
+        print("  this. Check that training windows pair a chart with the same")
+        print("  frames of mel (tests/test_dataset.py), and that the audio")
+        print("  encoder levels land on the U-Net's resolutions.")
+    return gate_b
 
 
 def grid_follow_fraction(sample, points: list[TimingPoint], frames: int,
@@ -122,9 +362,13 @@ def main() -> int:
     ap.add_argument("--shards", type=Path, default=Path("data/processed/shards"))
     ap.add_argument("--out", type=Path, default=Path("outputs/evaluation.json"))
     ap.add_argument("--n-maps", type=int, default=40)
+    ap.add_argument("--seeds", type=int, default=1,
+                    help="samples per map; metrics are averaged and their spread reported")
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--cfg-scale", type=float, default=4.0)
     ap.add_argument("--window-frames", type=int, default=None)
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="override the checkpoint's onset threshold")
     ap.add_argument("--max-frames", type=int, default=6000,
                     help="cap each song's length to keep evaluation quick")
     ap.add_argument("--use-reference-motif", action="store_true",
@@ -135,7 +379,7 @@ def main() -> int:
     ap.add_argument("--no-ema", action="store_true")
     ap.add_argument("--grid-probe", action="store_true",
                     help="also generate against a grid shifted by 1/3 beat and "
-                         "measure whether the notes follow it (doubles the cost)")
+                         "measure whether the notes follow it (one extra sample per map)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -148,9 +392,15 @@ def main() -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, threshold, ckpt = load_model(args.diffusion, args.ae, device, not args.no_ema)
+    if args.threshold is not None:
+        threshold = args.threshold
     window = args.window_frames or ckpt.get("window_frames", WINDOW_FRAMES_DEFAULT)
-    print(f"Model: profile {ckpt.get('profile')}, step {ckpt.get('step')}, "
-          f"threshold {threshold}, window {window}")
+    header = checkpoint_header(args.diffusion, ckpt)
+    print(f"Evaluating {header['evaluated']}: step {header['step']}"
+          + (f" (latest training step {header['latest_training_step']} is in last.pt)"
+             if "latest_training_step" in header else "")
+          + f", features {header['features']}, profile {ckpt.get('profile')}, "
+            f"threshold {threshold}, window {window}")
 
     reader = ShardReader(args.shards)
     _, val_idx = split_indices(reader, val_ratio=0.05)
@@ -172,13 +422,15 @@ def main() -> int:
 
         points = decode_timing_points(record["timing_points"])
         bpm, offset, meter = dominant_tempo(points)
+        grid = Grid(points)
 
         mel = torch.from_numpy(reader.mel_window(idx, 0, frames)).unsqueeze(0)
         timing_np = build_timing_stream(points, frames, start_frame=0)
         timing = torch.from_numpy(timing_np).unsqueeze(0)
 
         reference_chart = reader.chart_window(idx, 0, frames)
-        reference = tensor_to_beatmap(reference_chart, bpm=bpm, offset_ms=offset, meter=meter)
+        reference = tensor_to_beatmap(reference_chart, bpm=bpm, offset_ms=offset,
+                                      meter=meter, timing_points=points)
 
         motif = motif_mask = None
         if args.use_reference_motif:
@@ -188,7 +440,7 @@ def main() -> int:
         requested_sr = float(record.get("difficulty", 5.0))
         requested_nps = float(record.get("avg_nps", 0.0))
 
-        def sample(timing_tensor: torch.Tensor) -> np.ndarray:
+        def sample(timing_tensor: torch.Tensor, seed: int = 0) -> np.ndarray:
             return generate_song(
                 model, mel=mel, timing=timing_tensor,
                 difficulty=normalise_difficulty(requested_sr),
@@ -199,145 +451,58 @@ def main() -> int:
                 window_frames=window, overlap_frames=window // 2,
                 ddim_steps=args.steps, cfg_scale=args.cfg_scale,
                 progress=False,
-                generator=torch.Generator(device=device).manual_seed(args.seed + idx),
+                generator=torch.Generator(device=device).manual_seed(
+                    args.seed + idx + 7919 * seed),
             )[0].cpu().numpy()
 
-        generated = tensor_to_beatmap(
-            sample(timing), bpm=bpm, offset_ms=offset,
-            threshold=threshold, meter=meter, timing_points=points,
-        )
-
-        grid = Grid(points)
         act = activity(mel[0].numpy())
         span = (0.0, frames * FRAME_MS)
-        gen_act = activity_score(generated.notes, act, grid, span_ms=span)
+
+        per_seed = []
+        for seed in range(args.seeds):
+            variants = decode_variants(sample(timing, seed), points, grid, threshold,
+                                       bpm, offset, meter)
+            per_seed.append(score_variants(variants, reference, act, grid, span))
+        row = average_rows(per_seed)
+
+        ref_play = unplayability(reference.notes)
         ref_act = activity_score(reference.notes, act, grid, span_ms=span)
-
-        follows = float("nan")
-        if args.grid_probe:
-            follows = grid_follow_fraction(sample, points, frames, threshold)
-
-        f1 = onset_f1(generated.notes, reference.notes)
-        snap = snap_validity(generated.notes, generated.timing_points)
-        play = unplayability(generated.notes)
-        stats = note_statistics(generated)
-        reference_stats = note_statistics(reference)
-
-        rows.append({
+        ref_stats = note_statistics(reference)
+        row.update({
             "map": f"{record.get('title', '?')} [{record.get('version', '?')}]",
-            "onset_f1": f1.f1,
-            "onset_precision": f1.precision,
-            "onset_recall": f1.recall,
-            "onset_mae_ms": f1.mean_abs_error_ms,
-            "snap_validity": snap.valid_fraction,
-            "unplayability": play.rate,
-            "pattern_kl": pattern_divergence(generated.notes, reference.notes),
             "requested_sr": requested_sr,
             "requested_nps": requested_nps,
-            "realised_nps": stats.avg_nps,
-            "reference_nps": reference_stats.avg_nps,
-            "generated_notes": stats.n_notes,
-            "reference_notes": reference_stats.n_notes,
-            "don_ratio": stats.don_ratio,
-            "big_ratio": stats.big_ratio,
-            "quiet_note_rate": gen_act.quiet_note_rate,
+            "bpm": float(record.get("bpm") or bpm),
+            "reference_nps": ref_stats.avg_nps,
+            "reference_notes": ref_stats.n_notes,
+            "ref_snap_old": snap_validity(reference.notes, points).valid_fraction,
+            "ref_snap_raw": snap_validity(reference.notes, points,
+                                          tolerance_ms=RAW_TOLERANCE_MS).valid_fraction,
+            "ref_unplayability": ref_play.rate,
+            **{f"ref_{k}": v for k, v in violation_counts(ref_play).items()},
             "ref_quiet_note_rate": ref_act.quiet_note_rate,
-            "onset_miss_rate": gen_act.strong_onset_miss_rate,
             "ref_onset_miss_rate": ref_act.strong_onset_miss_rate,
-            "strong_onsets": gen_act.strong_onsets,
-            "grid_follow": follows,
+            "grid_follow": (grid_follow_fraction(sample, points, frames, threshold)
+                            if args.grid_probe else float("nan")),
         })
+        rows.append(row)
 
-        print(f"  [{n + 1}/{len(chosen)}] F1 {f1.f1:.3f}  "
-              f"snap {snap.valid_fraction:.3f}  "
-              f"notes {stats.n_notes} vs {reference_stats.n_notes}  "
-              f"quiet {gen_act.quiet_note_rate:.2f}/{ref_act.quiet_note_rate:.2f}  "
-              f"miss {gen_act.strong_onset_miss_rate:.2f}/{ref_act.strong_onset_miss_rate:.2f}  "
-              f"{rows[-1]['map'][:44]}")
+        print(f"  [{n + 1}/{len(chosen)}] F1 {row['onset_f1']:.3f}  "
+              f"snap {row['snap_validity']:.3f} (old measure {row['legacy_snap_old']:.3f}, "
+              f"ranked {row['ref_snap_old']:.3f})  unplay {row['unplayability']:.4f}  "
+              f"notes {row['generated_notes']:.0f} vs {row['reference_notes']}  "
+              f"repair {row['repair_rate']:.1%}  {row['map'][:40]}")
 
     if not rows:
         print("ERROR: no map was long enough to evaluate")
         return 1
 
-    # ---- aggregate -------------------------------------------------------- #
-    def mean(key: str) -> float:
-        return float(statistics.fmean(r[key] for r in rows))
-
-    requested = [r["requested_sr"] for r in rows]
-    realised = [r["realised_nps"] for r in rows]
-    sr_correlation = (
-        float(np.corrcoef(requested, realised)[0, 1])
-        if len(rows) > 2 and statistics.pstdev(requested) > 1e-6
-           and statistics.pstdev(realised) > 1e-6
-        else float("nan")
-    )
-    nps_error = float(statistics.fmean(
-        abs(r["realised_nps"] - r["requested_nps"]) for r in rows if r["requested_nps"] > 0
-    )) if any(r["requested_nps"] > 0 for r in rows) else float("nan")
-
-    summary = {
-        "n_maps": len(rows),
-        "onset_f1": mean("onset_f1"),
-        "onset_precision": mean("onset_precision"),
-        "onset_recall": mean("onset_recall"),
-        "onset_mae_ms": mean("onset_mae_ms"),
-        "snap_validity": mean("snap_validity"),
-        "unplayability": mean("unplayability"),
-        "pattern_kl": mean("pattern_kl"),
-        "sr_correlation": sr_correlation,
-        "nps_error": nps_error,
-        "don_ratio": mean("don_ratio"),
-        "big_ratio": mean("big_ratio"),
-        "note_ratio": mean("generated_notes") / max(mean("reference_notes"), 1e-6),
-        "quiet_note_rate": mean("quiet_note_rate"),
-        "ref_quiet_note_rate": mean("ref_quiet_note_rate"),
-        "onset_miss_rate": mean("onset_miss_rate"),
-        "ref_onset_miss_rate": mean("ref_onset_miss_rate"),
-        "grid_follow": (float(np.nanmean([r["grid_follow"] for r in rows]))
-                        if args.grid_probe else float("nan")),
-    }
-
-    print(f"\n{'=' * 62}")
-    print(f"{len(rows)} held-out maps, {args.steps} steps, guidance {args.cfg_scale}")
-    print(f"{'=' * 62}")
-
-    for key, (direction, target) in TARGETS.items():
-        value = summary[key]
-        if value != value:                       # NaN
-            verdict = "n/a"
-        else:
-            ok = value > target if direction == ">" else value < target
-            verdict = "PASS" if ok else "below target" if direction == ">" else "over target"
-        print(f"  {key:<16s} {value:>8.4f}   target {direction} {target:<7.3f}  {verdict}")
-
-    print(f"\n  {'onset precision':<16s} {summary['onset_precision']:>8.4f}")
-    print(f"  {'onset recall':<16s} {summary['onset_recall']:>8.4f}")
-    print(f"  {'onset MAE (ms)':<16s} {summary['onset_mae_ms']:>8.2f}")
-    print(f"  {'pattern KL':<16s} {summary['pattern_kl']:>8.4f}")
-    print(f"  {'note count ratio':<16s} {summary['note_ratio']:>8.4f}   "
-          f"(1.0 = same density as the reference)")
-    print(f"  {'don ratio':<16s} {summary['don_ratio']:>8.4f}")
-
-    print(f"\n  audio agreement           model   ranked map")
-    print(f"  {'quiet-section notes':<24s}{summary['quiet_note_rate']:>7.3f}   "
-          f"{summary['ref_quiet_note_rate']:>7.3f}   share of notes in the quietest 20%")
-    print(f"  {'missed strong onsets':<24s}{summary['onset_miss_rate']:>7.3f}   "
-          f"{summary['ref_onset_miss_rate']:>7.3f}   share of loud on-grid attacks left empty")
-    if args.grid_probe:
-        print(f"  {'grid follow':<24s}{summary['grid_follow']:>7.3f}   "
-              f"(1 = follows the given grid, 0 = ignores it)")
-
-    gate_b = summary["onset_f1"] > GATE_B_F1
-    print(f"\n  GATE B  onset F1 > {GATE_B_F1}: "
-          f"{'PASSED' if gate_b else 'FAILED'}  ({summary['onset_f1']:.4f})")
-    if not gate_b:
-        print("\n  The model is not following the audio. More steps will not fix")
-        print("  this. Check that training windows pair a chart with the same")
-        print("  frames of mel (tests/test_dataset.py), and that the audio")
-        print("  encoder levels land on the U-Net's resolutions.")
+    summary = summarise(rows)
+    gate_b = report(summary, args)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps({"summary": summary, "maps": rows}, indent=2))
+    args.out.write_text(json.dumps({"checkpoint": header, "summary": summary, "maps": rows},
+                                   indent=2, default=str))
     print(f"\nWrote {args.out}")
     return 0 if gate_b else 1
 

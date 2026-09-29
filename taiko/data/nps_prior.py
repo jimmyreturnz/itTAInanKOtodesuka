@@ -44,7 +44,7 @@ def fit_nps_prior(records: Iterable[dict]) -> Optional[dict]:
 
 def lookup(prior: dict, star_rating: float) -> tuple[float, float]:
     """Interpolated between bins, clamped at the ends."""
-    x = prior["stars"]
+    x = prior["stars"] if "stars" in prior else prior["sr"]   # "sr": an earlier draft's key
     return (float(np.interp(star_rating, x, prior["avg_nps"])),
             float(np.interp(star_rating, x, prior["peak_nps"])))
 

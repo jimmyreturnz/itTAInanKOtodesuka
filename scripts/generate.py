@@ -44,6 +44,7 @@ from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
     style_to_int,
 )
+from taiko.data.decode import decode_on_grid
 from taiko.data.frames import describe, frames_to_sec
 from taiko.data.grid import Grid
 from taiko.data.motif import (
@@ -53,6 +54,7 @@ from taiko.data.motif import (
 from taiko.data.nps_prior import load_prior, lookup
 from taiko.data.osu_parser import OsuTaikoParser, TimingPoint
 from taiko.data.osu_writer import OsuTaikoSerializer
+from taiko.data.repair import repair
 from taiko.data.tensor_repr import (
     beatmap_to_tensors, build_timing_stream, red_lines, tensor_to_beatmap,
 )
@@ -227,6 +229,13 @@ def main() -> int:
                     help="windows per U-Net forward; lower it on a small GPU")
     ap.add_argument("--threshold", type=float, default=None,
                     help="override the checkpoint's onset threshold")
+    ap.add_argument("--decode", choices=["grid", "legacy"], default="grid",
+                    help="grid: place notes only on legal subdivisions of each "
+                         "section's tempo (default). legacy: decode 20 ms frames, "
+                         "then snap")
+    ap.add_argument("--no-repair", action="store_true",
+                    help="skip the playability repair (too-fast hits, big notes "
+                         "in streams, overlapping or empty long notes)")
     ap.add_argument("--no-refine", action="store_true",
                     help="skip the post-generation grid snap")
     ap.add_argument("--quiet-gate", action="store_true",
@@ -319,18 +328,27 @@ def main() -> int:
 
     # ---- decode -------------------------------------------------------- #
     style_label = args.preset or args.style or "AI"
-    bm = tensor_to_beatmap(
-        chart, bpm=grid.sections[0].bpm, offset_ms=grid.sections[0].offset_ms,
-        threshold=threshold, meter=args.meter, timing_points=points,
+    meta = dict(
         title=args.audio.stem, artist="",
         version=f"{style_label.capitalize()} {args.difficulty:.1f}",
         audio_filename=args.audio.name,
         overall_difficulty=min(10.0, args.difficulty),
     )
+    if args.decode == "grid":
+        # Every note on a legal subdivision of its own section's tempo.
+        bm = decode_on_grid(chart, points, threshold=threshold, meter=args.meter, **meta)
+    else:
+        bm = tensor_to_beatmap(
+            chart, bpm=grid.sections[0].bpm, offset_ms=grid.sections[0].offset_ms,
+            threshold=threshold, meter=args.meter, timing_points=points, **meta,
+        )
+        if not args.no_refine and bm.note_count > 0:
+            print("\nSnapping to the beat grid ...")
+            apply_timing_refinement(bm, timing_points=points, verbose=True)
 
-    if not args.no_refine and bm.note_count > 0:
-        print("\nSnapping to the beat grid ...")
-        apply_timing_refinement(bm, timing_points=points, verbose=True)
+    if not args.no_repair and bm.notes:
+        fixes = repair(bm, grid)
+        print(f"\nPlayability repair: {fixes.summary()}")
 
     if args.quiet_gate and bm.notes:
         kept, dropped = gate_notes(bm.notes, act, grid)
