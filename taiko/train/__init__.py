@@ -3,6 +3,7 @@
 from taiko.train.session import (
     EXIT_LOW_MEMORY,
     CheckpointSaver,
+    MemDebug,
     MemoryTrend,
     SaveTrigger,
     atomic_save,
@@ -11,6 +12,7 @@ from taiko.train.session import (
     headroom_mb,
     install_stop_handlers,
     load_checkpoint,
+    malloc_trim,
     memory_line,
     memory_mb,
     memory_report,
@@ -19,6 +21,7 @@ from taiko.train.session import (
 __all__ = [
     "EXIT_LOW_MEMORY",
     "CheckpointSaver",
+    "MemDebug",
     "MemoryTrend",
     "SaveTrigger",
     "atomic_save",
@@ -27,6 +30,7 @@ __all__ = [
     "headroom_mb",
     "install_stop_handlers",
     "load_checkpoint",
+    "malloc_trim",
     "memory_line",
     "memory_mb",
     "memory_report",

@@ -82,8 +82,9 @@ from taiko.data.shards import MEL_IO_MODES, ShardReader
 from taiko.model.diffusion import EMA, FEATURES_LATEST, TaikoDiffusion
 from taiko.model.model_config import PROFILES, get_profile
 from taiko.train import (
-    EXIT_LOW_MEMORY, CheckpointSaver, MemoryTrend, SaveTrigger, headroom_gb,
-    install_stop_handlers, load_checkpoint, memory_line, memory_mb, memory_report,
+    EXIT_LOW_MEMORY, CheckpointSaver, MemDebug, MemoryTrend, SaveTrigger, headroom_gb,
+    install_stop_handlers, load_checkpoint, malloc_trim, memory_line, memory_mb,
+    memory_report,
 )
 from taiko.train.warm_start import warm_start
 
@@ -101,11 +102,13 @@ def lr_at(step: int, warmup: int, total: int, peak: float, floor: float = 1e-6) 
     return floor + (peak - floor) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
-def batch_to(batch: dict, device: torch.device) -> dict:
+BATCH_KEYS = ("chart", "mel", "timing", "difficulty", "style", "valid_mask",
+              "avg_nps", "peak_nps", "motif", "motif_mask", "window_nps")
+
+
+def batch_to(batch: dict, device: torch.device, non_blocking: bool = True) -> dict:
     """Only the tensors the model consumes, moved once."""
-    keys = ("chart", "mel", "timing", "difficulty", "style", "valid_mask",
-            "avg_nps", "peak_nps", "motif", "motif_mask", "window_nps")
-    return {k: batch[k].to(device, non_blocking=True) for k in keys}
+    return {k: batch[k].to(device, non_blocking=non_blocking) for k in BATCH_KEYS}
 
 
 @torch.no_grad()
@@ -163,6 +166,19 @@ def main() -> int:
                          "Resuming a generation-1 checkpoint at 2 widens it in "
                          "place (taiko/train/warm_start.py): step 0 reproduces "
                          "the old model exactly, and training continues from it.")
+    ap.add_argument("--mem-debug", action="store_true",
+                    help="at every log line, name what host memory is growing: "
+                         "Python allocations by source line, live CPU tensors, "
+                         "pinned host memory, and what malloc_trim gives back. "
+                         "Slows training; for a short leak-check run.")
+    ap.add_argument("--no-malloc-trim", dest="malloc_trim", action="store_false",
+                    default=True,
+                    help="do not call malloc_trim at each log line. It returns "
+                         "freed heap memory to the kernel, which is what "
+                         "fragmentation otherwise keeps.")
+    ap.add_argument("--sync-h2d", action="store_true",
+                    help="copy batches to the GPU synchronously. For A/B-testing "
+                         "whether non_blocking copies are what retains host memory.")
     ap.add_argument("--rewarm", type=int, default=500,
                     help="after a warm start, ramp the learning rate back up "
                          "over this many steps. The new inputs start at zero "
@@ -433,6 +449,7 @@ def main() -> int:
 
     t0 = time.time()
     trend = MemoryTrend()
+    mem_debug = MemDebug() if args.mem_debug else None
     model.train()
     stop = False
 
@@ -481,7 +498,7 @@ def main() -> int:
                 group["lr"] = lr_now
 
             with torch.amp.autocast("cuda", enabled=use_fp16):
-                loss, metrics = model(**batch_to(batch, device))
+                loss, metrics = model(**batch_to(batch, device, not args.sync_h2d))
                 # DataParallel returns one row per replica; averaging is what
                 # makes the reported numbers mean the same thing on 1 GPU and 2.
                 loss = loss.mean()
@@ -504,6 +521,8 @@ def main() -> int:
 
                 if step % args.log_every == 0:
                     elapsed = time.time() - t0
+                    if args.malloc_trim:
+                        malloc_trim()
                     snapshot = memory_mb()
                     trend.observe(step, snapshot)
                     growth = trend.compact()
@@ -515,6 +534,8 @@ def main() -> int:
                     alarm = trend.first_warning()
                     if alarm:
                         print(alarm, flush=True)
+                    if mem_debug is not None:
+                        print(mem_debug.report(), flush=True)
 
                 if args.val_every and step % args.val_every == 0:
                     run_validation(f"step {step}")

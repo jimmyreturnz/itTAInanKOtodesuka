@@ -264,6 +264,61 @@ first-class: `--timing-from`, or edit the `time_song.py` output in the editor.
 before and after about 10k steps; grid follow should rise. Then train
 TimingNet and run the timing benchmark.
 
+### 2026-09-29: first real evaluation (p1, best.pt at step 53,664)
+
+Baseline from the handover, for the next comparison. Training had reached step
+54,925 in `last.pt`; best val loss was 0.16439.
+
+| | value | target |
+|---|---|---|
+| onset F1 (P / R) | 0.683 (0.667 / 0.703) | > 0.55 |
+| onset MAE | 3.79 ms | |
+| snap validity (old measure) | 0.566 | > 0.95 |
+| SR correlation | 0.982 | > 0.85 |
+| NPS error | 0.393 | < 1.0 |
+| unplayability (raw) | 0.0118 | < 0.005 |
+| pattern KL / note ratio / don ratio | 0.270 / 1.074 / 0.514 | |
+| quiet-section notes (model / ranked) | 0.244 / 0.218 | |
+| missed strong onsets (model / ranked) | 0.266 / 0.228 | |
+
+**Snap validity 0.566 was a measurement artefact.** It was scored on raw
+decoded notes, which sit on 20 ms frame boundaries, at a 5 ms tolerance, with
+none of the grid snapping `generate.py` applies. A perfectly placed chart
+pushed through the same frames scores 0.49–0.70 depending on tempo.
+Unplayability was measured on the same raw notes.
+
+`evaluate.py` now scores legacy and grid decoding, raw and post-processed, with
+the ranked map as a control, and gates on what `generate.py` ships.
+`decode_on_grid` (`taiko/data/decode.py`) places notes only on legal
+subdivisions of each section's tempo. On synthetic charts that change snap by
+the phrase it put 100% of notes on the exact line, against 97.5–99% for
+decode-then-snap. `repair` (`taiko/data/repair.py`) fixes each unplayability
+type and counts its fixes. **Re-run the same 30-map evaluation to get the
+real numbers**; the old 0.566 is not comparable to the new gate.
+
+**Host-memory leak, 28.8 MB/step, all anonymous, 0 workers at exit.** 28.8 MB
+is exactly the fp16 mel read from `mels.dat` for one batch (25.2 MB) plus fp32
+chart and timing (3.5 MB). It does not reproduce on CPU: 400 steps with 0
+workers were flat, so it needs the CUDA path. Done:
+
+- The loader reads windows into a reused buffer instead of allocating a
+  ~393 KB `bytes` object per window (64 per step). These were the prime
+  suspect for heap fragmentation.
+- Trainers run with a fixed glibc mmap threshold and 2 arenas, and call
+  `malloc_trim` at every log line.
+- The supervisor never drops below 1 dataloader worker.
+- `--mem-debug` names what is growing: Python allocations by line, live CPU
+  tensors, pinned host memory, and what `malloc_trim` returns. The notebook
+  runs it for 15 minutes before stage 2 (`LEAK_CHECK_MINUTES`).
+- "page-locked 0" in the old log did not rule out pinned memory: the kernel's
+  Locked counter covers `mlock` only, and CUDA's pinned host memory does not
+  show there. `--mem-debug` asks PyTorch's host allocator directly.
+- `--sync-h2d` is there to A/B non-blocking copies if pinned memory is the
+  one growing.
+
+**Next:** the leak check cell's output decides the leak. Then re-evaluate
+`best.pt` with `--seeds 3`.
+
 ## Deferred, deliberately
 
 - **Hosted web version.** Would need a GPU bill (D3 rules it out) or Hugging Face Spaces + ZeroGPU. The Gradio app ports unchanged if this is ever wanted, so deferring costs nothing.

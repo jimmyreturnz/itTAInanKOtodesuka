@@ -462,6 +462,91 @@ class MemoryTrend:
 # Stopping cleanly
 # --------------------------------------------------------------------------- #
 
+def malloc_trim() -> float | None:
+    """
+    Ask glibc to give freed heap memory back to the kernel. Returns the MB of
+    anonymous memory it released, or None where there is no glibc.
+
+    Cheap, and diagnostic as well as corrective: if this releases most of a
+    run's growth, the growth was fragmentation -- memory already freed that the
+    allocator was holding -- not an object anything still references.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+    except OSError:
+        return None
+    before = _smaps_mb()["anon"]
+    libc.malloc_trim(0)
+    return before - _smaps_mb()["anon"]
+
+
+class MemDebug:
+    """
+    Name what is growing, for --mem-debug.
+
+    The memory line says *how much* anonymous memory grows per step; this says
+    *what* it is, in four independent ways, each pointing at a different fix:
+
+      python allocations  tracemalloc's biggest growth since the last report,
+                          by source line: a Python object being kept
+      live CPU tensors    count and bytes of every CPU tensor still reachable:
+                          batches being retained somewhere
+      pinned host memory  PyTorch's caching host allocator, which the kernel's
+                          "Locked" counter does not see: pin_memory or
+                          non_blocking copies staging through pinned buffers
+      malloc_trim         what glibc hands back when asked: fragmentation
+
+    tracemalloc slows every allocation, so this is for a short diagnostic run
+    (the notebook's leak-check cell), not a long session.
+    """
+
+    def __init__(self) -> None:
+        import tracemalloc
+        self._tm = tracemalloc
+        tracemalloc.start(6)
+        self._prev = tracemalloc.take_snapshot()
+
+    def report(self) -> str:
+        import gc
+        snap = self._tm.take_snapshot()
+        stats = snap.compare_to(self._prev, "lineno")
+        self._prev = snap
+        grown = [s for s in stats if s.size_diff > 256 * 1024][:3]
+        traced_mb = self._tm.get_traced_memory()[0] / 1024 ** 2
+
+        n_tensors, tensor_bytes, seen = 0, 0, set()
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, torch.Tensor) and obj.device.type == "cpu":
+                    storage = obj.untyped_storage()
+                    key = storage.data_ptr()
+                    n_tensors += 1
+                    if key not in seen:
+                        seen.add(key)
+                        tensor_bytes += storage.nbytes()
+            except Exception:                                   # noqa: BLE001
+                continue
+
+        pinned = "n/a"
+        try:
+            host = torch.cuda.memory.host_memory_stats()
+            pinned = (f"{host.get('allocated_bytes.current', 0) / 1024 ** 2:.0f} MB in use, "
+                      f"{host.get('reserved_bytes.current', 0) / 1024 ** 2:.0f} MB reserved")
+        except Exception:                                       # noqa: BLE001
+            pass
+
+        trimmed = malloc_trim()
+        lines = [f"  mem-debug: python-traced {traced_mb:.0f} MB | live CPU tensors "
+                 f"{n_tensors} ({tensor_bytes / 1024 ** 2:.0f} MB) | pinned host {pinned} | "
+                 f"malloc_trim released "
+                 + ("n/a" if trimmed is None else f"{trimmed:.0f} MB")]
+        for s in grown:
+            frame = s.traceback[0]
+            lines.append(f"    +{s.size_diff / 1024 ** 2:.1f} MB  {frame.filename}:{frame.lineno}")
+        return "\n".join(lines)
+
+
 class _StopFlag:
     def __init__(self) -> None:
         self.requested = False

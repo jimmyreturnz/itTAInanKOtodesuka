@@ -374,7 +374,7 @@ So both stages now go through `supervise`, which:
   instead of green.
 """),
 code("""
-import subprocess, sys, time
+import os, subprocess, sys, time
 from taiko.train import EXIT_LOW_MEMORY
 
 # Killed by SIGKILL: -9 from subprocess, 137 through a shell. This is what the
@@ -395,6 +395,17 @@ def _get_arg(args, flag, default):
     return args[args.index(flag) + 1] if flag in args else default
 
 
+# glibc allocator settings for every training process. The step-54k run grew
+# 28.8 MB of anonymous memory per step, and the loader's per-window buffers
+# were exactly the size glibc's *adaptive* mmap threshold moves into the heap,
+# where freed memory is kept rather than returned. A fixed threshold keeps
+# large buffers mmapped and returned on free, and two arenas stop per-thread
+# heaps from multiplying the effect. The trainer also calls malloc_trim at
+# every log line and reports what it gives back.
+MALLOC_ENV = {"MALLOC_MMAP_THRESHOLD_": "131072", "MALLOC_TRIM_THRESHOLD_": "131072",
+              "MALLOC_ARENA_MAX": "2"}
+
+
 def _run_streaming(command):
     \"\"\"
     Run a child process, relaying its output through this process.
@@ -413,6 +424,7 @@ def _run_streaming(command):
     \"\"\"
     process = subprocess.Popen(
         command,
+        env={**os.environ, **MALLOC_ENV},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -484,11 +496,15 @@ def supervise(script, args, out_dir, budget_hours, label):
         print(f"\\n{label}: out of host memory after {ran / 60:.1f} min "
               f"(exit {result.returncode}). The checkpoint is current; "
               f"restarting from it with less to hold.", flush=True)
-        if workers > 0:
+        # Never below one worker. With none, every window is read and
+        # collated inside the training process itself -- where the step-54k
+        # run's memory grew -- and a restart should hold less, not move the
+        # loading somewhere worse.
+        if workers > 1:
             workers = workers // 2
         else:
             pin = False
-        if workers == 0 and not pin:
+        if workers == 1 and not pin:
             print(f"{label}: already at the smallest loader. One more attempt.")
 """),
 
@@ -656,6 +672,24 @@ if RESUMABLE["diffusion"]:
     DIFF_ARGS += ["--resume", str(CKPT / "diffusion" / "last.pt")]
     print("resuming diffusion training")
 
+# Leak check: a short run with --mem-debug before the long one. The step-54k
+# run grew 28.8 MB of host memory per step; this names what is growing
+# (Python objects, live CPU tensors, pinned memory, or allocator
+# fragmentation) in about 15 minutes, and writes to its own folder so the real
+# checkpoints are only read. Set to 0 once a run has shown memory flat.
+LEAK_CHECK_MINUTES = 15
+if LEAK_CHECK_MINUTES and RESUMABLE["diffusion"]:
+    import shutil
+    probe_dir = Path("/kaggle/working/leak_check")
+    probe = _set_arg(DIFF_ARGS, "--out", probe_dir)
+    for flag, value in (("--max-hours", LEAK_CHECK_MINUTES / 60), ("--log-every", 25),
+                        ("--val-every", 0), ("--save-every", 0), ("--save-every-min", 0)):
+        probe = _set_arg(probe, flag, value)
+    probe += ["--mem-debug", "--no-epoch-val", "--no-epoch-save"]
+    print(f"Leak check: {LEAK_CHECK_MINUTES} min with --mem-debug")
+    _run_streaming([sys.executable, "scripts/train_diffusion.py", *probe])
+    shutil.rmtree(probe_dir, ignore_errors=True)
+
 ok = supervise("scripts/train_diffusion.py", DIFF_ARGS,
                CKPT / "diffusion", session_hours_left(), "stage 2")
 if not ok:
@@ -729,15 +763,17 @@ model now, and getting the grid right is most of getting the chart right.
 """),
 code("""
 AUDIO = "/kaggle/input/your-song/song.mp3"   # <- change this
-
-!python scripts/generate.py \\
-    --audio "{AUDIO}" \\
-    --diffusion {CKPT / "diffusion" / "best.pt"} \\
-    --ae {AE_BEST} \\
-    --difficulty 5.5 \\
-    --preset standard \\
-    --steps 50 \\
-    --out /kaggle/working/outputs
+if not Path(AUDIO).exists():
+    print(f"No audio at {AUDIO}; set AUDIO to a real file to generate a map.")
+else:
+    !python scripts/generate.py \\
+        --audio "{AUDIO}" \\
+        --diffusion {CKPT / "diffusion" / "best.pt"} \\
+        --ae {AE_BEST} \\
+        --difficulty 5.5 \\
+        --preset standard \\
+        --steps 50 \\
+        --out /kaggle/working/outputs
 """),
 ]
 

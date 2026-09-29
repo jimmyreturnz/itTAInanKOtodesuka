@@ -170,7 +170,10 @@ def test_relayed_output_keeps_exit_code_and_order():
     match = re.search(r"def _run_streaming\(command\):.*?\n    return process\n",
                       _code_source(), re.S)
     assert match, "the streaming helper is gone"
-    namespace = {"subprocess": subprocess}
+    env_match = re.search(r"MALLOC_ENV = \{.*?\}\n", _code_source(), re.S)
+    assert env_match, "the allocator settings are gone"
+    namespace = {"subprocess": subprocess, "os": os}
+    exec(env_match.group(0), namespace)
     exec(match.group(0), namespace)
     run_streaming = namespace["_run_streaming"]
 
@@ -178,8 +181,10 @@ def test_relayed_output_keeps_exit_code_and_order():
         child = Path(tmp) / "child.py"
         child.write_text(textwrap.dedent("""
             import sys
+            import os
             print("out", flush=True)
             print("err", file=sys.stderr, flush=True)
+            assert os.environ.get("MALLOC_ARENA_MAX") == "2", "allocator settings not passed"
             sys.exit(int(sys.argv[1]))
         """), encoding="utf-8")
 

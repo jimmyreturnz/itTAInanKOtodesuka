@@ -456,23 +456,35 @@ class ShardReader:
         return self._mel_fd
 
     def _read_frames(self, frame_start: int, count: int) -> np.ndarray:
-        """[count, 128] float32, read without mapping the file."""
+        """
+        [count, 128] float32, read without mapping the file.
+
+        Reads into one reused float16 buffer with preadv rather than letting
+        os.pread allocate a fresh bytes object per window. Those were ~393 KB
+        each, 64 per step: 25.2 MB of short-lived allocations per step, which is
+        the float16 part of the 28.8 MB/step anonymous growth the step-54k run
+        logged. Allocations that size fall between glibc's mmap threshold and
+        its heap once the threshold adapts upward, which is how a steady
+        allocate/free pattern turns into a heap that never shrinks. Whether or
+        not that was the whole leak, this path no longer allocates per read.
+        """
         row_bytes = MEL_BINS * 2
         want = count * row_bytes
         offset = frame_start * row_bytes
-        chunks, got = [], 0
+        scratch = getattr(self, "_scratch", None)
+        if scratch is None or scratch.shape[0] < count:
+            scratch = self._scratch = np.empty((max(count, 2048), MEL_BINS), dtype=np.float16)
+        view = memoryview(scratch).cast("B")[:want]
+        got = 0
         while got < want:
-            block = os.pread(self._fd, want - got, offset + got)
-            if not block:
+            n = os.preadv(self._fd, [view[got:]], offset + got)
+            if n <= 0:
                 break                              # Short file; caller zero-pads.
-            chunks.append(block)
-            got += len(block)
+            got += n
         if self.drop_page_cache and got:
             self._forget(offset, got)
-        raw = chunks[0] if len(chunks) == 1 else b"".join(chunks)
-        frames = len(raw) // row_bytes
-        return np.frombuffer(raw, dtype=np.float16, count=frames * MEL_BINS) \
-                 .reshape(frames, MEL_BINS).astype(np.float32)
+        frames = got // row_bytes
+        return scratch[:frames].astype(np.float32)
 
     def _forget(self, offset: int, length: int) -> None:
         """
@@ -521,6 +533,7 @@ class ShardReader:
         state = dict(self.__dict__)
         state["_mel"] = None
         state["_mel_fd"] = None
+        state["_scratch"] = None
         state["_owner_pid"] = None
         return state
 

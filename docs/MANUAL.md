@@ -433,6 +433,7 @@ character.
 | Notes over quiet passages | `--quiet-gate`; on a features-2 model also try `--window-density auto` |
 | Obvious sounds left empty | the run prints how many strong on-grid onsets got no note, and where; lower `--threshold` a little |
 | Slow on a long song / out of memory | `--batch-windows 4` |
+| Want the old decoder | `--decode legacy` (frame decode, then snap); `--no-repair` skips the playability fixes |
 
 `--seed 42` makes a run reproducible; changing it gives a different map for the
 same settings.
@@ -452,6 +453,33 @@ python scripts/evaluate.py --n-maps 40
 | sr_correlation | > 0.85 | asking for a difficulty does nothing |
 | nps_error | < 1.0 | density control does not work |
 | unplayability | < 0.005 | it produces patterns humans cannot hit |
+
+These headline numbers are measured on **what generate.py ships**: grid
+decoding plus playability repair. Each map is also decoded the old way and
+scored before post-processing, so the gain is visible. The snap-validity block
+reads like this:
+
+```
+  snap validity, by what is measured            model    ranked map
+  raw frames @5 ms  (the old measure)           0.566      ...    <- ceiling of the representation
+  raw frames @10 ms (half a frame)               ...       ...
+  legacy decode + snap @5 ms                     ...
+  grid decode @5 ms                              ...
+  grid decode + repair @5 ms  (shipped)          ...
+```
+
+The first line is what the step-53k evaluation reported as 0.566. Notes
+decoded from 20 ms frames sit up to 10 ms from their true time, so the ranked
+map scores low on it too. The number measured the frames, not the model: on
+synthetic charts placed perfectly it comes out at 0.49-0.70
+depending on tempo. Unplayability is broken down by type (too fast, big-note streams,
+overlapping longs, zero-length longs) for every version and for the ranked map.
+The report also shows how much repair had to change: a high rate means the
+model itself still breaks the rules.
+
+`--seeds 3` samples each map three times and reports the spread. Every metric
+is also grouped by difficulty band and BPM. The header names the checkpoint
+evaluated, its step, and the step in `last.pt` beside it.
 
 Beside those, two numbers track the most common complaints. Each is shown
 next to the ranked map's own value for the same song, because human mappers
