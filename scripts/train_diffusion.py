@@ -214,6 +214,10 @@ def main() -> int:
     ap.add_argument("--save-every-min", type=float, default=10.0,
                     help="save last.pt every N minutes. This is the one that "
                          "bounds what an OOM kill costs; 0 to disable")
+    ap.add_argument("--snapshot-every", type=int, default=0,
+                    help="also keep step_N.pt every N steps, as candidates for "
+                         "scripts/select_checkpoint.py, which picks by chart quality "
+                         "rather than val MSE. ~570 MB each; 0 to disable")
     ap.add_argument("--no-epoch-save", dest="epoch_save", action="store_false",
                     default=True, help="do not save at the end of every epoch")
     ap.add_argument("--no-epoch-val", dest="epoch_val", action="store_false",
@@ -541,6 +545,8 @@ def main() -> int:
                     run_validation(f"step {step}")
 
                 saver.maybe_save(step)
+                if args.snapshot_every and step % args.snapshot_every == 0:
+                    saver.save(f"step_{step}.pt", "snapshot for select_checkpoint.py")
 
                 if stop_signal:
                     reason = f"{stop_signal.reason} at step {step}"

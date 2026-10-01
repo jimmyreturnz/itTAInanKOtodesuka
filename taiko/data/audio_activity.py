@@ -27,6 +27,11 @@ NOTE_WINDOW_MS = 40.0      # a strong onset counts as marked if a note is this c
 ON_GRID_MS = 15.0          # a frame is 20 ms, so a frame time can sit 10 ms off its line
 ONSET_DIVISORS = (1, 2, 4)
 STRONG_STD = 1.5           # strong onset: flux above mean + this many std
+# Silence: loudness this far from the song's own floor toward its median. The
+# quietest-20% measure above is relative and always 20% of the song, so it
+# cannot say "nothing is playing"; this can.
+SILENCE_FLOOR_QUANTILE = 0.02
+SILENCE_REACH = 0.15
 
 
 @dataclass
@@ -36,6 +41,14 @@ class Activity:
     quiet: np.ndarray      # [T] bool, the quietest QUIET_QUANTILE of frames
     strong: np.ndarray     # [T] bool, loud local-peak attacks (not yet grid-filtered)
     threshold: float
+    silent: np.ndarray     # [T] bool, near the song's own floor
+
+
+def silence_rate(notes: Sequence[TaikoNote], act: Activity) -> float:
+    """Share of hits on a silent frame. Ranked maps put 1.10% there."""
+    n = len(act.loudness)
+    hits = [x.time for x in notes if not x.is_long]
+    return float(np.mean([act.silent[_frame(t, n)] for t in hits])) if hits else 0.0
 
 
 @dataclass
@@ -58,7 +71,9 @@ def activity(mel: np.ndarray) -> Activity:
     prev = np.concatenate([[-np.inf], flux[:-1]])
     nxt = np.concatenate([flux[1:], [-np.inf]])
     strong = (flux > threshold) & (flux >= prev) & (flux >= nxt) & ~quiet
-    return Activity(loudness, flux, quiet, strong, threshold)
+    floor, median = np.quantile(loudness, SILENCE_FLOOR_QUANTILE), np.median(loudness)
+    silent = loudness < floor + SILENCE_REACH * (median - floor)
+    return Activity(loudness, flux, quiet, strong, threshold, silent)
 
 
 def _frame(time_ms: float, n: int) -> int:

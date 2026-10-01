@@ -61,7 +61,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import torch
 
-from taiko.data.audio_activity import ON_GRID_MS, activity, activity_score
+from taiko.data.audio_activity import ON_GRID_MS, activity, activity_score, silence_rate
 from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
 )
@@ -236,6 +236,7 @@ def score_variants(variants: dict, reference, act, grid: Grid, span, real_ms=Non
                 "don_ratio": stats.don_ratio, "big_ratio": stats.big_ratio,
                 "quiet_note_rate": act_score.quiet_note_rate,
                 "onset_miss_rate": act_score.strong_onset_miss_rate,
+                "silence_rate": silence_rate(bm.notes, act),
             })
     # The old measure, kept so the new numbers can be read against the handover.
     raw = variants["legacy_raw"]
@@ -415,6 +416,8 @@ def report(summary: dict, args) -> bool:
     print(f"\n  audio agreement           model   ranked map")
     print(f"  {'quiet-section notes':<24s}{summary['quiet_note_rate']:>7.3f}   "
           f"{summary['ref_quiet_note_rate']:>7.3f}   share of notes in the quietest 20%")
+    print(f"  {'notes on silence':<24s}{summary['silence_rate']:>7.3f}   "
+          f"{summary['ref_silence_rate']:>7.3f}   share of hits near the song's own floor")
     print(f"  {'missed strong onsets':<24s}{summary['onset_miss_rate']:>7.3f}   "
           f"{summary['ref_onset_miss_rate']:>7.3f}   share of loud on-grid attacks left empty")
     if args.grid_probe:
@@ -667,6 +670,7 @@ def main() -> int:
             "ref_unplayability": ref_play.rate,
             **{f"ref_{k}": v for k, v in violation_counts(ref_play).items()},
             "ref_quiet_note_rate": ref_act.quiet_note_rate,
+            "ref_silence_rate": silence_rate(ceiling.notes, act),
             "ref_onset_miss_rate": ref_act.strong_onset_miss_rate,
             "grid_follow": (grid_follow_fraction(sample, points, frames, threshold)
                             if args.grid_probe else float("nan")),

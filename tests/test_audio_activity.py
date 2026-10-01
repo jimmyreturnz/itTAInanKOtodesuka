@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 
-from taiko.data.audio_activity import activity, activity_score, gate_notes
+from taiko.data.audio_activity import activity, activity_score, gate_notes, silence_rate
 from taiko.data.frames import FRAME_MS
 from taiko.data.grid import Grid
 from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
@@ -91,3 +91,19 @@ def test_gate_drops_isolated_quiet_filler_but_keeps_streams():
     kept, dropped = gate_notes(loud + isolated + stream, act, grid)
     assert [n.time for n in dropped] == [12500, 14000, 15500]
     assert len(kept) == 1 + len(stream)
+
+
+def test_silence_rate_counts_hits_where_nothing_plays():
+    mel = _mel(1000, slice(600, 900), hits=[])     # frames 600-899 silent: 12-18 s
+    act = activity(mel)
+    notes = [TaikoNote(time=t, note_type="don") for t in (2000, 4000, 13000, 15000)]
+    assert silence_rate(notes, act) == 0.5
+    assert silence_rate([TaikoNote(time=13000, note_type="roll", end_time=14000)], act) == 0.0
+
+
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print(f"  {name}  ok")
+    print("all audio activity tests passed")
