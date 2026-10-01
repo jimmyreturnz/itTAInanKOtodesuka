@@ -408,7 +408,14 @@ that fails here will never be fixed by more steps.
    in the whole plan.
 4. **Difficulty envelope** — a per-section density curve instead of one global number, so
    kiai sections get denser. The window-local conditioning already supports this.
-5. Gradio UI (already in `requirements.txt`, never built).
+5. **A GUI for making charts (later — requested 2026-10-01).** Generation is
+   a command line with a dozen flags today; charting a song should not need
+   them. It covers picking a song from the osu! library, a reference map or
+   preset, SR, and timing from an existing `.osu` or detection. It generates,
+   shows the result's density and audio-agreement numbers, and exports the
+   `.osz`. Gradio is already in `requirements.txt` and was never built, but it
+   is a starting point rather than a decision; taiko_arranger (PySide6) already
+   reads the library and `osu!.db` and is another candidate host.
 
 ---
 
