@@ -86,6 +86,8 @@ def main() -> int:
         return 1
     best = max(passing)
     print(f"\nkeep {best[1]}  (exact snap {best[0]:.4f}, {best[2]})")
+    # The metrics say it matches ranked distributions; only playing it says it is fun.
+    print(f"blind A/B round for it: python scripts/blind_ab.py make --round <next> --diffusion {best[1]}")
     return 0
 
 
