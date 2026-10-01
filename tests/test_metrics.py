@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
 from taiko.eval.metrics import (
     ChartReport, NoteStats, OnsetScore, SnapScore, UnplayabilityScore,
-    evaluate_chart, exact_snap, format_report, note_statistics, onset_f1,
+    evaluate_chart, exact_snap, feel_counts, format_report, js_divergence, note_statistics, onset_f1,
     pattern_divergence, snap_validity, unplayability,
 )
 
@@ -365,6 +365,22 @@ def test_exact_snap_tells_a_1_6_from_the_mappers_1_4():
     assert s.per_divisor == {1: (1, 1), 2: (1, 1), 4: (0, 1)}, s.per_divisor
     assert exact_snap(ref, ref, grid).exact == 1.0
     print("  exact_snap: 1/6 is not 1/4   ok")
+
+
+def test_feel_counts_reads_a_stream_its_snaps_and_its_patterns():
+    # 120 BPM: a 12-note 1/4 stream (125 ms apart) alternating kat/don, then
+    # two singles 2.25 and 1 beat later.
+    from taiko.data.grid import Grid
+    grid = Grid([TimingPoint(time=0, beat_length=500, meter=4, uninherited=True)])
+    times = list(range(0, 12 * 125, 125)) + [2500, 3000]
+    notes = [_note(t, "kat" if i % 2 == 0 else "don") for i, t in enumerate(times)]
+    c = feel_counts(notes, grid)
+    assert c["stream"] == {"9-16": 1, "1": 2}, c["stream"]
+    assert c["snap"] == {"1/4": 11, ">1": 1, "1/1": 1}, c["snap"]
+    assert c["colour"] == {"kdkd": 5, "dkdk": 4}, c["colour"]   # 9 4-grams in 12 notes
+    assert js_divergence(c["snap"], c["snap"]) == 0.0
+    assert js_divergence({"a": 1}, {"b": 1}) == 1.0
+    print("  feel_counts: stream/snap/colour ok")
 
 
 if __name__ == "__main__":

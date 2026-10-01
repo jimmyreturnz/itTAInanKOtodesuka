@@ -49,6 +49,7 @@ ignores it.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import copy
 import json
 import statistics
@@ -75,7 +76,7 @@ from taiko.data.shards import ShardReader, decode_timing_points, load_note_times
 from taiko.data.tensor_repr import build_timing_stream, tensor_to_beatmap
 from taiko.data.timing_refine import apply_timing_refinement
 from taiko.eval.metrics import (
-    EXACT_SNAP_DIVISORS, exact_snap,
+    EXACT_SNAP_DIVISORS, FEEL_FAMILIES, exact_snap, feel_counts, js_divergence,
     note_statistics, onset_f1, pattern_divergence, snap_validity, unplayability,
 )
 from taiko.model.diffusion import load_diffusion
@@ -291,6 +292,31 @@ def summarise(rows: list[dict]) -> dict:
     return summary
 
 
+def sr_band(sr: float) -> str:
+    return next(label for lo, hi, label in SR_BANDS if lo <= sr < hi)
+
+
+def add_feel(pool: dict, band: str, side: str, notes, grid: Grid) -> None:
+    """Pool feel counts per SR band and side ('model' or 'ranked'), over maps and seeds."""
+    slot = pool.setdefault(band, {}).setdefault(side, {f: Counter() for f in FEEL_FAMILIES})
+    for family, counts in feel_counts(notes, grid).items():
+        slot[family].update(counts)
+
+
+def feel_table(pool: dict) -> dict:
+    """JS divergence, model against ranked, per band and family, plus all bands pooled."""
+    out, total = {}, {side: {f: Counter() for f in FEEL_FAMILIES} for side in ("model", "ranked")}
+    for band, sides in pool.items():
+        if len(sides) < 2:
+            continue
+        out[band] = {f: js_divergence(sides["model"][f], sides["ranked"][f]) for f in FEEL_FAMILIES}
+        for side in total:
+            for f in FEEL_FAMILIES:
+                total[side][f].update(sides[side][f])
+    out["all"] = {f: js_divergence(total["model"][f], total["ranked"][f]) for f in FEEL_FAMILIES}
+    return out
+
+
 def nanmean(vals) -> float:
     vals = [v for v in vals if v == v]
     return float(np.mean(vals)) if vals else float("nan")
@@ -378,6 +404,13 @@ def report(summary: dict, args) -> bool:
                 cells.append(f"1/{d} {summary[f'xs_hit_{d}'] / n:.3f} ({n * summary['n_maps']:.0f})")
         print("  by the mapper's divisor: " + "   ".join(cells))
         print(f"  reference notes on no scored line, left out: {summary['unsnapped_share']:.2%}")
+
+    if summary.get("feel"):
+        print(f"\n  feel, model against ranked maps of the same SR band "
+              f"(Jensen-Shannon: 0 same, 1 disjoint)")
+        print(f"  {'band':<21s}" + "".join(f"{f:>9s}" for f in FEEL_FAMILIES))
+        for band, js in summary["feel"].items():
+            print(f"  {band:<21s}" + "".join(f"{js[f]:>9.3f}" for f in FEEL_FAMILIES))
 
     print(f"\n  audio agreement           model   ranked map")
     print(f"  {'quiet-section notes':<24s}{summary['quiet_note_rate']:>7.3f}   "
@@ -534,6 +567,7 @@ def main() -> int:
         chosen = rng.permutation(val_idx)[:args.n_maps]
 
     rows = []
+    feel_pool: dict = {}
     for n, idx in enumerate(chosen):
         idx = int(idx)
         record = reader.records[idx]
@@ -595,10 +629,18 @@ def main() -> int:
         if note_times is not None:
             real_ms = note_times[idx][note_times[idx] < span[1]]
 
+        band = sr_band(requested_sr)
+        # The ranked side: the ranked chart's own frames through the shipped
+        # decoder. `reference` is the legacy frame decode, whose notes sit on
+        # 20 ms frame times rather than lines (exact snap ~0.3, gaps off-snap).
+        ceiling = decode_on_grid(reference_chart, points, threshold=0.5)
+        add_feel(feel_pool, band, "ranked", ceiling.notes, grid)
+
         per_seed = []
         for seed in range(args.seeds):
             probs = sample(timing, seed)
             variants = decode_variants(probs, points, grid, threshold, bpm, offset, meter)
+            add_feel(feel_pool, band, "model", variants[SHIPPED].notes, grid)
             scored = score_variants(variants, reference, act, grid, span, real_ms)
             if args.harness:
                 scored.update(harness_rows(probs, points, grid, threshold, requested_nps,
@@ -608,10 +650,6 @@ def main() -> int:
 
         ref_play = unplayability(reference.notes)
         if real_ms is not None:
-            # The ceiling: the ranked chart's own frames through the shipped
-            # decoder. `reference` is the legacy frame decode, whose notes sit
-            # on 20 ms frame times rather than lines, so it scores ~0.3.
-            ceiling = decode_on_grid(reference_chart, points, threshold=0.5)
             row.update(exact_snap_fields("ref_", hit_times(ceiling), real_ms, grid, False))
         ref_act = activity_score(reference.notes, act, grid, span_ms=span)
         ref_stats = note_statistics(reference)
@@ -646,6 +684,7 @@ def main() -> int:
         return 1
 
     summary = summarise(rows)
+    summary["feel"] = feel_table(feel_pool)
     gate_b = report(summary, args)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

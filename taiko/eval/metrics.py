@@ -57,6 +57,8 @@ from __future__ import annotations
 import bisect
 from dataclasses import dataclass
 
+from collections import Counter
+
 import numpy as np
 
 from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
@@ -217,6 +219,85 @@ def exact_snap(generated_ms, reference_ms, grid, tolerance_ms: float = 25.0) -> 
         n_unsnapped=sum(d is None for d in divisor),
         per_divisor={d: (e, m) for d, (e, m) in per.items() if m},
     )
+
+
+# --------------------------------------------------------------------------- #
+# Feel: what a player notices, against ranked maps of the same SR band
+# --------------------------------------------------------------------------- #
+
+# Gaps, in beats, a player reads as a snap. 3% slack covers ms truncation.
+FEEL_SNAPS = ((1.0, "1/1"), (0.5, "1/2"), (1 / 3, "1/3"), (0.25, "1/4"),
+              (1 / 6, "1/6"), (0.125, "1/8"))
+STREAM_GAP_BEATS = 0.25 * 1.05          # a run continues while notes stay 1/4 apart or closer
+STREAM_BINS = ((1, "1"), (2, "2"), (3, "3-4"), (5, "5-8"), (9, "9-16"), (17, "17-32"), (33, "33+"))
+DENSITY_WINDOW_MS = 8000
+DENSITY_BINS = ((0.0, "<10%"), (0.1, "10-25%"), (0.25, "25-50%"), (0.5, "50-100%"), (1.0, "100%+"))
+FEEL_FAMILIES = ("stream", "snap", "colour", "density")
+
+
+def _bin(value: float, bins) -> str:
+    label = bins[0][1]
+    for edge, name in bins:
+        if value >= edge:
+            label = name
+    return label
+
+
+def feel_counts(notes: list[TaikoNote], grid) -> dict[str, Counter]:
+    """
+    Four distributions a player feels and onset F1 does not see, as counts so
+    they pool over maps and seeds:
+
+      stream   run lengths, a run continuing while notes stay 1/4 beat apart
+      snap     the gap to the previous note as a beat fraction
+      colour   don/kat 4-grams inside runs -- where patterns are played
+      density  NPS change between consecutive 8 s windows, relative to the map's mean
+    """
+    out = {f: Counter() for f in FEEL_FAMILIES}
+    hits = sorted((n.time, "k" if "kat" in n.note_type else "d")
+                  for n in notes if not n.is_long)
+    if len(hits) < 2:
+        return out
+    times = np.array([t for t, _ in hits], dtype=np.float64)
+    run = [hits[0][1]]
+    for i in range(1, len(hits)):
+        beats = (times[i] - times[i - 1]) / grid.section_at(float(times[i])).ms_per_beat
+        snap = next((name for frac, name in FEEL_SNAPS if abs(beats - frac) <= 0.03 * frac), None)
+        out["snap"][snap or (">1" if beats > 1.03 else "other")] += 1
+        if beats <= STREAM_GAP_BEATS:
+            run.append(hits[i][1])
+            continue
+        _close_run(run, out)
+        run = [hits[i][1]]
+    _close_run(run, out)
+
+    windows = np.bincount(((times - times[0]) // DENSITY_WINDOW_MS).astype(int))
+    if windows.size > 1 and windows.mean() > 0:
+        for change in np.abs(np.diff(windows)) / windows.mean():
+            out["density"][_bin(float(change), DENSITY_BINS)] += 1
+    return out
+
+
+def _close_run(run: list[str], out: dict[str, Counter]) -> None:
+    out["stream"][_bin(len(run), STREAM_BINS)] += 1
+    for i in range(len(run) - 3):
+        out["colour"]["".join(run[i:i + 4])] += 1
+
+
+def js_divergence(a: Counter, b: Counter) -> float:
+    """Jensen-Shannon divergence, base 2: 0 for the same distribution, 1 for disjoint."""
+    keys = sorted(set(a) | set(b))
+    if not keys or not sum(a.values()) or not sum(b.values()):
+        return float("nan")
+    p = np.array([a.get(k, 0) for k in keys], dtype=np.float64)
+    q = np.array([b.get(k, 0) for k in keys], dtype=np.float64)
+    p, q = p / p.sum(), q / q.sum()
+    m = 0.5 * (p + q)
+
+    def kl(x):
+        nz = x > 0
+        return float(np.sum(x[nz] * np.log2(x[nz] / m[nz])))
+    return 0.5 * kl(p) + 0.5 * kl(q)
 
 
 # --------------------------------------------------------------------------- #
