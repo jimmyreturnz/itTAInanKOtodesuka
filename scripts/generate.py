@@ -195,7 +195,7 @@ def main() -> int:
                     help="target star rating (default: --level's ranked median, else 5.0)")
     ap.add_argument("--level", default=None, choices=list(NAMES),
                     help="a taiko difficulty name: the chart is made to obey that level's "
-                         "ranking criteria (rules and pattern guidelines), named after it, and "
+                         "ranking criteria (every problem and warning), named after it, and "
                          "given its ranked median SR, OD and HP unless --difficulty is set")
     ap.add_argument("--style", default=None,
                     choices=["standard", "stream", "speed", "tech"])
@@ -380,7 +380,7 @@ def main() -> int:
         print(f"\nRanking criteria ({args.level}): "
               + (", ".join(f"{v} {k}" for k, v in fixes.most_common()) or "nothing to fix"))
         left = [k for k in check(bm.notes, grid, NAMES[args.level][0])
-                if not k.startswith("guideline: no rest")]
+                if k.split(":")[0] in ("problem", "warning") and "rest" not in k]
         if left:
             print(f"  still breaks: {left}")
 

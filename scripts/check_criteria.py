@@ -36,6 +36,11 @@ from taiko.eval.criteria import LEVELS, check, enforce, level_of
 BPM_BANDS = ((0, 150, "<150"), (150, 200, "150-200"), (200, 999, "200+"))
 
 
+def is_fixable(key: str) -> bool:
+    """What enforce() fixes: problems and warnings, except a missing rest moment."""
+    return key.split(":")[0] in ("problem", "warning") and "rest" not in key
+
+
 def table(title: str, fired: dict[str, list[Counter]]) -> None:
     """Per level: share of maps where each check fires at least once."""
     print(f"\n== {title}")
@@ -46,9 +51,11 @@ def table(title: str, fired: dict[str, list[Counter]]) -> None:
         keys = Counter()
         for c in maps:
             keys.update({k: 1 for k in c})
-        clean = sum(not any(k.startswith("rule") for k in c) for c in maps)
-        print(f"  {level}: {len(maps)} maps, {clean / len(maps):.1%} break no rule")
-        for k, n in sorted(keys.items(), key=lambda kv: (not kv[0].startswith("rule"), -kv[1])):
+        clean = sum(not any(is_fixable(k) for k in c) for c in maps)
+        print(f"  {level}: {len(maps)} maps, {clean / len(maps):.1%} with no problem or warning "
+              f"(rest moments aside)")
+        order = {"problem": 0, "warning": 1, "minor": 2}
+        for k, n in sorted(keys.items(), key=lambda kv: (order[kv[0].split(":")[0]], -kv[1])):
             print(f"    {n / len(maps):6.1%}  {k}")
 
 
@@ -87,13 +94,12 @@ def main() -> int:
     for n, rec in enumerate(reader.records):
         if n % 2000 == 0:
             print(f"  {n}/{len(reader.records)}", flush=True)
-        level = level_of(rec.get("version", ""))
-        if level is None:
-            continue
+        level = level_of(rec.get("version", ""), float(rec.get("difficulty", 0)))
         bm = ranked_notes(rec)
         if bm is None:
             continue
-        c = check(bm.notes, Grid(bm.timing_points), level)
+        c = check(bm.notes, Grid(bm.timing_points), level, drain_ms=bm.duration_ms,
+                  od=bm.overall_difficulty, hp=bm.hp_drain)
         fired[level].append(c)
         ranked_by_idx[n] = c
         bpm = float(rec.get("bpm") or 0)
@@ -116,9 +122,7 @@ def main() -> int:
         for f in sorted(args.probs_cache.glob("*.npy")):
             idx = int(f.stem.split("_")[1])
             rec = reader.records[idx]
-            level = level_of(rec.get("version", ""))
-            if level is None:
-                continue
+            level = level_of(rec.get("version", ""), float(rec.get("difficulty", 0)))
             points = decode_timing_points(rec["timing_points"])
             chart = decode_on_grid(np.load(f), points, threshold=args.threshold)
             repair(chart, Grid(points))
