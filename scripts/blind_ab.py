@@ -10,9 +10,8 @@ ranked distributions; only someone playing it can say whether it is fun.
     python scripts/blind_ab.py score --round 1            # after playing
 
 `make` picks 6 held-out songs, one per SR band, that osu!.db says you have
-never played (every difficulty in the folder unplayed), and keeps them in
-outputs/blind_ab/songs.json so every round uses the same 6. `--replace 2,5`
-swaps slots once those songs are remembered. Each song becomes a folder with
+never played (every difficulty in the folder unplayed) and that no earlier
+round used (outputs/blind_ab/used.json). Each song becomes a folder with
 the audio and two difficulties, [A] and [B]: copy the folders into osu!'s
 Songs folder (or pass --songs-dir) and press F5 in song select.
 
@@ -63,7 +62,7 @@ from taiko.eval.criteria import enforce, level_for_sr, level_of
 from taiko.model.sampling import generate_song
 
 ROOT = Path("outputs/blind_ab")
-SONGS_FILE = ROOT / "songs.json"
+USED_FILE = ROOT / "used.json"
 RATINGS = "ratings.txt"
 KEY = "key.txt"
 
@@ -152,22 +151,18 @@ def make(args) -> int:
     db = osu_db.read(args.osu_db)
     rng = random.Random(args.round)
 
-    songs = json.loads(SONGS_FILE.read_text(encoding="utf-8")) if SONGS_FILE.exists() else {}
-    songs = {int(k): v for k, v in songs.items()}
-    replace = {int(x) - 1 for x in args.replace.split(",")} if args.replace else set()
-    missing = [s for s in range(len(SR_BANDS)) if s not in songs or s in replace]
-    if missing:
-        # A replaced song is remembered, so it is retired for good; songs in
-        # use and retired songs are never picked again.
-        retired_file = ROOT / "retired.json"
-        retired = set(json.loads(retired_file.read_text(encoding="utf-8"))) if retired_file.exists() else set()
-        retired |= {reader.records[songs[s]["record"]]["mel_key"] for s in replace if s in songs}
-        taken = retired | {reader.records[v["record"]]["mel_key"] for v in songs.values()}
-        for slot, idx in pick_songs(reader, val_idx, folders, db, missing, taken, rng).items():
-            songs[slot] = {"record": idx, "beatmap_id": int(reader.records[idx]["beatmap_id"])}
-        ROOT.mkdir(parents=True, exist_ok=True)
-        retired_file.write_text(json.dumps(sorted(retired), ensure_ascii=False), encoding="utf-8")
-        SONGS_FILE.write_text(json.dumps(songs, indent=1), encoding="utf-8")
+    # Every round is 6 songs never used before: once played, a ranked chart is
+    # remembered, and a remembered chart is not blind. (Jimmy, after round 1.)
+    used = set(json.loads(USED_FILE.read_text(encoding="utf-8"))) if USED_FILE.exists() else set()
+    for legacy in (ROOT / "retired.json", ROOT / "songs.json"):   # the first rounds' bookkeeping
+        if legacy.exists():
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            used |= set(data) if isinstance(data, list) else \
+                {reader.records[v["record"]]["mel_key"] for v in data.values()}
+    songs = {slot: {"record": idx} for slot, idx in
+             pick_songs(reader, val_idx, folders, db, range(len(SR_BANDS)), used, rng).items()}
+    ROOT.mkdir(parents=True, exist_ok=True)
+    USED_FILE.write_text(json.dumps(sorted(used), ensure_ascii=False), encoding="utf-8")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, threshold, ckpt = load_model(args.diffusion, args.ae, device, True)
@@ -255,8 +250,6 @@ def main() -> int:
     ap.add_argument("--osu-db", type=Path, default=Path("D:/osu!/osu!.db"))
     ap.add_argument("--songs-dir", default=None,
                     help="write the song folders straight into this folder (osu!'s Songs)")
-    ap.add_argument("--replace", default=None,
-                    help="song numbers to swap for new never-played songs, e.g. 2,5")
     args = ap.parse_args()
     return make(args) if args.action == "make" else score(args)
 
