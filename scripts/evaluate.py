@@ -64,7 +64,7 @@ from taiko.data.audio_activity import ON_GRID_MS, activity, activity_score
 from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
 )
-from taiko.data.decode import decode_on_grid
+from taiko.data.decode import calibrate_threshold, decode_on_grid
 from taiko.data.frames import FRAME_MS, describe
 from taiko.data.grid import Grid
 from taiko.data.motif import beat_frames_from_timing, compute_motif
@@ -144,6 +144,41 @@ def decode_variants(probs: np.ndarray, points, grid: Grid, threshold: float,
     fixes = repair(grid_final, grid)
     return {"legacy_raw": legacy_raw, "legacy_final": legacy_final,
             "grid_raw": grid_raw, "grid_final": grid_final, "_repair": fixes}
+
+
+# Decode-side harness candidates, each through repair like the shipped chart.
+# "lock" calibrates the hit threshold to the requested NPS. An onset bias
+# (hit evidence up on strong attacks, down on quiet frames) was measured here
+# and dropped: missed strong onsets 0.211 -> 0.209, quiet-section notes 0.200
+# -> 0.085 against the ranked 0.180 -- it deleted notes rather than finding any.
+HARNESS = ("lock",)
+
+
+def harness_rows(probs: np.ndarray, points, grid: Grid, threshold: float, target_nps: float,
+                 act, reference, span) -> dict:
+    ref_nps = note_statistics(reference).avg_nps
+    row = {}
+    for name in HARNESS:
+        th = threshold
+        if "lock" in name and target_nps > 0:
+            th, _ = calibrate_threshold(probs, points, target_nps, threshold=threshold)
+        raw = decode_on_grid(probs, points, threshold=threshold, hit_threshold=th)
+        bm = copy.deepcopy(raw)
+        fixes = repair(bm, grid)
+        a = activity_score(bm.notes, act, grid, span_ms=span)
+        nps = note_statistics(bm).avg_nps
+        row.update({
+            f"h_{name}_onset_f1": onset_f1(bm.notes, reference.notes).f1,
+            f"h_{name}_pattern_kl": pattern_divergence(bm.notes, reference.notes),
+            f"h_{name}_nps_rel_error": abs(nps - ref_nps) / max(ref_nps, 1e-6),
+            f"h_{name}_notes": len(bm.notes),
+            f"h_{name}_quiet_note_rate": a.quiet_note_rate,
+            f"h_{name}_onset_miss_rate": a.strong_onset_miss_rate,
+            f"h_{name}_raw_too_fast": unplayability(raw.notes).too_fast,
+            f"h_{name}_repair_rate": fixes.rate,
+            f"h_{name}_threshold": th,
+        })
+    return row
 
 
 def violation_counts(play) -> dict:
@@ -294,6 +329,8 @@ def report(summary: dict, args) -> bool:
     print(f"  {'pattern KL':<16s} {summary['pattern_kl']:>8.4f}")
     print(f"  {'note count ratio':<16s} {summary['note_ratio']:>8.4f}   "
           f"(1.0 = same density as the reference)")
+    print(f"  {'nps rel. error':<16s} {summary['nps_rel_error']:>8.4f}   "
+          f"(mean |realised - reference| / reference, per map)")
     print(f"  {'don ratio':<16s} {summary['don_ratio']:>8.4f}")
     if args.seeds > 1:
         print(f"  seed spread (sd): F1 {summary.get('onset_f1_sd', float('nan')):.4f}  "
@@ -315,6 +352,19 @@ def report(summary: dict, args) -> bool:
             print(f"  {label:<21s}{g['maps']:>4d}  {g['onset_f1']:.3f}  {g['snap_validity']:.3f}  "
                   f"{g['unplayability']:.4f}  {g['note_ratio']:.2f}   {g['quiet_note_rate']:.2f}   "
                   f"{g['onset_miss_rate']:.2f}")
+
+    if args.harness:
+        cols = ("onset_f1", "pattern_kl", "nps_rel_error", "quiet_note_rate",
+                "onset_miss_rate", "raw_too_fast", "repair_rate", "threshold")
+        print("\n  harness            F1   patKL  npsErr  quiet   miss  rawFast  repair  thresh")
+        shipped = [summary["onset_f1"], summary["pattern_kl"], summary["nps_rel_error"],
+                   summary["quiet_note_rate"], summary["onset_miss_rate"],
+                   summary["grid_raw_too_fast"], summary["repair_rate"], float("nan")]
+        table = [("shipped", shipped)] + [
+            (name, [summary.get(f"h_{name}_{c}", float("nan")) for c in cols]) for name in HARNESS]
+        for label, v in table:
+            print(f"  {label:<14s}{v[0]:>7.3f}{v[1]:>8.3f}{v[2]:>8.3f}{v[3]:>7.3f}{v[4]:>7.3f}"
+                  f"{v[5]:>9.1f}{v[6]:>8.3f}{v[7]:>8.3f}")
 
     gate_b = summary["onset_f1"] > GATE_B_F1
     print(f"\n  GATE B  onset F1 > {GATE_B_F1}: "
@@ -381,6 +431,16 @@ def main() -> int:
                     help="also generate against a grid shifted by 1/3 beat and "
                          "measure whether the notes follow it (one extra sample per map)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--min-sr", type=float, default=0.0,
+                    help="only held-out maps at or above this star rating. The default "
+                         "pool is mostly easy maps; --min-sr 5.5 is the hard-map benchmark")
+    ap.add_argument("--max-sr", type=float, default=99.0)
+    ap.add_argument("--harness", action="store_true",
+                    help="also score the decode-side harness candidates (%s) side by side "
+                         "with the shipped decode" % ", ".join(HARNESS))
+    ap.add_argument("--probs-cache", type=Path, default=None,
+                    help="keep each sampled chart here and reuse it, so decode-side "
+                         "changes can be compared on identical samples without resampling")
     args = ap.parse_args()
 
     print(describe())
@@ -408,6 +468,10 @@ def main() -> int:
     if not val_idx:
         print("ERROR: validation split is empty")
         return 1
+
+    val_idx = [i for i in val_idx
+               if args.min_sr <= float(reader.records[i].get("difficulty", 0.0)) < args.max_sr]
+    print(f"  {len(val_idx)} of them between {args.min_sr}* and {args.max_sr}*")
 
     rng = np.random.default_rng(args.seed)
     chosen = rng.permutation(val_idx)[:args.n_maps]
@@ -441,6 +505,19 @@ def main() -> int:
         requested_nps = float(record.get("avg_nps", 0.0))
 
         def sample(timing_tensor: torch.Tensor, seed: int = 0) -> np.ndarray:
+            cached = None
+            if args.probs_cache is not None and timing_tensor is timing:
+                cached = args.probs_cache / (f"{header['step']}_{idx}_{args.seed}_{seed}_"
+                                             f"{args.steps}_{args.cfg_scale}_{frames}.npy")
+                if cached.exists():
+                    return np.load(cached)
+            probs = _sample(timing_tensor, seed)
+            if cached is not None:
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                np.save(cached, probs)
+            return probs
+
+        def _sample(timing_tensor: torch.Tensor, seed: int) -> np.ndarray:
             return generate_song(
                 model, mel=mel, timing=timing_tensor,
                 difficulty=normalise_difficulty(requested_sr),
@@ -460,9 +537,13 @@ def main() -> int:
 
         per_seed = []
         for seed in range(args.seeds):
-            variants = decode_variants(sample(timing, seed), points, grid, threshold,
-                                       bpm, offset, meter)
-            per_seed.append(score_variants(variants, reference, act, grid, span))
+            probs = sample(timing, seed)
+            variants = decode_variants(probs, points, grid, threshold, bpm, offset, meter)
+            scored = score_variants(variants, reference, act, grid, span)
+            if args.harness:
+                scored.update(harness_rows(probs, points, grid, threshold, requested_nps,
+                                           act, reference, span))
+            per_seed.append(scored)
         row = average_rows(per_seed)
 
         ref_play = unplayability(reference.notes)
@@ -475,6 +556,7 @@ def main() -> int:
             "bpm": float(record.get("bpm") or bpm),
             "reference_nps": ref_stats.avg_nps,
             "reference_notes": ref_stats.n_notes,
+            "nps_rel_error": abs(row["realised_nps"] - ref_stats.avg_nps) / max(ref_stats.avg_nps, 1e-6),
             "ref_snap_old": snap_validity(reference.notes, points).valid_fraction,
             "ref_snap_raw": snap_validity(reference.notes, points,
                                           tolerance_ms=RAW_TOLERANCE_MS).valid_fraction,

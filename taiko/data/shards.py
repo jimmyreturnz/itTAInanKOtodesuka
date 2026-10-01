@@ -468,6 +468,11 @@ class ShardReader:
         allocate/free pattern turns into a heap that never shrinks. Whether or
         not that was the whole leak, this path no longer allocates per read.
         """
+        if not hasattr(os, "preadv"):
+            # Windows has no preadv (nor posix_fadvise). Only local evaluation
+            # and generation read shards there, one song at a time, so the
+            # memmap is fine; the leak above was a Kaggle training problem.
+            return self.mel[frame_start:frame_start + count].astype(np.float32)
         row_bytes = MEL_BINS * 2
         want = count * row_bytes
         offset = frame_start * row_bytes

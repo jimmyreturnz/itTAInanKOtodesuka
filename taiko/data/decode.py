@@ -14,12 +14,24 @@ that is more than 10 ms from every line is kept exactly where it fell, off
 the grid.
 
 Here the question is turned around. Every legal position is enumerated first:
-each subdivision of each red line's own tempo. Each one then gets a score
-from the frames around it, and positions are kept by non-maximum suppression,
-so every note is on a line by construction. A mild prior prefers common
-snaps (1/1, 1/2, 1/4) over rare ones (1/8, 1/12). When a frame could belong
-to either of two nearby lines, the probability and the prior decide together,
-not whichever divisor happens to be tried first.
+each subdivision of each red line's own tempo. Each onset peak in the
+probabilities then chooses among the lines near it, so every note is on a line
+by construction. A mild prior prefers common snaps (1/1, 1/2, 1/4) over rare
+ones (1/8, 1/12). When a frame could belong to either of two nearby lines, the
+probability and the prior decide together, not whichever divisor happens to be
+tried first.
+
+Peaks first, not lines first
+----------------------------
+This decoder used to ask every line for the probability at its own frame. On
+30 held-out 5.5*+ maps that split one onset into two notes 22-27 ms apart 147
+times a map (one onset spread over three frames lit a 1/4 line and a 1/3 or
+1/6 line beside it), and lost onsets whose peak sat a frame off their line --
+12.2% of the model's peaks are more than 10 ms off, against 2.0% for ranked
+charts. Deciding peaks first, on the same samples: onset F1 0.670 -> 0.728,
+pattern KL 0.484 -> 0.183, note count 1.37x -> 1.09x the reference, missed
+strong onsets 0.211 -> 0.163 (ranked 0.152), and repair touches 0.2% of notes
+instead of 5.0%.
 
 On synthetic charts that change snap by the phrase (1/4, 1/6, 1/3 across a
 212 -> 174 BPM change), this put 100% of notes on the exact line they were
@@ -35,6 +47,7 @@ import numpy as np
 from taiko.data.frames import FRAME_MS
 from taiko.data.grid import Grid
 from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
+from taiko.eval.metrics import MIN_HIT_GAP_MS
 from taiko.data.tensor_repr import (
     CH_BIG_DON, CH_BIG_KAT, CH_DON, CH_KAT, tensor_to_beatmap,
 )
@@ -43,8 +56,7 @@ from taiko.data.tensor_repr import (
 # the same onset. Values are multipliers on the onset probability.
 SNAP_PRIOR = {1: 1.0, 2: 1.0, 4: 1.0, 3: 0.9, 6: 0.85, 8: 0.8, 12: 0.7}
 
-# Two hits closer than this are one hit seen on two lines. A frame is 20 ms,
-# and no playable taiko rhythm puts hits closer than ~30 ms.
+# A hit peak this close to a long note belongs to the long note.
 NMS_MS = 25.0
 
 HIT_CHANNELS = ((CH_DON, "don"), (CH_KAT, "kat"), (CH_BIG_DON, "big_don"), (CH_BIG_KAT, "big_kat"))
@@ -77,31 +89,13 @@ def grid_candidates(grid: Grid, end_ms: float, divisors=tuple(SNAP_PRIOR)) -> li
     return out
 
 
-def _evidence(channel: np.ndarray, t_ms: np.ndarray, slack: float = 0.05) -> np.ndarray:
-    """
-    Onset probability available to a position: the frame a note at that time
-    would have been written to, round(t / 20). Only that frame -- reading
-    neighbours too lets one onset be claimed by grid lines 30 ms apart. A
-    position within `slack` frames of a frame boundary reads both frames,
-    since rounding could have sent it either way.
-    """
-    f = t_ms / FRAME_MS
-    n = len(channel)
-    near = np.clip(np.round(f).astype(int), 0, n - 1)
-    best = channel[near].astype(np.float64)
-    frac = f - np.floor(f)
-    edge = np.abs(frac - 0.5) < slack
-    other = np.clip(np.where(near > f, near - 1, near + 1), 0, n - 1)
-    best[edge] = np.maximum(best[edge], channel[other[edge]])
-    return best
-
-
 def decode_on_grid(
     chart: np.ndarray,
     timing_points: list[TimingPoint],
     threshold: float = 0.5,
     divisors=tuple(SNAP_PRIOR),
     family_switch: float | None = None,
+    hit_threshold: float | None = None,
     **meta,
 ) -> TaikoBeatmap:
     """
@@ -110,6 +104,10 @@ def decode_on_grid(
     Long notes come from the same region decoding as tensor_to_beatmap, with
     their ends moved to the nearest grid line. `meta` is passed through to
     tensor_to_beatmap for title, version and so on.
+
+    `hit_threshold` gates hits only (default: `threshold`, which also finds
+    the long notes), so density can be tuned without growing or shrinking
+    rolls.
     """
     grid = Grid(timing_points)
     first = grid.sections[0]
@@ -127,32 +125,108 @@ def decode_on_grid(
         bm.compute_stats()
         return bm
     t = np.array([c.time_ms for c in cands])
-    prior = np.array([SNAP_PRIOR.get(c.divisor, 0.7) for c in cands])
-
-    probs = np.stack([_evidence(chart[ch], t) for ch, _ in HIT_CHANNELS])     # [4, N]
-    best_ch = probs.argmax(axis=0)
-    p = probs.max(axis=0)
     div = np.array([c.divisor for c in cands])
-    live = np.flatnonzero((p > threshold)
-                          & ~np.array([any(n.time - NMS_MS < x < n.end_time + NMS_MS
-                                           for n in longs) for x in t]))
-
-    # Candidates within NMS_MS of each other are one onset seen on several
-    # lines. Group them, then choose one line per onset for the whole song at
-    # once, so neighbouring notes can vote.
-    clusters: list[list[int]] = []
-    for i in live:
-        if clusters and t[i] - t[clusters[-1][0]] < NMS_MS:
-            clusters[-1].append(int(i))
-        else:
-            clusters.append([int(i)])
-    chosen = _viterbi(clusters, t, p, div, grid, family_switch)
-
-    hits = [TaikoNote(time=int(round(t[i])), note_type=HIT_CHANNELS[best_ch[i]][1])
-            for i in chosen]
+    thr = threshold if hit_threshold is None else hit_threshold
+    hits = _decode_peaks(chart, t, div, grid, thr, longs, family_switch)
     bm.notes = sorted(longs + hits, key=lambda n: (n.time, 0 if n.is_long else 1))
     bm.compute_stats()
     return bm
+
+
+
+# How far a peak may sit from the line it is assigned to. The model's peaks
+# land more than 10 ms off their line 12.2% of the time (ranked charts: 2.0%);
+# a line that reads only its own frame sees the tail of such an onset rather
+# than its peak, and the onset is lost.
+PEAK_REACH_MS = 1.5 * FRAME_MS
+# A line whose own frame is the peak's competes on the snap prior alone, as in
+# line-first decoding; a line one frame over is a fallback at this weight. A
+# distance-weighted claim instead handed 1/3 notes to a 1/8 line 3 ms from
+# their frame (94.8% exact on the mixed-snap test, against >99%). Swept on the
+# mixed-snap test: exact up to 0.7, 97.8% at 0.85, 66.7% at 1.0. Hard-map F1
+# rises over the same sweep (0.722 -> 0.758), but only because the eval's
+# reference notes sit on 20 ms frames, so a note pulled onto the wrong line
+# toward its frame matches them better -- each peak emits one note whatever
+# the weight, so the weight changes placement and nothing else.
+NEIGHBOUR_WEIGHT = 0.7
+
+
+def _decode_peaks(chart, t, div, grid, thr, longs, family_switch) -> list[TaikoNote]:
+    """
+    One note per onset peak, placed on the line the peak most plausibly means.
+
+    Line-first decoding asked every grid line for the probability at its own
+    frame. An onset spread over two or three frames then lit several lines, and
+    an onset whose peak sat a frame off its line lit none. Here the peaks are
+    found first -- one per onset, like the frame decoder -- and each becomes a
+    cluster of the lines within PEAK_REACH_MS, weighted by distance. The
+    Viterbi picks the line, so neighbouring notes still vote on snap family.
+    """
+    ch = [c for c, _ in HIT_CHANNELS]
+    env = chart[ch].max(axis=0).astype(np.float64)
+    prev = np.concatenate([[-np.inf], env[:-1]])
+    nxt = np.concatenate([env[1:], [-np.inf]])
+    peaks = np.flatnonzero((env > prev) & (env >= nxt) & (env > thr))
+    peak_ms = peaks * FRAME_MS
+    peaks = [k for k, x in zip(peaks, peak_ms)
+             if not any(n.time - NMS_MS < x < n.end_time + NMS_MS for n in longs)]
+
+    pt, pp, pd, pc, clusters = [], [], [], [], []
+    for k in peaks:
+        x = k * FRAME_MS
+        lo, hi = np.searchsorted(t, x - PEAK_REACH_MS), np.searchsorted(t, x + PEAK_REACH_MS, "right")
+        idx = range(lo, hi) if hi > lo else [int(np.argmin(np.abs(t - x)))]
+        members = []
+        for i in idx:
+            members.append(len(pt))
+            pt.append(t[i]); pd.append(div[i]); pc.append(int(chart[ch, k].argmax()))
+            f = t[i] / FRAME_MS
+            own = int(np.round(f)) == k or (abs(f - np.floor(f) - 0.5) < 0.05
+                                             and k in (int(np.floor(f)), int(np.ceil(f))))
+            pp.append(env[k] * (1.0 if own else NEIGHBOUR_WEIGHT))
+        clusters.append(members)
+    if not clusters:
+        return []
+    pt, pp, pd = np.array(pt), np.array(pp), np.array(pd)
+    chosen = _viterbi(clusters, pt, pp, pd, grid, family_switch)
+    return [TaikoNote(time=int(round(pt[i])), note_type=HIT_CHANNELS[pc[i]][1]) for i in chosen]
+
+
+def realised_nps(bm: TaikoBeatmap) -> float:
+    """Hits per second over the span they cover -- the measure avg_nps is packed with."""
+    hits = sorted(n.time for n in bm.notes if not n.is_long)
+    span = (hits[-1] - hits[0]) / 1000.0 if len(hits) > 1 else 0.0
+    return len(hits) / span if span > 0 else 0.0
+
+
+def calibrate_threshold(chart: np.ndarray, timing_points: list[TimingPoint], target_nps: float,
+                        lo: float = 0.5, hi: float = 0.99, iters: int = 10,
+                        **decode_kwargs) -> tuple[float, float]:
+    """
+    Hit threshold whose decode lands on `target_nps`, by bisection.
+
+    The model's density tracks the requested NPS only loosely -- measured at
+    1.89x the reference on oni maps and 0.67x of a 7.5* request by hand -- but
+    the ranking of candidates inside a chart is what it is good at. Moving the
+    threshold keeps that ranking and fixes only how many are kept. [lo, hi]
+    bounds how far it may go from the autoencoder's own threshold, so a target
+    the probabilities cannot honestly support stops at the bound rather than
+    admitting noise. Returns (threshold, realised nps).
+    """
+    # Density moves in steps (a threshold either passes a candidate or not), so
+    # the bisection's last midpoint can sit on the far side of the step nearest
+    # the target. Every threshold tried is kept and the closest one returned.
+    best: tuple[float, float] | None = None
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        got = realised_nps(decode_on_grid(chart, timing_points, hit_threshold=mid, **decode_kwargs))
+        if best is None or abs(got - target_nps) < abs(best[1] - target_nps):
+            best = (mid, got)
+        if got > target_nps:
+            lo = mid
+        else:
+            hi = mid
+    return best
 
 
 BINARY = {4, 8}
@@ -163,6 +237,14 @@ TERNARY = {3, 6, 12}
 # penalty drags a new phrase's first note onto the old family. Kept as a knob
 # for A/B on real model output, whose frames are noisier than these.
 FAMILY_SWITCH = 0.0
+
+# Log-penalty for picking two lines closer than a hand can re-strike. Two
+# peaks two frames apart can each reach a line within PEAK_REACH_MS, and
+# choosing freely the Viterbi would put them on lines 22.7 ms apart at 220 BPM
+# (the 1/4 and 1/3 lines after a beat) and leave repair to guess which to drop.
+# Large enough that a collision is only taken when no other pair of lines
+# exists, so repair still sees those.
+COLLISION = 50.0
 
 
 def _family(d: int) -> int:
@@ -180,7 +262,8 @@ def _viterbi(clusters: list[list[int]], t: np.ndarray, p: np.ndarray, div: np.nd
     note followed by a 1/6 note. Real charts do switch between 1/4 and 1/6,
     but by the phrase, not note by note; a frame that is ambiguous between
     the two lines is almost always continuing whatever its neighbours are
-    doing. Neutral positions (1/1, 1/2) switch for free.
+    doing. Neutral positions (1/1, 1/2) switch for free. Two picks closer
+    than MIN_HIT_GAP_MS cost COLLISION.
     """
     if not clusters:
         return []
@@ -205,6 +288,8 @@ def _viterbi(clusters: list[list[int]], t: np.ndarray, p: np.ndarray, div: np.nd
                 fa = fam[i]
                 close = (t[b] - t[a]) < beat
                 pen = switch if (close and fa and fb and fa != fb) else 0.0
+                if t[b] - t[a] < MIN_HIT_GAP_MS:
+                    pen += COLLISION
                 s = score[i] - pen
                 if s > best:
                     best, arg, arg_fam = s, i, (fb or fa if close else fb)

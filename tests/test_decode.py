@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 
-from taiko.data.decode import decode_on_grid
+from taiko.data.decode import calibrate_threshold, decode_on_grid, realised_nps
 from taiko.data.grid import Grid
 from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
 from taiko.data.repair import repair
@@ -120,3 +120,51 @@ def test_repair_fixes_every_violation_type_and_counts_them():
     assert rep.dropped_too_fast == 1 and rep.shrunk_big_notes == 1
     assert rep.dropped_in_longs >= 1 and rep.trimmed_longs == 1 and rep.dropped_zero_longs == 1
     assert [n.time for n in bm.notes if n.note_type == "don"][0] == 1000   # the on-beat one kept
+
+
+def _graded_chart(frames: int = 3000) -> np.ndarray:
+    """Don evidence on every 1/4 of 150 BPM, confidence falling off the beat."""
+    chart = np.zeros((6, frames), dtype=np.float32)
+    beat = 400.0
+    k = 0
+    while (t := 200 + k * beat / 4) < frames * 20 - 40:
+        chart[0, int(round(t / 20))] = (0.97, 0.7, 0.85, 0.6)[k % 4]
+        k += 1
+    return chart
+
+
+def test_calibration_hits_the_requested_density_and_keeps_the_strongest():
+    points = [TimingPoint(time=200, beat_length=400.0, meter=4, uninherited=True)]
+    chart = _graded_chart()
+    full = realised_nps(decode_on_grid(chart, points, hit_threshold=0.5))
+    for target in (full * 0.5, full * 0.25):
+        th, got = calibrate_threshold(chart, points, target, lo=0.5, hi=0.99)
+        assert abs(got - target) / target < 0.05, (target, got, th)
+    # Half the density keeps the two strongest positions of each beat, not a random half.
+    th, _ = calibrate_threshold(chart, points, full * 0.5, lo=0.5, hi=0.99)
+    kept = {(n.time - 200) % 400 for n in decode_on_grid(chart, points, hit_threshold=th).notes}
+    assert kept == {0, 200}, kept
+    # A target the probabilities cannot support stops at the bound instead of admitting noise.
+    th, got = calibrate_threshold(chart, points, full * 3, lo=0.5, hi=0.99)
+    assert abs(got - full) < 1e-6, (th, got)
+
+
+def test_a_smeared_onset_is_not_decoded_as_two_hits_too_close_to_play():
+    # 220 BPM: the 1/6, 1/4 and 1/3 lines after the downbeat sit 22.7 ms apart,
+    # at frames 2, 3 and 4.5. Evidence on frames 2-4 is one onset seen three
+    # times; it clusters as [1/6, 1/4] and [1/3].
+    beat = 60_000.0 / 220
+    points = [TimingPoint(time=0, beat_length=beat, meter=4, uninherited=True)]
+    chart = np.zeros((6, 100), dtype=np.float32)
+    chart[0, 2:5] = 0.95
+    hits = sorted(n.time for n in decode_on_grid(chart, points, threshold=0.9).notes)
+    gaps = np.diff(hits)
+    assert len(hits) and (gaps >= 30).all(), hits
+
+
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            fn()
+            print(f"  {name}  ok")
+    print("all decode tests passed")

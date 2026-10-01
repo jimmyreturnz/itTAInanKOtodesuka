@@ -44,7 +44,7 @@ from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
     style_to_int,
 )
-from taiko.data.decode import decode_on_grid
+from taiko.data.decode import calibrate_threshold, decode_on_grid
 from taiko.data.frames import describe, frames_to_sec
 from taiko.data.grid import Grid
 from taiko.data.motif import (
@@ -238,6 +238,12 @@ def main() -> int:
                          "in streams, overlapping or empty long notes)")
     ap.add_argument("--no-refine", action="store_true",
                     help="skip the post-generation grid snap")
+    ap.add_argument("--density-lock", action="store_true",
+                    help="move the hit threshold until the chart's NPS matches the "
+                         "requested density (--avg-nps, or the typical one for "
+                         "--difficulty). Measured on held-out maps: density error "
+                         "8.3%% -> 6.1%%, onset F1 -0.009, so it is for when the chart "
+                         "comes out clearly denser or sparser than asked")
     ap.add_argument("--quiet-gate", action="store_true",
                     help="drop isolated notes in the song's quietest passages "
                          "that have no attack under them (streams are kept)")
@@ -337,6 +343,12 @@ def main() -> int:
     if args.decode == "grid":
         # Every note on a legal subdivision of its own section's tempo.
         bm = decode_on_grid(chart, points, threshold=threshold, meter=args.meter, **meta)
+        if args.density_lock and avg_nps:
+            hit_th, got = calibrate_threshold(chart, points, avg_nps, threshold=threshold)
+            print(f"\nDensity lock: hit threshold {threshold} -> {hit_th:.3f}, "
+                  f"{got:.2f} nps for {avg_nps:.2f} requested")
+            bm = decode_on_grid(chart, points, threshold=threshold, hit_threshold=hit_th,
+                                meter=args.meter, **meta)
     else:
         bm = tensor_to_beatmap(
             chart, bpm=grid.sections[0].bpm, offset_ms=grid.sections[0].offset_ms,
