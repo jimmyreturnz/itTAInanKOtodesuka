@@ -217,6 +217,16 @@ NAMES = {
 STRENGTH_DIVISORS = (1, 2, 3, 4, 6, 8, 12, 16)
 
 
+def level_for_sr(sr: float) -> str:
+    """For a custom name: the level whose ranked SR band holds `sr`, split
+    halfway between neighbouring levels' medians (1.80, 2.74, 3.71, 4.80)."""
+    levels = [k for k in NAMES if NAMES[k][0] == k]          # the five criteria levels
+    for lo, hi in zip(levels, levels[1:]):
+        if sr < (NAMES[lo][1] + NAMES[hi][1]) / 2:
+            return lo
+    return levels[-1]
+
+
 def _strength(n: TaikoNote, grid) -> int:
     """Metrical weight as a divisor: 1 on the beat, 2 on the half, ... lower is stronger."""
     sec = grid.section_at(float(n.time))

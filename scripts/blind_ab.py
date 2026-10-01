@@ -59,6 +59,7 @@ from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
 from taiko.data.repair import repair
 from taiko.data.shards import ShardReader, decode_timing_points
 from taiko.data.tensor_repr import build_timing_stream
+from taiko.eval.criteria import enforce, level_for_sr, level_of
 from taiko.model.sampling import generate_song
 
 ROOT = Path("outputs/blind_ab")
@@ -128,7 +129,11 @@ def ai_chart(model, threshold, window, reader, idx, rec, points, device, seed) -
     )[0].cpu().numpy()
     chart = decode_on_grid(probs, points, threshold=threshold)
     repair(chart, Grid(points))
-    return chart.notes
+    # As generate.py --level ships it: the ranked map's level, or for a
+    # custom name the level its SR sits in.
+    level = level_of(rec.get("version", "")) or level_for_sr(float(rec.get("difficulty", 5.0)))
+    notes, _ = enforce(chart.notes, Grid(points), level)
+    return notes
 
 
 def neutral(ranked: TaikoBeatmap, notes: list, title: str, version: str, audio: str) -> TaikoBeatmap:
