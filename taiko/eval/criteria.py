@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from taiko.data.osu_parser import TaikoNote
 
@@ -195,3 +195,165 @@ def check(notes: list[TaikoNote], grid, level: str) -> Counter:
             if gap < spec.spinner_gap * (1 - SLACK):
                 out[f"guideline: spinner closer than 1/{round(1 / spec.spinner_gap)} to the note before"] += 1
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Enforcing the rules on a generated chart
+# --------------------------------------------------------------------------- #
+
+# A difficulty name a user can ask for: (criteria level, star rating, OD, HP).
+# SR is the median of the ranked maps carrying that name (11106 maps); OD and
+# HP the median of 250 of them -- which sit on the wiki's bounds. Ura and Hell
+# Oni are above the criteria's last level, so they are checked as Inner Oni.
+NAMES = {
+    "Kantan":     ("Kantan", 1.36, 3.0, 8.0),
+    "Futsuu":     ("Futsuu", 2.25, 4.0, 7.0),
+    "Muzukashii": ("Muzukashii", 3.23, 5.0, 6.0),
+    "Oni":        ("Oni", 4.19, 5.5, 5.5),
+    "Inner Oni":  ("Inner Oni", 5.41, 6.0, 6.0),
+    "Ura Oni":    ("Inner Oni", 5.95, 6.5, 5.5),
+    "Hell Oni":   ("Inner Oni", 6.90, 7.0, 5.6),
+}
+STRENGTH_DIVISORS = (1, 2, 3, 4, 6, 8, 12, 16)
+
+
+def _strength(n: TaikoNote, grid) -> int:
+    """Metrical weight as a divisor: 1 on the beat, 2 on the half, ... lower is stronger."""
+    sec = grid.section_at(float(n.time))
+    return next((d for d in STRENGTH_DIVISORS if sec.distance_ms(float(n.time), d) <= 2.0), 99)
+
+
+def _small(n: TaikoNote) -> TaikoNote:
+    return replace(n, note_type=n.note_type.replace("big_", ""))
+
+
+def enforce(notes: list[TaikoNote], grid, level: str,
+            guidelines: bool = True) -> tuple[list[TaikoNote], Counter]:
+    """
+    Make a chart obey `level`'s rules, and its pattern guidelines unless
+    `guidelines` is False, and count each fix. The rest-moment guidelines are
+    never enforced: ranked maps break them 10-32% of the time, and forcing a
+    rest deletes a phrase. Every other guideline here ranked maps follow
+    90-99% of the time -- and after the rules were enforced, these were the
+    gap left: Muzukashii 1/4 colour changes 53% against ranked 4.7%, Oni 1/8
+    triples 38% against 5.6%.
+
+    There are no probabilities left at this point, so every choice goes by
+    metre: of two notes too close together, or the note that splits a run
+    that is too long, the one on the weaker beat goes; a pattern that must
+    be one colour takes the colour of its strongest note. ponytail: metre
+    is a proxy for what the model was surest of; carrying the decoder's
+    peak heights through would choose better.
+    """
+    spec = SPEC[level]
+    fixes: Counter = Counter()
+    out = sorted(notes, key=lambda n: n.time)
+
+    def gap(a: TaikoNote, b: TaikoNote) -> float:
+        return (b.time - a.time) / _beat(grid, b.time)
+
+    # 1. Minimum gap between hits.
+    if spec.min_gap > 0:
+        kept: list[TaikoNote] = []
+        for n in out:
+            prev = kept[-1] if kept else None
+            if (prev is not None and not n.is_long and not prev.is_long
+                    and 0 < gap(prev, n) < spec.min_gap * (1 - SLACK)):
+                fixes["dropped: too close"] += 1
+                if _strength(n, grid) < _strength(prev, grid):
+                    kept[-1] = n
+                continue
+            kept.append(n)
+        out = kept
+
+    # 2. 1/4 runs too long (Muzukashii's rule): drop the weakest note among
+    # the first limit+1, which splits the run there; repeat until none is.
+    for snap, limit, kind in spec.max_notes:
+        if kind != "rule" and not guidelines:
+            continue
+        while True:
+            hits = [n for n in out if not n.is_long]
+            beats = [0.0] + [gap(hits[i - 1], hits[i]) for i in range(1, len(hits))]
+            long_run = next((r for r in _chains(hits, beats, snap) if len(r) > limit), None)
+            if long_run is None:
+                break
+            window = long_run[1:limit + 1]
+            victim = max(window, key=lambda i: (_strength(hits[i], grid), i))
+            out = [n for n in out if n is not hits[victim]]
+            fixes[f"dropped: 1/{round(1 / snap)} run over {limit}"] += 1
+
+    # 2b. A spinner needs room after the note before it: that note goes.
+    if guidelines:
+        kept = []
+        for n in out:
+            # A loop: with the note before gone, the one before that can be too close too.
+            while (n.note_type == "denden" and kept and
+                    (n.time - (kept[-1].end_time if kept[-1].is_long else kept[-1].time))
+                    / _beat(grid, n.time) < spec.spinner_gap * (1 - SLACK)):
+                kept.pop()
+                fixes["dropped: too close before a spinner"] += 1
+            kept.append(n)
+        out = kept
+
+    def runs(snap: float) -> tuple[list[TaikoNote], list[list[int]]]:
+        hits = [n for n in out if not n.is_long]
+        beats = [0.0] + [gap(hits[i - 1], hits[i]) for i in range(1, len(hits))]
+        return hits, _chains(hits, beats, snap)
+
+    swap: dict[int, TaikoNote] = {}     # id(original) -> replacement
+
+    def put(n: TaikoNote, new: TaikoNote, why: str) -> None:
+        if new.note_type != n.note_type:
+            swap[id(n)] = new
+            fixes[why] += 1
+
+    # 3. Patterns that must stay plain: one colour, no finishers.
+    for snap, kind in spec.plain:
+        if kind != "rule":
+            continue
+        hits, chains = runs(snap)
+        for run in chains:
+            strongest = min(run, key=lambda i: (_strength(hits[i], grid), i))
+            colour = "kat" if _colour(hits[strongest]) == "k" else "don"
+            for i in run:
+                put(hits[i], replace(hits[i], note_type=colour), "recoloured / unfinished: plain pattern")
+        out = [swap.get(id(n), n) for n in out]
+        swap.clear()
+
+    # 4. Finishers in patterns too fast for them.
+    if spec.finisher_free is not None:
+        hits, chains = runs(spec.finisher_free)
+        for run in chains:
+            for i in run:
+                if _is_big(hits[i]):
+                    put(hits[i], _small(hits[i]), "unfinished: fast pattern")
+        out = [swap.get(id(n), n) for n in out]
+        swap.clear()
+    if level == "Oni":
+        hits, chains = runs(1 / 4)
+        for run in chains:
+            for k, i in enumerate(run):
+                if _is_big(hits[i]) and (k != len(run) - 1
+                                          or _colour(hits[i]) == _colour(hits[run[k - 1]])):
+                    put(hits[i], _small(hits[i]), "unfinished: 1/4 pattern")
+        out = [swap.get(id(n), n) for n in out]
+        swap.clear()
+
+    # 5. Muzukashii: a 1/4 pattern over 3 notes changes colour once at most,
+    # at its start or end -- recoloured to one colour, its strongest note's.
+    if level == "Muzukashii" and guidelines:
+        hits, chains = runs(1 / 4)
+        for run in chains:
+            if len(run) <= 3:
+                continue
+            cols = [_colour(hits[i]) for i in run]
+            changes = [k for k in range(1, len(cols)) if cols[k] != cols[k - 1]]
+            if len(changes) > 1 or (changes and changes[0] not in (1, len(cols) - 1)):
+                strongest = min(run, key=lambda i: (_strength(hits[i], grid), i))
+                colour = _colour(hits[strongest])
+                for i in run:
+                    if _colour(hits[i]) != colour:
+                        new = hits[i].note_type.replace("kat", "don") if colour == "d"                             else hits[i].note_type.replace("don", "kat")
+                        put(hits[i], replace(hits[i], note_type=new), "recoloured: 1/4 pattern")
+        out = [swap.get(id(n), n) for n in out]
+    return out, fixes

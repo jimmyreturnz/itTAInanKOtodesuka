@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from taiko.data.grid import Grid
 from taiko.data.osu_parser import TaikoNote, TimingPoint
-from taiko.eval.criteria import check, level_of
+from taiko.eval.criteria import LEVELS, check, enforce, level_of
 
 
 def _grid(bpm: float) -> Grid:
@@ -55,6 +55,29 @@ def test_level_of_reads_custom_names():
     assert level_of("Hell Oni") == "Inner Oni"
     assert level_of("Ono's Taiko Muzukashii") == "Muzukashii"
     assert level_of("Chocolate from Rinami") is None
+
+
+def test_enforce_recolours_a_kantan_1_2_by_its_stronger_note():
+    half = 60_000 / 180 / 2
+    out, fixes = enforce(_notes([0, half], ["kat", "don"]), _grid(180), "Kantan")
+    assert [n.note_type for n in out] == ["kat", "kat"], out     # the downbeat's colour wins
+    assert not check(out, _grid(180), "Kantan")
+
+
+def test_enforce_leaves_no_rule_broken_on_random_dense_charts():
+    import random
+    rng = random.Random(0)
+    kinds = ["don", "kat", "big_don", "big_kat"]
+    for bpm in (95, 150, 180, 230):
+        step = 60_000 / bpm / 8
+        for _ in range(20):
+            times = sorted({round(rng.randrange(400) * step) for _ in range(250)})
+            notes = _notes(times, [rng.choice(kinds) for _ in times])
+            for level in LEVELS:
+                out, _ = enforce(notes, _grid(bpm), level)
+                broken = [k for k in check(out, _grid(bpm), level)
+                          if k.startswith("rule") or "pattern" in k or "spinner" in k]
+                assert not broken, (bpm, level, broken)
 
 
 if __name__ == "__main__":

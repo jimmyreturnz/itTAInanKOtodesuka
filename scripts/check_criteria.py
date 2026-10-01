@@ -31,7 +31,7 @@ from taiko.data.grid import Grid
 from taiko.data.osu_parser import OsuTaikoParser
 from taiko.data.repair import repair
 from taiko.data.shards import ShardReader, decode_timing_points
-from taiko.eval.criteria import LEVELS, check, level_of
+from taiko.eval.criteria import LEVELS, check, enforce, level_of
 
 BPM_BANDS = ((0, 150, "<150"), (150, 200, "150-200"), (200, 999, "200+"))
 
@@ -61,6 +61,8 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=None,
                     help="hit threshold for decoding cached samples (default: the autoencoder's)")
     ap.add_argument("--by-bpm", action="store_true", help="split the ranked table by BPM band")
+    ap.add_argument("--enforce", action="store_true",
+                    help="run criteria.enforce on the model's charts first, as generate.py --level does")
     args = ap.parse_args()
 
     reader = ShardReader(args.shards)
@@ -110,6 +112,7 @@ def main() -> int:
                                               Path("checkpoints/autoencoder/best.pt"),
                                               torch.device("cpu"), True)
         ai, same_ranked = defaultdict(list), defaultdict(list)
+        fixes, before, after = Counter(), 0, 0
         for f in sorted(args.probs_cache.glob("*.npy")):
             idx = int(f.stem.split("_")[1])
             rec = reader.records[idx]
@@ -119,10 +122,20 @@ def main() -> int:
             points = decode_timing_points(rec["timing_points"])
             chart = decode_on_grid(np.load(f), points, threshold=args.threshold)
             repair(chart, Grid(points))
-            ai[level].append(check(chart.notes, Grid(points), level))
+            notes = chart.notes
+            if args.enforce:
+                before += len(notes)
+                notes, f = enforce(notes, Grid(points), level)
+                fixes.update(f)
+                after += len(notes)
+            ai[level].append(check(notes, Grid(points), level))
             if idx in ranked_by_idx:
                 same_ranked[level].append(ranked_by_idx[idx])
-        table(f"the model's charts ({args.probs_cache}, every seed)", ai)
+        table(f"the model's charts ({args.probs_cache}, every seed)"
+              + (", after criteria.enforce" if args.enforce else ""), ai)
+        if args.enforce:
+            print(f"  enforce kept {after}/{before} notes ({1 - after / max(before, 1):.1%} dropped); "
+                  f"fixes: {dict(fixes.most_common())}")
         table("the ranked maps of those same songs", same_ranked)
     return 0
 

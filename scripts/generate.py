@@ -54,6 +54,7 @@ from taiko.data.motif import (
 from taiko.data.nps_prior import load_prior, lookup
 from taiko.data.osu_parser import OsuTaikoParser, TimingPoint
 from taiko.data.osu_writer import OsuTaikoSerializer
+from taiko.eval.criteria import NAMES, check, enforce
 from taiko.data.repair import repair
 from taiko.data.tensor_repr import (
     beatmap_to_tensors, build_timing_stream, red_lines, tensor_to_beatmap,
@@ -190,7 +191,12 @@ def main() -> int:
     ap.add_argument("--ae", type=Path, default=Path("checkpoints/autoencoder/best.pt"))
     ap.add_argument("--out", type=Path, default=Path("outputs"))
 
-    ap.add_argument("--difficulty", type=float, default=5.0, help="target star rating")
+    ap.add_argument("--difficulty", type=float, default=None,
+                    help="target star rating (default: --level's ranked median, else 5.0)")
+    ap.add_argument("--level", default=None, choices=list(NAMES),
+                    help="a taiko difficulty name: the chart is made to obey that level's "
+                         "ranking criteria (rules and pattern guidelines), named after it, and "
+                         "given its ranked median SR, OD and HP unless --difficulty is set")
     ap.add_argument("--style", default=None,
                     choices=["standard", "stream", "speed", "tech"])
     ap.add_argument("--preset", default=None, choices=sorted(PRESETS),
@@ -248,6 +254,8 @@ def main() -> int:
                     help="drop isolated notes in the song's quietest passages "
                          "that have no attack under them (streams are kept)")
     args = ap.parse_args()
+    if args.difficulty is None:
+        args.difficulty = NAMES[args.level][1] if args.level else 5.0
 
     print(describe())
 
@@ -334,11 +342,12 @@ def main() -> int:
 
     # ---- decode -------------------------------------------------------- #
     style_label = args.preset or args.style or "AI"
+    version = args.level or f"{style_label.capitalize()} {args.difficulty:.1f}"
     meta = dict(
         title=args.audio.stem, artist="",
-        version=f"{style_label.capitalize()} {args.difficulty:.1f}",
+        version=version,
         audio_filename=args.audio.name,
-        overall_difficulty=min(10.0, args.difficulty),
+        overall_difficulty=NAMES[args.level][2] if args.level else min(10.0, args.difficulty),
     )
     if args.decode == "grid":
         # Every note on a legal subdivision of its own section's tempo.
@@ -361,6 +370,19 @@ def main() -> int:
     if not args.no_repair and bm.notes:
         fixes = repair(bm, grid)
         print(f"\nPlayability repair: {fixes.summary()}")
+
+    if args.level and bm.notes:
+        # After repair, which can change note types. The quiet gate below only
+        # drops notes, and dropping one cannot break a criterion.
+        bm.notes, fixes = enforce(bm.notes, grid, NAMES[args.level][0])
+        bm.hp_drain = NAMES[args.level][3]
+        bm.compute_stats()
+        print(f"\nRanking criteria ({args.level}): "
+              + (", ".join(f"{v} {k}" for k, v in fixes.most_common()) or "nothing to fix"))
+        left = [k for k in check(bm.notes, grid, NAMES[args.level][0])
+                if not k.startswith("guideline: no rest")]
+        if left:
+            print(f"  still breaks: {left}")
 
     if args.quiet_gate and bm.notes:
         kept, dropped = gate_notes(bm.notes, act, grid)
@@ -389,7 +411,7 @@ def main() -> int:
     # ---- package -------------------------------------------------------- #
     args.out.mkdir(parents=True, exist_ok=True)
     safe = "".join(c for c in args.audio.stem if c.isalnum() or c in " -_")[:40].strip()
-    name = f"{safe} [{style_label.capitalize()} {args.difficulty:.1f}]"
+    name = f"{safe} [{version}]"
     osz_path = args.out / f"{name}.osz"
 
     with zipfile.ZipFile(osz_path, "w", zipfile.ZIP_DEFLATED) as archive:
