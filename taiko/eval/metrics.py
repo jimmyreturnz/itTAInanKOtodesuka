@@ -97,26 +97,19 @@ class OnsetScore:
     mean_abs_error_ms: float
 
 
-def onset_f1(
-    generated: list[TaikoNote],
-    reference: list[TaikoNote],
-    tolerance_ms: float = 25.0,
-) -> OnsetScore:
+def match_onsets(gen_times: np.ndarray, ref_times: np.ndarray,
+                 tolerance_ms: float) -> list[tuple[float, int, int]]:
     """
-    Precision/recall/F1 of generated note *times* against reference times.
+    Greedy one-to-one pairs (|diff|, gen index, ref index), both inputs sorted.
 
-    Matching is greedy one-to-one: every candidate (generated, reference)
-    pair within tolerance is considered, closest pairs are consumed first,
-    and each note on either side can be used at most once. Without the
-    one-to-one constraint, several generated notes clustered near a single
-    reference note would each count as a hit and double (or triple, or
-    more) the apparent recall -- exactly the failure mode this metric
-    exists to catch, so it cannot be allowed to hide it.
+    Every candidate pair within tolerance is considered, closest pairs are
+    consumed first, and each note on either side can be used at most once.
+    Without the one-to-one constraint, several generated notes clustered near a
+    single reference note would each count as a hit and double (or triple, or
+    more) the apparent recall -- exactly the failure mode the onset metrics
+    exist to catch, so it cannot be allowed to hide it.
     """
-    gen_times = np.asarray(sorted(n.time for n in generated), dtype=np.float64)
-    ref_times = np.asarray(sorted(n.time for n in reference), dtype=np.float64)
     n_gen, n_ref = gen_times.size, ref_times.size
-
     candidates: list[tuple[float, int, int]] = []
     if n_gen and n_ref:
         # A reference note can only ever match a generated note within
@@ -128,18 +121,33 @@ def onset_f1(
         for gi in range(n_gen):
             for ri in range(int(lo[gi]), int(hi[gi])):
                 candidates.append((abs(float(gen_times[gi] - ref_times[ri])), gi, ri))
-
     candidates.sort(key=lambda c: c[0])
 
     used_gen = [False] * n_gen
     used_ref = [False] * n_ref
-    matched_diffs: list[float] = []
+    pairs = []
     for diff, gi, ri in candidates:
         if used_gen[gi] or used_ref[ri]:
             continue
-        used_gen[gi] = True
-        used_ref[ri] = True
-        matched_diffs.append(diff)
+        used_gen[gi] = used_ref[ri] = True
+        pairs.append((diff, gi, ri))
+    return pairs
+
+
+def onset_f1(
+    generated: list[TaikoNote],
+    reference: list[TaikoNote],
+    tolerance_ms: float = 25.0,
+) -> OnsetScore:
+    """
+    Precision/recall/F1 of generated note *times* against reference times.
+
+    Matching is greedy one-to-one (match_onsets).
+    """
+    gen_times = np.asarray(sorted(n.time for n in generated), dtype=np.float64)
+    ref_times = np.asarray(sorted(n.time for n in reference), dtype=np.float64)
+    n_gen, n_ref = gen_times.size, ref_times.size
+    matched_diffs = [d for d, _, _ in match_onsets(gen_times, ref_times, tolerance_ms)]
 
     n_matched = len(matched_diffs)
     precision = n_matched / n_gen if n_gen else 0.0
@@ -151,6 +159,63 @@ def onset_f1(
         precision=precision, recall=recall, f1=f1,
         n_generated=n_gen, n_reference=n_ref, n_matched=n_matched,
         mean_abs_error_ms=mean_abs_error_ms,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Exact snap, against the mapper's own milliseconds
+# --------------------------------------------------------------------------- #
+
+# A note is on a line when it is this close to it. osu! truncates a snapped
+# position to whole ms, so a note on its line sits up to 1 ms below it.
+SNAP_TRUTH_MS = 2.0
+EXACT_SNAP_DIVISORS = (1, 2, 3, 4, 6, 8, 12)
+
+
+@dataclass
+class ExactSnapScore:
+    exact: float                              # matched onsets on the mapper's own line
+    n_matched: int
+    n_unsnapped: int                          # reference notes on no line, left out
+    per_divisor: dict[int, tuple[int, int]]   # ref divisor -> (exact, matched)
+
+
+def exact_snap(generated_ms, reference_ms, grid, tolerance_ms: float = 25.0) -> ExactSnapScore:
+    """
+    Of the onsets the model found, the share placed on the mapper's own line.
+
+    Onset F1's 25 ms window cannot tell 1/4, 1/6 and 1/8 apart at speed, and
+    scored against frame-quantised reference notes it rewarded pulling a note
+    onto the wrong line nearer its frame. This scores against the .osu's real
+    milliseconds (note_times.npz), pairs onsets exactly as onset_f1 does, and
+    then asks only whether each pair agrees on the line. Finding the onset at
+    all stays F1's job; this is the rhythm.
+
+    A reference note's divisor is the first of EXACT_SNAP_DIVISORS with a line
+    within SNAP_TRUTH_MS. A reference note on none of them (unsnapped, or 1/5,
+    1/7, 1/16) is left out: there is no line for the model to be on.
+    """
+    gen = np.sort(np.asarray(generated_ms, dtype=np.float64))
+    ref = np.sort(np.asarray(reference_ms, dtype=np.float64))
+    divisor = []
+    for t in ref:
+        sec = grid.section_at(float(t))
+        divisor.append(next((d for d in EXACT_SNAP_DIVISORS
+                             if sec.distance_ms(float(t), d) <= SNAP_TRUTH_MS), None))
+
+    per: dict[int, list[int]] = {d: [0, 0] for d in EXACT_SNAP_DIVISORS}
+    for diff, _, ri in match_onsets(gen, ref, tolerance_ms):
+        d = divisor[ri]
+        if d is None:
+            continue
+        per[d][1] += 1
+        per[d][0] += diff <= SNAP_TRUTH_MS
+    hit = sum(e for e, _ in per.values())
+    matched = sum(m for _, m in per.values())
+    return ExactSnapScore(
+        exact=hit / matched if matched else 0.0, n_matched=matched,
+        n_unsnapped=sum(d is None for d in divisor),
+        per_divisor={d: (e, m) for d, (e, m) in per.items() if m},
     )
 
 

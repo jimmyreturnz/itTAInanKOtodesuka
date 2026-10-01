@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from taiko.data.osu_parser import TaikoBeatmap, TaikoNote, TimingPoint
 from taiko.eval.metrics import (
     ChartReport, NoteStats, OnsetScore, SnapScore, UnplayabilityScore,
-    evaluate_chart, format_report, note_statistics, onset_f1,
+    evaluate_chart, exact_snap, format_report, note_statistics, onset_f1,
     pattern_divergence, snap_validity, unplayability,
 )
 
@@ -350,6 +350,21 @@ def test_format_report_is_a_readable_string():
     for label in ("notes", "snap valid", "unplayable rate", "onset f1", "pattern KL"):
         assert label in text, label
     print("  format_report readable       ok")
+
+
+def test_exact_snap_tells_a_1_6_from_the_mappers_1_4():
+    # 220 BPM: the 1/4 after a beat is 68 ms, the 1/6 is 45 -- 23 ms apart,
+    # inside onset F1's window, so F1 calls the wrong line a hit.
+    from taiko.data.grid import Grid
+    grid = Grid([TimingPoint(time=0, beat_length=60_000 / 220, meter=4, uninherited=True)])
+    ref = [0, 68, 136, 400]          # 1/1, 1/4, 1/2, and 400 on no line
+    gen = [0, 45, 136]               # the 1/4 written as a 1/6
+    s = exact_snap(gen, ref, grid)
+    assert s.n_matched == 3 and s.n_unsnapped == 1, s
+    assert abs(s.exact - 2 / 3) < 1e-9, s
+    assert s.per_divisor == {1: (1, 1), 2: (1, 1), 4: (0, 1)}, s.per_divisor
+    assert exact_snap(ref, ref, grid).exact == 1.0
+    print("  exact_snap: 1/6 is not 1/4   ok")
 
 
 if __name__ == "__main__":

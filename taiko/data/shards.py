@@ -63,7 +63,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 
 import numpy as np
 
@@ -80,6 +80,9 @@ MEL_BINS      = 128
 MEL_FILENAME   = "mels.dat"
 CHART_FILENAME = "charts.npz"
 INDEX_FILENAME = "index.json"
+# The .osu's real hit times, beside the frame-quantised charts: what the eval
+# scores exact snap against. Optional -- training never reads it.
+NOTE_TIMES_FILENAME = "note_times.npz"
 
 SHARD_FORMAT_VERSION = 1
 
@@ -201,6 +204,36 @@ def decode_timing_points(packed: list[list[float]]) -> list[TimingPoint]:
 # --------------------------------------------------------------------------- #
 # Writing
 # --------------------------------------------------------------------------- #
+
+def write_note_times(shard_dir: str | Path, records: Sequence[dict],
+                     times: Sequence[Sequence[int]]) -> Path:
+    """
+    Store each record's hit times (ms), in index order, as one flat int32 array
+    plus offsets. Keyed by position rather than beatmap ID because the index
+    can hold one ID twice (a cut version kept the ranked map's ID), and keyed
+    by ID one record's times silently became the other's.
+    """
+    lengths = np.array([len(t) for t in times], dtype=np.int64)
+    flat = np.concatenate([np.asarray(t, dtype=np.int32) for t in times])         if len(times) else np.zeros(0, dtype=np.int32)
+    path = Path(shard_dir) / NOTE_TIMES_FILENAME
+    np.savez_compressed(path, beatmap_id=np.array([int(r["beatmap_id"]) for r in records]),
+                        offsets=np.concatenate([[0], np.cumsum(lengths)]), times=flat)
+    return path
+
+
+def load_note_times(reader: "ShardReader") -> list[np.ndarray] | None:
+    """Per record, its real hit times (ms); None when the shards have none."""
+    path = reader.dir / NOTE_TIMES_FILENAME
+    if not path.exists():
+        return None
+    data = np.load(path)
+    ids = [int(r["beatmap_id"]) for r in reader.records]
+    if data["beatmap_id"].tolist() != ids:
+        raise ValueError(f"{path} was built for another index; rebuild it "
+                         f"(python scripts/build_note_times.py)")
+    off, flat = data["offsets"], data["times"]
+    return [flat[off[k]:off[k + 1]] for k in range(len(ids))]
+
 
 class ShardWriter:
     """

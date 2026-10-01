@@ -71,10 +71,11 @@ from taiko.data.motif import beat_frames_from_timing, compute_motif
 from taiko.data.osu_parser import TimingPoint
 from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
 from taiko.data.repair import repair
-from taiko.data.shards import ShardReader, decode_timing_points
+from taiko.data.shards import ShardReader, decode_timing_points, load_note_times
 from taiko.data.tensor_repr import build_timing_stream, tensor_to_beatmap
 from taiko.data.timing_refine import apply_timing_refinement
 from taiko.eval.metrics import (
+    EXACT_SNAP_DIVISORS, exact_snap,
     note_statistics, onset_f1, pattern_divergence, snap_validity, unplayability,
 )
 from taiko.model.diffusion import load_diffusion
@@ -187,8 +188,28 @@ def violation_counts(play) -> dict:
             "zero_length_longs": play.zero_length_longs}
 
 
-def score_variants(variants: dict, reference, act, grid: Grid, span) -> dict:
-    """Flat metrics for one generated sample, every variant."""
+def hit_times(bm) -> list[int]:
+    return [n.time for n in bm.notes if not n.is_long]
+
+
+def exact_snap_fields(pre: str, gen_ms, real_ms, grid: Grid, per_divisor: bool) -> dict:
+    """exact_snap as flat row fields. Per-divisor counts stay counts, so their
+    mean over maps divides back to the pooled share."""
+    s = exact_snap(gen_ms, real_ms, grid)
+    row = {f"{pre}exact_snap": s.exact if s.n_matched else float("nan")}
+    if per_divisor:
+        row["unsnapped_share"] = s.n_unsnapped / max(len(real_ms), 1)
+        for d in EXACT_SNAP_DIVISORS:
+            e, m = s.per_divisor.get(d, (0, 0))
+            row[f"xs_hit_{d}"], row[f"xs_n_{d}"] = e, m
+    return row
+
+
+def score_variants(variants: dict, reference, act, grid: Grid, span, real_ms=None) -> dict:
+    """
+    Flat metrics for one generated sample, every variant. `real_ms` is the
+    .osu's own hit times (note_times.npz); without it there is no exact snap.
+    """
     row: dict = {}
     points = reference.timing_points
     for name in VARIANTS:
@@ -199,6 +220,8 @@ def score_variants(variants: dict, reference, act, grid: Grid, span) -> dict:
         row[f"{pre}onset_f1"] = f1.f1
         row[f"{pre}snap_validity"] = snap_validity(bm.notes, points).valid_fraction
         row[f"{pre}unplayability"] = play.rate
+        if real_ms is not None:
+            row.update(exact_snap_fields(pre, hit_times(bm), real_ms, grid, name == SHIPPED))
         for k, v in violation_counts(play).items():
             row[f"{pre}{k}"] = v
         if name == SHIPPED:
@@ -268,6 +291,11 @@ def summarise(rows: list[dict]) -> dict:
     return summary
 
 
+def nanmean(vals) -> float:
+    vals = [v for v in vals if v == v]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
 def group(rows: list[dict], key: str, bands) -> dict:
     out = {}
     for lo, hi, label in bands:
@@ -277,6 +305,7 @@ def group(rows: list[dict], key: str, bands) -> dict:
         out[label] = {
             "maps": len(sel),
             "onset_f1": float(np.mean([r["onset_f1"] for r in sel])),
+            "exact_snap": nanmean([r.get("exact_snap", float("nan")) for r in sel]),
             "snap_validity": float(np.mean([r["snap_validity"] for r in sel])),
             "unplayability": float(np.mean([r["unplayability"] for r in sel])),
             "note_ratio": float(np.sum([r["generated_notes"] for r in sel])
@@ -337,6 +366,19 @@ def report(summary: dict, args) -> bool:
               f"snap {summary.get('snap_validity_sd', float('nan')):.4f}  "
               f"unplay {summary.get('unplayability_sd', float('nan')):.4f}")
 
+    if "exact_snap" in summary:
+        print(f"\n  exact snap: matched onsets on the mapper's own line, against the .osu's ms")
+        print(f"  shipped {summary['exact_snap']:.3f}   grid raw {summary['grid_raw_exact_snap']:.3f}   "
+              f"legacy final {summary['legacy_final_exact_snap']:.3f}   "
+              f"ranked map through frames {summary['ref_exact_snap']:.3f}  <- ceiling")
+        cells = []
+        for d in EXACT_SNAP_DIVISORS:
+            n = summary.get(f"xs_n_{d}", 0.0)
+            if n > 0:
+                cells.append(f"1/{d} {summary[f'xs_hit_{d}'] / n:.3f} ({n * summary['n_maps']:.0f})")
+        print("  by the mapper's divisor: " + "   ".join(cells))
+        print(f"  reference notes on no scored line, left out: {summary['unsnapped_share']:.2%}")
+
     print(f"\n  audio agreement           model   ranked map")
     print(f"  {'quiet-section notes':<24s}{summary['quiet_note_rate']:>7.3f}   "
           f"{summary['ref_quiet_note_rate']:>7.3f}   share of notes in the quietest 20%")
@@ -347,9 +389,10 @@ def report(summary: dict, args) -> bool:
               f"(1 = follows the given grid, 0 = ignores it)")
 
     for name, table in summary["groups"].items():
-        print(f"\n  by {name:<18s} maps   F1     snap   unplay  notes  quiet  miss")
+        print(f"\n  by {name:<18s} maps   F1     exact  snap   unplay  notes  quiet  miss")
         for label, g in table.items():
-            print(f"  {label:<21s}{g['maps']:>4d}  {g['onset_f1']:.3f}  {g['snap_validity']:.3f}  "
+            print(f"  {label:<21s}{g['maps']:>4d}  {g['onset_f1']:.3f}  {g['exact_snap']:.3f}  "
+                  f"{g['snap_validity']:.3f}  "
                   f"{g['unplayability']:.4f}  {g['note_ratio']:.2f}   {g['quiet_note_rate']:.2f}   "
                   f"{g['onset_miss_rate']:.2f}")
 
@@ -412,6 +455,10 @@ def main() -> int:
     ap.add_argument("--shards", type=Path, default=Path("data/processed/shards"))
     ap.add_argument("--out", type=Path, default=Path("outputs/evaluation.json"))
     ap.add_argument("--n-maps", type=int, default=40)
+    ap.add_argument("--per-band", type=int, default=None,
+                    help="the fixed benchmark pool: this many held-out maps from each SR "
+                         "band (fewer where a band has fewer), instead of --n-maps at random. "
+                         "The random pool is mostly easy maps, with one 7*+ in 30")
     ap.add_argument("--seeds", type=int, default=1,
                     help="samples per map; metrics are averaged and their spread reported")
     ap.add_argument("--steps", type=int, default=30)
@@ -463,6 +510,9 @@ def main() -> int:
             f"threshold {threshold}, window {window}")
 
     reader = ShardReader(args.shards)
+    note_times = load_note_times(reader)
+    if note_times is None:
+        print("no note_times.npz, so no exact snap (python scripts/build_note_times.py)")
     _, val_idx = split_indices(reader, val_ratio=0.05)
     print(f"Held-out pool: {len(val_idx)} maps")
     if not val_idx:
@@ -474,7 +524,14 @@ def main() -> int:
     print(f"  {len(val_idx)} of them between {args.min_sr}* and {args.max_sr}*")
 
     rng = np.random.default_rng(args.seed)
-    chosen = rng.permutation(val_idx)[:args.n_maps]
+    if args.per_band:
+        chosen = []
+        for lo, hi, label in SR_BANDS:
+            band = [i for i in val_idx if lo <= float(reader.records[i].get("difficulty", 0.0)) < hi]
+            chosen += list(rng.permutation(band)[:args.per_band])
+            print(f"  {label}: {min(len(band), args.per_band)} of {len(band)}")
+    else:
+        chosen = rng.permutation(val_idx)[:args.n_maps]
 
     rows = []
     for n, idx in enumerate(chosen):
@@ -534,12 +591,15 @@ def main() -> int:
 
         act = activity(mel[0].numpy())
         span = (0.0, frames * FRAME_MS)
+        real_ms = None
+        if note_times is not None:
+            real_ms = note_times[idx][note_times[idx] < span[1]]
 
         per_seed = []
         for seed in range(args.seeds):
             probs = sample(timing, seed)
             variants = decode_variants(probs, points, grid, threshold, bpm, offset, meter)
-            scored = score_variants(variants, reference, act, grid, span)
+            scored = score_variants(variants, reference, act, grid, span, real_ms)
             if args.harness:
                 scored.update(harness_rows(probs, points, grid, threshold, requested_nps,
                                            act, reference, span))
@@ -547,6 +607,12 @@ def main() -> int:
         row = average_rows(per_seed)
 
         ref_play = unplayability(reference.notes)
+        if real_ms is not None:
+            # The ceiling: the ranked chart's own frames through the shipped
+            # decoder. `reference` is the legacy frame decode, whose notes sit
+            # on 20 ms frame times rather than lines, so it scores ~0.3.
+            ceiling = decode_on_grid(reference_chart, points, threshold=0.5)
+            row.update(exact_snap_fields("ref_", hit_times(ceiling), real_ms, grid, False))
         ref_act = activity_score(reference.notes, act, grid, span_ms=span)
         ref_stats = note_statistics(reference)
         row.update({
