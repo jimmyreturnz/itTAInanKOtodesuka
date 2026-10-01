@@ -65,10 +65,16 @@ def _blend_weights(length: int, ramp: int, device, dtype) -> torch.Tensor:
     hand over. Tapering means a frame near a boundary is a smooth mixture of
     both neighbours' opinions, which is what makes the overlap invisible rather
     than merely blurry.
+
+    Sampled at half steps, so no frame weighs exactly 0. With linspace(0, 1)
+    the song's first and last latent frame, which only one window covers,
+    got 0 from it: the prediction there was 0/0 clamped to 0, so those
+    frames were never denoised -- the stray notes in the first 320 ms. Two
+    overlapping tapers still sum to exactly 1.
     """
     w = torch.ones(length, device=device, dtype=dtype)
     if ramp > 0:
-        t = torch.linspace(0, 1, ramp, device=device, dtype=dtype)
+        t = (torch.arange(ramp, device=device, dtype=dtype) + 0.5) / ramp
         taper = 0.5 * (1 - torch.cos(torch.pi * t))
         w[:ramp] = taper
         w[-ramp:] = taper.flip(0)
