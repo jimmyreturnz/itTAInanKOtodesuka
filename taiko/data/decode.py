@@ -56,6 +56,18 @@ from taiko.data.tensor_repr import (
 # the same onset. Values are multipliers on the onset probability.
 SNAP_PRIOR = {1: 1.0, 2: 1.0, 4: 1.0, 3: 0.9, 6: 0.85, 8: 0.8, 12: 0.7}
 
+def osu_ms(line_ms: float) -> int:
+    """
+    A grid line's time as osu! stores a note on it: truncated, not rounded.
+    The editor casts the line's exact position to int, so a note on a line
+    sits in (-1, 0] ms of it. Rounding put about half of every generated
+    chart's notes 1 ms above where osu! writes the same snap (97.8% of charts
+    against 40% of ranked maps). The epsilon keeps a line that lands a hair
+    under a whole ms from losing it.
+    """
+    return int(np.floor(line_ms + 1e-6))
+
+
 # A hit peak this close to a long note belongs to the long note.
 NMS_MS = 25.0
 
@@ -69,13 +81,19 @@ class Candidate:
 
 
 def grid_candidates(grid: Grid, end_ms: float, divisors=tuple(SNAP_PRIOR)) -> list[Candidate]:
-    """Every legal position up to `end_ms`, tagged with its coarsest divisor."""
+    """
+    Every legal position from the first red line to `end_ms`, tagged with its
+    coarsest divisor. Nothing before the first red line: a note there has no
+    timing of its own, and a ranking review flags it. The grid used to run
+    back to 0, and 15% of the model's charts put notes there against 3.3% of
+    the ranked maps of the same songs.
+    """
     divisors = sorted(set(divisors))
     L = int(np.lcm.reduce(divisors))
     starts = [s.offset_ms for s in grid.sections] + [end_ms]
     out: list[Candidate] = []
     for i, sec in enumerate(grid.sections):
-        lo = 0.0 if i == 0 else starts[i]
+        lo = starts[i]
         hi = starts[i + 1]
         if hi <= lo:
             continue
@@ -115,8 +133,8 @@ def decode_on_grid(
                            threshold=threshold, timing_points=timing_points, **meta)
     longs = [n for n in bm.notes if n.is_long]
     for n in longs:
-        n.time = int(round(_nearest(grid, n.time, divisors)))
-        n.end_time = max(n.time + int(FRAME_MS), int(round(_nearest(grid, n.end_time, divisors))))
+        n.time = osu_ms(_nearest(grid, n.time, divisors))
+        n.end_time = max(n.time + int(FRAME_MS), osu_ms(_nearest(grid, n.end_time, divisors)))
 
     end_ms = chart.shape[1] * FRAME_MS
     cands = grid_candidates(grid, end_ms, divisors)
@@ -189,7 +207,7 @@ def _decode_peaks(chart, t, div, grid, thr, longs, family_switch) -> list[TaikoN
         return []
     pt, pp, pd = np.array(pt), np.array(pp), np.array(pd)
     chosen = _viterbi(clusters, pt, pp, pd, grid, family_switch)
-    return [TaikoNote(time=int(round(pt[i])), note_type=HIT_CHANNELS[pc[i]][1]) for i in chosen]
+    return [TaikoNote(time=osu_ms(pt[i]), note_type=HIT_CHANNELS[pc[i]][1]) for i in chosen]
 
 
 def realised_nps(bm: TaikoBeatmap) -> float:

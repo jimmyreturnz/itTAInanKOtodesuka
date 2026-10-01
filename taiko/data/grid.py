@@ -43,7 +43,9 @@ class Grid:
         reds = red_lines(list(timing_points))
         if not reds:
             raise ValueError("a grid needs at least one red line")
-        self.sections = [Section(float(tp.time), float(tp.beat_length), max(1, tp.meter))
+        # The exact offset: a red line at 1234.5 ms puts every line under it half a ms later
+        # than its truncated `time` would.
+        self.sections = [Section(float(tp.exact_time), float(tp.beat_length), max(1, tp.meter))
                          for tp in reds]
         self._starts = np.asarray([s.offset_ms for s in self.sections])
 

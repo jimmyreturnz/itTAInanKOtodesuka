@@ -55,6 +55,7 @@ from taiko.data.nps_prior import load_prior, lookup
 from taiko.data.osu_parser import OsuTaikoParser, TimingPoint
 from taiko.data.osu_writer import OsuTaikoSerializer
 from taiko.eval.criteria import NAMES, check, enforce
+from taiko.eval.mapset import Chart, chart_findings, fix_chart
 from taiko.data.repair import repair
 from taiko.data.tensor_repr import (
     beatmap_to_tensors, build_timing_stream, red_lines, tensor_to_beatmap,
@@ -383,6 +384,16 @@ def main() -> int:
                 if k.split(":")[0] in ("problem", "warning") and "rest" not in k]
         if left:
             print(f"  still breaks: {left}")
+
+    if bm.notes:
+        # The beatmapset checks a generator answers for, on the timing it was given.
+        bm.notes, moved = fix_chart(bm.notes, points)
+        if moved:
+            print(f"\nMapset: {', '.join(f'{v} {k}' for k, v in moved.items())}")
+        flagged = [k for k in chart_findings(Chart(bm.version, bm.notes, points))
+                   if k.split(":")[0] in ("problem", "warning")]
+        if flagged:
+            print(f"  ranking checks still flag: {flagged}")
 
     if args.quiet_gate and bm.notes:
         kept, dropped = gate_notes(bm.notes, act, grid)

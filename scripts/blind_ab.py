@@ -59,6 +59,7 @@ from taiko.data.repair import repair
 from taiko.data.shards import ShardReader, decode_timing_points
 from taiko.data.tensor_repr import build_timing_stream
 from taiko.eval.criteria import enforce, level_of
+from taiko.eval.mapset import fix_chart
 from taiko.model.sampling import generate_song
 
 ROOT = Path("outputs/blind_ab")
@@ -74,11 +75,11 @@ def folder_index(scan_cache: Path) -> dict[str, list[Path]]:
     return by_key
 
 
-def never_played(folder: Path, db: dict) -> bool:
-    """Every .osu in the folder is in osu!.db and marked unplayed."""
-    files = list(folder.glob("*.osu"))
-    entries = [db.get(osu_db.file_md5(f)) for f in files]
-    return bool(files) and all(e is not None and e.unplayed for e in entries)
+def never_played(folder: Path, by_folder: dict) -> bool:
+    """Every ranked difficulty osu!.db lists in the folder is unplayed. Unranked
+    ones (rate edits, cut versions) are never read."""
+    entries = [b for b in by_folder.get(folder.name.lower(), []) if b.status == osu_db.RANKED]
+    return bool(entries) and all(b.unplayed for b in entries)
 
 
 def ranked_osu(rec: dict, osus: list[Path], parser: OsuTaikoParser) -> tuple[Path, TaikoBeatmap] | None:
@@ -131,6 +132,7 @@ def ai_chart(model, threshold, window, reader, idx, rec, points, device, seed) -
     # As generate.py --level ships it: the level the ranked map is held to.
     level = level_of(rec.get("version", ""), float(rec.get("difficulty", 5.0)))
     notes, _ = enforce(chart.notes, Grid(points), level)
+    notes, _ = fix_chart(notes, points)
     return notes
 
 
@@ -147,7 +149,9 @@ def make(args) -> int:
     reader = ShardReader(args.shards)
     _, val_idx = split_indices(reader, val_ratio=0.05)
     folders = folder_index(args.scan_cache)
-    db = osu_db.read(args.osu_db)
+    db: dict = {}
+    for b in osu_db.read(args.osu_db).values():
+        db.setdefault(b.folder.lower(), []).append(b)
     rng = random.Random(args.round)
 
     # Every round is 6 songs never used before: once played, a ranked chart is
@@ -180,7 +184,9 @@ def make(args) -> int:
             continue
         osu_path, ranked = found
         audio_src = osu_path.parent / ranked.audio_filename
-        points = decode_timing_points(rec["timing_points"])
+        # The ranked .osu's own timing, as the pack writes it out: the packed
+        # timing is whole ms, and decoding on it put lines up to 1 ms off.
+        points = ranked.timing_points
         print(f"  {n}: {SR_BANDS[slot][2]}  generating ...", flush=True)
         notes = ai_chart(model, threshold, window, reader, idx, rec, points, device, args.round * 1000 + n)
 

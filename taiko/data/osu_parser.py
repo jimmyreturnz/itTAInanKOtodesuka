@@ -49,6 +49,20 @@ class TimingPoint:
     beat_length: float  # ms per beat (positive) or SV multiplier (negative)
     meter: int          # beats per measure
     uninherited: bool   # True = BPM point, False = inherited (SV)
+    effects: int = 0    # bit 0 kiai, bit 3 omit the first barline
+    offset: Optional[float] = None   # the exact, possibly fractional, time; `time` is it truncated
+
+    @property
+    def kiai(self) -> bool:
+        return bool(self.effects & 1)
+
+    @property
+    def omits_barline(self) -> bool:
+        return bool(self.effects & 8)
+
+    @property
+    def exact_time(self) -> float:
+        return self.time if self.offset is None else self.offset
 
     @property
     def bpm(self) -> Optional[float]:
@@ -340,11 +354,12 @@ class OsuTaikoParser:
         if len(parts) < 2:
             return None
         try:
-            time        = int(float(parts[0]))
+            offset      = float(parts[0])
             beat_length = float(parts[1])
             meter       = int(parts[2]) if len(parts) > 2 else 4
             uninherited = bool(int(parts[6])) if len(parts) > 6 else True
-            return TimingPoint(time, beat_length, meter, uninherited)
+            effects     = int(parts[7]) if len(parts) > 7 and parts[7].strip() else 0
+            return TimingPoint(int(offset), beat_length, meter, uninherited, effects, offset)
         except (ValueError, IndexError):
             return None
 

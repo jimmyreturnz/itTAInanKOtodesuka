@@ -26,6 +26,7 @@ NO_ENTRY_SIZE_VERSION = 20191106
 SINGLE_DIFFICULTY_VERSION = 20140609
 TAIKO = 1
 NM, DT, HT = 0, 64, 256
+RANKED = 4                 # osu!.db's ranked-status byte: 4 ranked, 5 approved, 7 loved, ...
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class DbBeatmap:
     folder: str
     osu_file: str
     unplayed: bool
+    status: int = 0
     taiko_stars: dict[int, float] = field(default_factory=dict)   # mods -> SR, NM/DT/HT
 
 
@@ -97,7 +99,8 @@ def read(path: str | Path) -> dict[str, DbBeatmap]:
             reader.skip_string()
         md5 = reader.string()
         osu_file = reader.string()
-        reader.skip(1 + 2 + 2 + 2 + 8)  # ranked status, circles, sliders, spinners, modified
+        status = reader.byte()
+        reader.skip(2 + 2 + 2 + 8)  # circles, sliders, spinners, modified
         reader.skip(16 if version >= SINGLE_DIFFICULTY_VERSION else 4)  # AR CS HP OD
         reader.skip(8)  # slider velocity
         stars: dict[int, float] = {}
@@ -128,7 +131,7 @@ def read(path: str | Path) -> dict[str, DbBeatmap]:
         if version < SINGLE_DIFFICULTY_VERSION:
             reader.skip(2)
         reader.skip(4 + 1)    # last modification, mania scroll speed
-        beatmaps[md5] = DbBeatmap(md5, folder, osu_file, unplayed, stars)
+        beatmaps[md5] = DbBeatmap(md5, folder, osu_file, unplayed, status=status, taiko_stars=stars)
     return beatmaps
 
 
