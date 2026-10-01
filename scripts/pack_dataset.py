@@ -33,7 +33,7 @@ import os
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -101,7 +101,37 @@ def safe_name(text: str, max_len: int = 120) -> str:
     return cleaned[:max_len]
 
 
+def named_audio(osu_path: Path) -> str:
+    """The AudioFilename an .osu names, read from its header."""
+    with open(osu_path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("AudioFilename:"):
+                return line.split(":", 1)[1].strip()
+            if line.startswith("[Metadata]"):
+                break
+    return ""
+
+
 def find_audio(folder: Path) -> Path | None:
+    """
+    The audio the folder's taiko difficulties are timed to: the AudioFilename
+    most of its taiko .osu files name. Taking the first .mp3 instead packed 8
+    songs against a rate-edited copy in the same folder ("audio 0.650x
+    withDT.mp3"), so their charts trained on audio playing at another speed.
+    A vote, not the first .osu, because the first can be the rate edit itself.
+    """
+    votes: Counter[str] = Counter()
+    for osu in folder.glob("*.osu"):
+        try:
+            with open(osu, encoding="utf-8", errors="replace") as handle:
+                head = handle.read(2048)
+        except OSError:
+            continue
+        if "Mode: 1" in head or "Mode:1" in head:
+            votes[named_audio(osu)] += 1
+    for name, _ in votes.most_common():
+        if name and (folder / name).is_file():
+            return folder / name
     for ext in (".mp3", ".ogg", ".wav", ".flac"):
         matches = sorted(folder.glob(f"*{ext}"))
         if matches:
@@ -510,6 +540,7 @@ def main() -> int:
                 continue
 
             mel = np.load(mel_path).astype(np.float32)
+            audio = find_audio(folder)
 
             pending = []
             for osu_path in sorted(by_folder[folder]):
@@ -519,6 +550,11 @@ def main() -> int:
                     skipped["parse error"] += 1
                     continue
 
+                # The folder's mel is one audio file; a difficulty timed to
+                # another (a rate edit sharing the folder) is not this song.
+                if audio is not None and bm.audio_filename.lower() != audio.name.lower():
+                    skipped["names other audio"] += 1
+                    continue
                 if bm.note_count < MIN_NOTES:
                     skipped["too few notes"] += 1
                     continue
