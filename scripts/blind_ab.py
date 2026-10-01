@@ -20,9 +20,9 @@ and green lines, SliderMultiplier, OD and HP, and nothing else: no kiai, no
 custom hitsounds. The AI chart scrolls with the ranked map's SV. Anything one
 chart has and the other cannot is a tell, and a tell is not blind.
 
-Each chart is its own beatmap folder ("... #1 A", "... #1 B"), so song select
-always lists A above B. The star rating osu! shows is a small tell when the
-two charts' SR differ; it cannot be hidden.
+osu! lists a set's difficulties by star rating, not by name, so [A] may be
+listed second -- read the name, not the position. The star rating osu! shows
+is itself a small tell when the two charts' SR differ; it cannot be hidden.
 
 Then fill in ratings.txt in the round folder (A or B per song, and one line
 of why) and run `score`. The key is in key.txt, base64 so a glance does not
@@ -186,17 +186,13 @@ def make(args) -> int:
         notes = ai_chart(model, threshold, window, reader, idx, rec, points, device, args.round * 1000 + n)
 
         ai_is_a = rng.random() < 0.5
+        title = f"Blind AB r{args.round} #{n}"
+        folder = songs_out / title
+        folder.mkdir(parents=True, exist_ok=True)
         audio = "audio" + audio_src.suffix.lower()
+        shutil.copyfile(audio_src, folder / audio)
         for version, chart in (("A", notes if ai_is_a else ranked.notes),
                                ("B", ranked.notes if ai_is_a else notes)):
-            # One folder per chart: osu! lists a set's difficulties by star
-            # rating, so A and B in one set swapped places whenever the AI's
-            # chart rated lower -- which put a wrong answer on the sheet in
-            # both of the first two rounds. Sets are listed by title.
-            title = f"Blind AB r{args.round} #{n} {version}"
-            folder = songs_out / title
-            folder.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(audio_src, folder / audio)
             bm = neutral(ranked, chart, title, version, audio)
             (folder / f"{title} [{version}].osu").write_text(writer.serialize(bm, audio), encoding="utf-8")
         key[n] = {"ai": "A" if ai_is_a else "B", "map": f"{rec.get('title')} [{rec.get('version')}]",
