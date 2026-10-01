@@ -17,9 +17,13 @@ the audio and two difficulties, [A] and [B]: copy the folders into osu!'s
 Songs folder (or pass --songs-dir) and press F5 in song select.
 
 Both charts are written by the same serializer, with the ranked map's red
-lines, SliderMultiplier, OD and HP, and nothing else: no SV, no kiai, no
-custom hitsounds. That changes how the ranked map reads, but anything one
+and green lines, SliderMultiplier, OD and HP, and nothing else: no kiai, no
+custom hitsounds. The AI chart scrolls with the ranked map's SV. Anything one
 chart has and the other cannot is a tell, and a tell is not blind.
+
+osu! lists a set's difficulties by star rating, not by name, so [A] may be
+listed second -- read the name, not the position. The star rating osu! shows
+is itself a small tell when the two charts' SR differ; it cannot be hidden.
 
 Then fill in ratings.txt in the round folder (A or B per song, and one line
 of why) and run `score`. The key is in key.txt, base64 so a glance does not
@@ -54,7 +58,7 @@ from taiko.data.osu_writer import OsuTaikoSerializer
 from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
 from taiko.data.repair import repair
 from taiko.data.shards import ShardReader, decode_timing_points
-from taiko.data.tensor_repr import build_timing_stream, red_lines
+from taiko.data.tensor_repr import build_timing_stream
 from taiko.model.sampling import generate_song
 
 ROOT = Path("outputs/blind_ab")
@@ -132,7 +136,7 @@ def neutral(ranked: TaikoBeatmap, notes: list, title: str, version: str, audio: 
         title=title, artist="Blind A/B", creator="?", version=version, audio_filename=audio,
         hp_drain=ranked.hp_drain, overall_difficulty=ranked.overall_difficulty,
         slider_multiplier=ranked.slider_multiplier, slider_tick_rate=ranked.slider_tick_rate,
-        timing_points=red_lines(ranked.timing_points), notes=sorted(notes, key=lambda n: n.time),
+        timing_points=list(ranked.timing_points), notes=sorted(notes, key=lambda n: n.time),
     )
 
 
