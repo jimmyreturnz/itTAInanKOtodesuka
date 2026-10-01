@@ -87,6 +87,25 @@ def test_enforce_leaves_nothing_to_fix_on_random_dense_charts():
                 assert not left, (bpm, level, left)
 
 
+def test_a_kantan_1_1_run_counts_in_the_songs_own_beat():
+    # Blind round 3: 10 consecutive 1/1 notes at 128 BPM, where the fold
+    # reads a beat as 1.5 and the 7-note limit never applied.
+    beat = 60_000 / 128
+    notes = _notes([i * beat for i in range(10)], ["don"] * 10)
+    assert "warning: 1/1 run over 7 notes in the song's own beat" in check(notes, _grid(128), "Kantan")
+    out, _ = enforce(notes, _grid(128), "Kantan")
+    assert not _fixable(check(out, _grid(128), "Kantan")) and len(out) < 10
+
+
+def test_a_triplet_in_a_futsuu_moves_to_a_straight_line():
+    beat = 60_000 / 176
+    notes = _notes([0, beat, beat + beat * 2 / 3, beat * 3], ["don"] * 4)   # a 2/3-beat gap
+    assert "warning: triplet-only note in a straight low difficulty" in check(notes, _grid(176), "Futsuu")
+    out, fixes = enforce(notes, _grid(176), "Futsuu")
+    assert fixes["moved: triplet onto a 1/4 line"] == 1
+    assert not _fixable(check(out, _grid(176), "Futsuu"))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

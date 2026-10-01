@@ -99,13 +99,24 @@ class Spec:
     spinner_gap: float | None = None                     # minor: beats from the note before a spinner
     od: float | None = None
     hp: tuple[float, float, float, float] | None = None  # by drain: <=1:00, <3:45, <4:45, longer
+    # Measured on ranked maps rather than written in the criteria (blind A/B
+    # round 3 caught both by eye):
+    own_beat_run: int | None = None                      # warning: 1/1 run, in the song's own beat
+    straight: bool = False                               # warning: a note on a triplet-only line
 
 
 SPEC = {
+    # own_beat_run: the fold reads a 128 BPM beat as 192 BPM's, so a Kantan's
+    # 1/1 never counted as one; in the song's own beat 2.3% of 1860 ranked
+    # Kantans run past 7 (Futsuu 31.8%, Muzukashii 27.6%: theirs is normal).
+    # straight: 96.0% of ranked Kantans and 88.2% of Futsuus put no note on a
+    # triplet-only line; the rest are swing songs.
     "Kantan": Spec(min_gap=1 / 2, patterns=((1, 7), (1 / 2, 2)), plain=1 / 2, finisher=1 / 2,
-                   rest=((1, 3.0),), chain=(36, 44), spinner_gap=1 / 2, od=3, hp=(9, 8, 7, 6)),
+                   rest=((1, 3.0),), chain=(36, 44), spinner_gap=1 / 2, od=3, hp=(9, 8, 7, 6),
+                   own_beat_run=7, straight=True),
     "Futsuu": Spec(min_gap=1 / 3, patterns=((1 / 2, 7), (1 / 3, 2)), plain=1 / 3, finisher=1 / 3,
-                   rest=((1, 2.0),), chain=(36, 44), spinner_gap=1 / 2, od=4, hp=(8, 7, 6, 5)),
+                   rest=((1, 2.0),), chain=(36, 44), spinner_gap=1 / 2, od=4, hp=(8, 7, 6, 5),
+                   straight=True),
     "Muzukashii": Spec(min_gap=1 / 6, patterns=((1 / 4, 5), (1 / 6, 4)), finisher=1 / 4,
                        finisher_warn=1 / 3, rest=((1, 1.5), (3, 1.0)), chain=(36, 44),
                        spinner_gap=1 / 2, od=5, hp=(7, 6, 5, 4)),
@@ -133,11 +144,22 @@ def _end(n: TaikoNote) -> int:
     return n.end_time if n.is_long else n.time
 
 
-def _chains(hits: list[TaikoNote], grid, snap: float) -> list[list[int]]:
-    """Runs of hits whose every gap is at most `snap` folded beats."""
+def _own_beat(grid, time_ms: float) -> float:
+    return grid.section_at(float(time_ms)).ms_per_beat
+
+
+def _triplet_only(n: TaikoNote, grid) -> bool:
+    """On a 1/3, 1/6 or 1/12 line and on no 1/16 line."""
+    sec = grid.section_at(float(n.time))
+    return sec.distance_ms(float(n.time), 12) <= 2 and sec.distance_ms(float(n.time), 16) > 2
+
+
+def _chains(hits: list[TaikoNote], grid, snap: float, beat=None) -> list[list[int]]:
+    """Runs of hits whose every gap is at most `snap` beats (folded, unless `beat` says otherwise)."""
+    beat = beat or _beat
     runs, cur = [], [0] if hits else []
     for i in range(1, len(hits)):
-        if hits[i].time - hits[i - 1].time <= snap * _beat(grid, hits[i - 1].time) + EPS_MS:
+        if hits[i].time - hits[i - 1].time <= snap * beat(grid, hits[i - 1].time) + EPS_MS:
             cur.append(i)
         else:
             if len(cur) > 1:
@@ -214,6 +236,15 @@ def check(notes: list[TaikoNote], grid, level: str, drain_ms: float | None = Non
                 out[f"warning: 1/{round(1 / snap)} pattern over {limit} notes"] += 1
             elif len(run) == limit:
                 out[f"minor: 1/{round(1 / snap)} pattern of {limit} notes"] += 1
+
+    if spec.own_beat_run:
+        for run in _chains(hits, grid, 1, beat=_own_beat):
+            if len(run) > spec.own_beat_run:
+                out[f"warning: 1/1 run over {spec.own_beat_run} notes in the song's own beat"] += 1
+    if spec.straight:
+        n_triplet = sum(_triplet_only(n, grid) for n in hits)
+        if n_triplet:
+            out["warning: triplet-only note in a straight low difficulty"] += n_triplet
 
     if spec.plain:
         for run in _chains(hits, grid, spec.plain):
@@ -302,6 +333,20 @@ def enforce(notes: list[TaikoNote], grid, level: str) -> tuple[list[TaikoNote], 
     fixes: Counter = Counter()
     out = sorted(notes, key=lambda n: n.time)
 
+    # Triplet-only notes in a straight low difficulty: onto the nearest 1/4
+    # line, truncated as osu! stores it -- first, so the gap pass below
+    # judges the moved note where it now stands.
+    if spec.straight:
+        moved = []
+        for n in out:
+            if not n.is_long and _triplet_only(n, grid):
+                sec = grid.section_at(float(n.time))
+                t = int(sec.nearest(float(n.time), 4) + 1e-6)
+                n = replace(n, time=t, end_time=t)
+                fixes["moved: triplet onto a 1/4 line"] += 1
+            moved.append(n)
+        out = sorted(moved, key=lambda n: n.time)
+
     if spec.min_gap:
         kept: list[TaikoNote] = []
         for n in out:
@@ -316,10 +361,13 @@ def enforce(notes: list[TaikoNote], grid, level: str) -> tuple[list[TaikoNote], 
         out = kept
 
     # A run too long: drop the weakest of its first limit+1 notes, which splits it.
-    for snap, limit in spec.patterns:
+    runs_to_split = [(snap, limit, _beat) for snap, limit in spec.patterns]
+    if spec.own_beat_run:
+        runs_to_split.append((1, spec.own_beat_run, _own_beat))
+    for snap, limit, beat in runs_to_split:
         while True:
             hits = [n for n in out if not n.is_long]
-            run = next((r for r in _chains(hits, grid, snap) if len(r) > limit), None)
+            run = next((r for r in _chains(hits, grid, snap, beat=beat) if len(r) > limit), None)
             if run is None:
                 break
             victim = max(run[1:limit + 1], key=lambda i: (_strength(hits[i], grid), i))

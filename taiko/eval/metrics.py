@@ -284,6 +284,27 @@ def _close_run(run: list[str], out: dict[str, Counter]) -> None:
         out["colour"]["".join(run[i:i + 4])] += 1
 
 
+FAST_SNAPS = ((1 / 3, "1/3"), (1 / 4, "1/4"), (1 / 6, "1/6"), (1 / 8, "1/8"), (1 / 12, "1/12"))
+
+
+def snap_switch_rate(notes: list[TaikoNote], grid) -> float:
+    """
+    Changes of fast snap (1/4 to 1/6, 1/8 to 1/3, ...) between consecutive
+    gaps, per 100 hits. A ranked mapper commits to one snap for a phrase; the
+    model's charts changed every few notes (round 3: 421 changes against 24 in
+    the same song's ranked map), which reads as rhythm following noise.
+    """
+    hits = sorted(n.time for n in notes if not n.is_long)
+    prev, switches = None, 0
+    for a, b in zip(hits, hits[1:]):
+        beats = (b - a) / grid.section_at(float(b)).ms_per_beat
+        snap = next((name for frac, name in FAST_SNAPS if abs(beats - frac) <= 0.03 * frac), None)
+        if snap and prev and snap != prev:
+            switches += 1
+        prev = snap
+    return 100.0 * switches / max(len(hits), 1)
+
+
 def js_divergence(a: Counter, b: Counter) -> float:
     """Jensen-Shannon divergence, base 2: 0 for the same distribution, 1 for disjoint."""
     keys = sorted(set(a) | set(b))
