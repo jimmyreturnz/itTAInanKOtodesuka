@@ -51,7 +51,16 @@ python scripts/sweep_family_switch.py --probs-cache outputs/eval_cache_v2
 | d877d24 | Two low-difficulty tells from round 3 are now checks: Kantan 1/1 runs in the song's own beat, triplet-only notes in Kantan/Futsuu |
 | (this) | Re-pack (10h, 9, 10e): md5-verified ranked, osu!.db SR (NM/DT/HT), one record per beatmap ID, audio from the verified .osu, split per beatmapset carried over from the old index, outros in the chart, `pack_report.json`. 11,096 maps / 2,829 songs, 10,557 train / 539 val. Old eval cache moved to `outputs/eval_cache_v2_oldindex`; the baseline must be re-run on the new index |
 
-### Baseline (best.pt, step 58968; `evaluate.py --per-band 10 --seeds 3`, 60 maps)
+### Baseline on the re-packed index (2026-10-10, `outputs/eval_baseline_phase3.json`)
+Same checkpoint and command, new val pool (539 maps, the old val sets).
+This is the incumbent for `select_checkpoint.py` from now on.
+- Onset F1 0.686 (Gate B passed). Exact snap 0.956, ceiling 0.999.
+- By divisor: 1/1 0.965, 1/2 0.949, 1/3 0.595 (533 notes), 1/4 0.851,
+  1/6 0.597 (94), 1/8 0.308 (53). 7*+ exact 0.861.
+- Notes on silence 2.2% against ranked 2.0%. F1 by band: <2* 0.605,
+  2-3* 0.632, 3-4* 0.691, 4-5.5* 0.738, 5.5-7* 0.744, 7*+ 0.703.
+
+### Baseline (best.pt, step 58968; `evaluate.py --per-band 10 --seeds 3`, 60 maps) (old index)
 - Onset F1 0.686. Exact snap 0.955, against a ceiling of 0.998.
 - Exact snap by the mapper's divisor: 1/1 0.962, 1/2 0.945, 1/3 0.512,
   1/4 0.826, 1/6 0.751, 1/8 0.610.
