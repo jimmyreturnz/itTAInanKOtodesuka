@@ -68,7 +68,15 @@ PRESET_REFS: dict[str, list[tuple[str, str]]] = {
         ("2132229 Terminal 11 - Adcar", "Illegal"),
         ("2132229 Terminal 11 - Adcar", "ulko's Nervousness"),
     ],
-    # "stream": Jimmy picks from scripts/shortlist_stream.py.
+    # Jimmy's pick (2026-10-10) of the shortlist from scripts/shortlist_stream.py:
+    # 5-7*, 63-69% of notes in 1/4 runs of 16+, tech under 1%, no run over 231.
+    "stream": [
+        ("2200737 SHK - Flight of the Bumblebee (RST Classic)", "Symphonic"),
+        ("2124033 Mage - The Words I Never Said in D&B", "Remorse"),
+        ("2095104 Imperfect Cherry Blossom", "Lunatic"),
+        ("2437756 Folktales Princess", "Mythic Adventure"),
+        ("2242259 Rise Of The Chaos Wizards", "Return Of The Warfare"),
+    ],
     # "standard": no preset; leave the profile unspecified.
 }
 

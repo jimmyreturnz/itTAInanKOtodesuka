@@ -413,7 +413,7 @@ python scripts/train_timing.py --shards data/processed/shards --out checkpoints/
 | Flag | What it does |
 |---|---|
 | `--difficulty 5.5` | target star rating |
-| `--preset deathstream` | features 3: a difficulty profile averaged over reference maps (`deathstream`, `speed`, `burst`, `tech`; `taiko/data/profile.py`). Older models: a motif preset |
+| `--preset deathstream` | features 3: a difficulty profile averaged over reference maps (`deathstream`, `stream`, `speed`, `burst`, `tech`; `taiko/data/profile.py`). Older models: a motif preset |
 | `--style stream` | older models only: the coarse 4-class label from training |
 | `--reference "map.osu"` | copy the profile (features 3) or motif of an existing map |
 | `--level Oni` | also a profile input on features-3 models |

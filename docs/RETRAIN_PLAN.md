@@ -158,7 +158,7 @@ Recommended: **warm-start**.
    - `pack_dataset.py` writes `note_times.npz` itself.
 2. ~~**Rate augmentation (item 10)**~~ done 2026-10-10: a window's SR interpolated from the
    map's own HT/NM/DT ratings, which `osu_db` already reads.
-3. **Difficulty profile (item 10b, ADR 0001):** code done 2026-10-10 as features 3 (stream preset pending Jimmy's pick from `scripts/shortlist_stream.py`). It replaces the style label
+3. **Difficulty profile (item 10b, ADR 0001):** code done 2026-10-10 as features 3; stream preset = all 5 of the shortlist. It replaces the style label
    and the per-window motif. Add the criteria level to it. Presets per the
    ADR.
 4. **SR-band sampling (item 12),** then the **warm-start plus scratch
