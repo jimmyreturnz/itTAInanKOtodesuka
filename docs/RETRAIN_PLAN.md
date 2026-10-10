@@ -81,7 +81,61 @@ python scripts/sweep_family_switch.py --probs-cache outputs/eval_cache_v2
 - Finisher and colour placement.
 - No pattern repetition, a 30.7 s window limit.
 
+### Architecture verdict (2026-10-02, after this handoff): evolve first
+A debate between keeping the diffusion model and a reset to one discrete
+token per beat (1/48-beat slots on the red-line grid, no chart VAE, a masked
+transformer over the whole song) first went to the reset. Three measurements
+afterwards flipped it:
+- **The VAE loses almost nothing** (`scripts/measure_vae_margin.py`, 40 ranked
+  validation maps at 5.5*+): 99.93% of notes on the exact ms, 99.93% colour,
+  100% size. The kat and finisher tell comes from diffusion.
+- **Snaps hold under latent noise:** at sigma 0.2, 3.20 fast-snap changes per
+  100 hits against 2.82 for the real chart. Colour breaks first (0.83 at
+  sigma 0.5), which argues for weighting kat up in the loss.
+- **The reset costs more than estimated** (`scripts/bench_token_vs_unet.py`,
+  on the 1650): about 3.4x the U-Net per second of audio, 80% of it in the
+  transformer. A full run is 45-160 GPU-h, not 10-16, so an 8 GPU-h pilot
+  could fail from undertraining alone.
+
+Also measured: "30% extra notes" is a placement problem, not a count one
+(note count 1.08x ranked, precision 0.67). About 81% of a mapper's repeated
+bars are within 30 s, so the 30.7 s window is not what stops repetition.
+
+Revised training plan, after the Phase 3 data work below:
+1. Rhythm-head probe on the frozen U-Net, about 1.5 GPU-h.
+2. Warm-start with the difficulty profile, level, divisor mask, rhythm head,
+   SR-band sampling and a colour-weighted loss, about 15 GPU-h.
+3. Echo-channel fine-tune for repetition, about 8 GPU-h. Killed if bar
+   recurrence within 15 s stays under 0.2.
+4. If the echo fails: a beat-warped time axis inside the diffusion design.
+   No chart autoencoder retrain either way (4ed6b53).
+
+### Reference chart study (2026-10-02, `scripts/study_reference_charts.py`)
+All 24 preset reference charts, each confirmed ranked by md5 against
+osu!.db (the 1.4x rate edit in Tenkai's folder excluded).
+- **Tenkai e no Kippu [Shining Blade]** is the cleanest deathstream: 89% of
+  gaps 1/4, no 1/3, 1/6 or 1/8, 0 snap changes per 100 hits, 69% of notes in
+  runs of 33+, longest run 451, no finishers, colour in pairs and triples
+  (kkdd, ddkk), every kiai on a full-density block with a one-block dip
+  before it.
+- **Drop IRON ROSE from deathstream:** 290 BPM, longest run 21, a burst map.
+  The other 15 agree: 166-200 BPM, 76-92% 1/4, at most 0.8 snap changes per
+  100 hits.
+- **Split speed in two:** SUNKiSS is one continuous mixed-snap stream at 185
+  BPM (16-23 snap changes per 100 hits); POWA is short bursts at 300 BPM.
+- **Stigma goes with SUNKiSS, not Adcar:** 36% of gaps 1/6 and 1/8, 0% 1/3.
+  Adcar's tech is triplets, 24-27% 1/3 in every difficulty.
+- **The snap-flicker target depends on style.** Ranked speed and tech
+  references change snap 15-23 times per 100 hits, more than the model's
+  13.9. The global ranked 2.0 is the target for stream styles only.
+- **The repetition metric breaks on stream maps:** rhythm-only, stream bars
+  repeat 82-99% (sixteen 1/4 notes look alike). It must count colour before
+  it can judge the echo channel.
+- **Finishers never sit inside a stream** in any of the 24.
+- Still open: the stream preset's shortlist.
+
 ### Decision pending: warm-start or scratch
+Superseded by the verdict above: warm-start. Original reasoning kept below.
 Recommended: **warm-start**.
 - The new conditioning (difficulty profile, ADR 0001) only touches the
   conditioning embedding, 0.08M of 35.6M params (0.2%).
