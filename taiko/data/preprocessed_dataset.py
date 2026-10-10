@@ -68,6 +68,20 @@ WINDOW_FRAMES_DEFAULT = 1_536    # 30.7 s
 WINDOW_ALIGNMENT = 64
 
 
+def rate_sr(record: dict, rate: float) -> float:
+    """
+    The map's SR played at `rate`, interpolated over its own osu!.db ratings
+    at 0.75x (HT), 1.0x and 1.5x (DT), so a sped-up window is labelled harder
+    as well as denser. Records packed before 10h carry no HT/DT and keep their
+    1.0x SR.
+    """
+    sr = float(record.get("difficulty", 0.0))
+    ht, dt = float(record.get("sr_ht", 0.0)), float(record.get("sr_dt", 0.0))
+    if rate == 1.0 or ht <= 0 or dt <= 0:
+        return sr
+    return float(np.interp(rate, (0.75, 1.0, 1.5), (ht, sr, dt)))
+
+
 class WindowedDataset(Dataset):
     """
     Random fixed-size windows over the packed corpus.
@@ -198,7 +212,7 @@ class WindowedDataset(Dataset):
 
         record = reader.records[idx]
 
-        difficulty = float(record.get("difficulty", 0.0))
+        difficulty = rate_sr(record, rate)
         # Playing the song `rate` times faster packs the same notes into less
         # time, so density rises with it. Leaving these at the original values
         # told the model a 1.1x window was as dense as the 1.0x one.

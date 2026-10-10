@@ -362,6 +362,17 @@ def test_packed_split_keeps_old_sides():
     print("  packed split carried over ok")
 
 
+def test_rate_sr_follows_the_maps_own_curve():
+    """A 1.1x window is harder than the 1.0x one and inside its HT..DT curve."""
+    from taiko.data.preprocessed_dataset import rate_sr
+    rec = {"difficulty": 5.0, "sr_ht": 3.9, "sr_dt": 7.1}
+    assert rate_sr(rec, 1.0) == 5.0
+    assert 5.0 < rate_sr(rec, 1.1) < 7.1
+    assert 3.9 < rate_sr(rec, 0.9) < 5.0
+    assert rate_sr({"difficulty": 5.0}, 1.1) == 5.0          # pre-10h shards
+    print("  rate SR on the map's curve ok")
+
+
 def test_ranked_only_filter():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp, n_songs=10)

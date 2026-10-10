@@ -156,7 +156,7 @@ Recommended: **warm-start**.
    - every skipped map reported with its reason;
    - outros included in training;
    - `pack_dataset.py` writes `note_times.npz` itself.
-2. **Rate augmentation (item 10):** a window's SR interpolated from the
+2. ~~**Rate augmentation (item 10)**~~ done 2026-10-10: a window's SR interpolated from the
    map's own HT/NM/DT ratings, which `osu_db` already reads.
 3. **Difficulty profile (item 10b, ADR 0001):** it replaces the style label
    and the per-window motif. Add the criteria level to it. Presets per the
