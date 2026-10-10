@@ -390,6 +390,17 @@ def test_map_profile_replaces_style_and_window_motif():
         print("  map profile conditioning  ok")
 
 
+def test_sr_flatten_evens_out_the_bands():
+    """sr_flatten=1 draws every SR band equally; 0 draws every map equally."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        reader = _build(tmp)              # SR 3, 4, 5 per song: one band of 1, one of 2
+        flat = WindowedDataset(reader, window_frames=W, sr_flatten=1.0).band_share
+        assert np.allclose(flat[flat > 0], 0.5), flat
+        plain = WindowedDataset(reader, window_frames=W, sr_flatten=0.0).band_share
+        assert np.allclose(sorted(plain[plain > 0]), [1 / 3, 2 / 3]), plain
+        print("  SR-band sampling          ok")
+
+
 def test_ranked_only_filter():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp, n_songs=10)

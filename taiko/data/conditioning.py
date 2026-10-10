@@ -70,6 +70,16 @@ def normalise_peak_nps(nps: float) -> float:
     return max(0.0, min(float(nps) / PEAK_NPS_SCALE, 1.5))
 
 
+# Star-rating bands, shared by the eval (stratified pool, per-band scores) and
+# training's SR-band sampling, so both mean the same buckets.
+SR_BANDS = [(0, 2.0, "kantan <2*"), (2.0, 3.0, "futsuu 2-3*"), (3.0, 4.0, "muzukashii 3-4*"),
+            (4.0, 5.5, "oni 4-5.5*"), (5.5, 7.0, "inner 5.5-7*"), (7.0, 99, "extreme 7*+")]
+
+
+def sr_band(sr: float) -> int:
+    return next(i for i, (lo, hi, _) in enumerate(SR_BANDS) if sr < hi or i == len(SR_BANDS) - 1)
+
+
 # --------------------------------------------------------------------------- #
 # Classifier-free guidance
 # --------------------------------------------------------------------------- #

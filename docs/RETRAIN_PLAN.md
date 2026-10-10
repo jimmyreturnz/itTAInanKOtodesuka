@@ -161,7 +161,7 @@ Recommended: **warm-start**.
 3. **Difficulty profile (item 10b, ADR 0001):** code done 2026-10-10 as features 3; stream preset = all 5 of the shortlist. It replaces the style label
    and the per-window motif. Add the criteria level to it. Presets per the
    ADR.
-4. **SR-band sampling (item 12),** then the **warm-start plus scratch
+4. **SR-band sampling (item 12),** code done 2026-10-10 (`--sr-flatten`, default 0.5: 7*+ draws 5% -> 10%; tune from the eval), then the **warm-start plus scratch
    control (item 13)**. Judge by the eval, the criteria checks,
    `select_checkpoint.py` and a blind round.
 

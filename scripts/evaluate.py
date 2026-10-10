@@ -63,7 +63,7 @@ import torch
 
 from taiko.data.audio_activity import ON_GRID_MS, activity, activity_score, silence_rate
 from taiko.data.conditioning import (
-    normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
+    SR_BANDS, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
 )
 from taiko.data.decode import calibrate_threshold, decode_on_grid
 from taiko.data.profile import record_conditioning
@@ -99,8 +99,6 @@ RAW_TOLERANCE_MS = FRAME_MS / 2
 VARIANTS = ("legacy_raw", "legacy_final", "grid_raw", "grid_final")
 SHIPPED = "grid_final"
 
-SR_BANDS = [(0, 2.0, "kantan <2*"), (2.0, 3.0, "futsuu 2-3*"), (3.0, 4.0, "muzukashii 3-4*"),
-            (4.0, 5.5, "oni 4-5.5*"), (5.5, 7.0, "inner 5.5-7*"), (7.0, 99, "extreme 7*+")]
 BPM_BANDS = [(0, 140, "<140"), (140, 180, "140-180"), (180, 220, "180-220"), (220, 999, "220+")]
 
 

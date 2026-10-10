@@ -41,8 +41,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from taiko.data.conditioning import (
-    MOTIF_DIM_DROPOUT, MOTIF_JITTER, PROFILE_DIM, STYLE_NULL,
-    normalise_avg_nps, normalise_difficulty, normalise_peak_nps, profile_vector,
+    MOTIF_DIM_DROPOUT, MOTIF_JITTER, PROFILE_DIM, SR_BANDS, STYLE_NULL,
+    normalise_avg_nps, normalise_difficulty, normalise_peak_nps, profile_vector, sr_band,
 )
 from taiko.data.frames import FRAME_MS, assert_aligned
 from taiko.data.motif import (
@@ -104,6 +104,10 @@ class WindowedDataset(Dataset):
                            off its own conditioning vector.
         map_profile:       features >= 3 (ADR 0001): the motif slot carries the
                            map-wide motif and style is always null.
+        sr_flatten:        SR-band sampling (item 12). A map is drawn with
+                           weight (maps in its SR band) ** -sr_flatten: 0 is
+                           uniform over maps, 1 is uniform over bands. Only
+                           for random draws; evaluation order is unchanged.
     """
 
     def __init__(
@@ -122,6 +126,7 @@ class WindowedDataset(Dataset):
         freq_mask_bands:   int   = 12,
         seed:              int   = 0,
         map_profile:       bool  = False,
+        sr_flatten:        float = 0.0,
     ):
         self.reader        = reader
         self.indices       = list(indices) if indices is not None else list(range(len(reader)))
@@ -136,6 +141,11 @@ class WindowedDataset(Dataset):
         self.freq_mask_bands = freq_mask_bands
         self.seed          = seed
         self.map_profile   = map_profile
+        bands = [sr_band(float(reader.records[i].get("difficulty", 0.0))) for i in self.indices]
+        counts = np.bincount(bands, minlength=len(SR_BANDS)).astype(np.float64)
+        w = counts[bands] ** -float(sr_flatten)
+        self.draw_p = w / w.sum()
+        self.band_share = np.bincount(bands, weights=self.draw_p, minlength=len(SR_BANDS))
 
         if not self.indices:
             raise ValueError("WindowedDataset got an empty split")
@@ -167,7 +177,7 @@ class WindowedDataset(Dataset):
         if self._length == len(self.indices) and not self.random_window:
             idx = self.indices[i % len(self.indices)]
         else:
-            idx = self.indices[int(rng.integers(0, len(self.indices)))]
+            idx = self.indices[int(rng.choice(len(self.indices), p=self.draw_p))]
 
         for _ in range(4):
             try:

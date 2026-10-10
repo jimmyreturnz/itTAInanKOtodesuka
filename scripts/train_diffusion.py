@@ -79,6 +79,7 @@ from taiko.data.preprocessed_dataset import (
     WINDOW_FRAMES_DEFAULT, WindowedDataset, print_split_stats, split_indices,
 )
 from taiko.data.shards import MEL_IO_MODES, ShardReader
+from taiko.data.conditioning import SR_BANDS
 from taiko.model.diffusion import EMA, FEATURES_LATEST, TaikoDiffusion
 from taiko.model.model_config import PROFILES, get_profile
 from taiko.train import (
@@ -160,6 +161,9 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=2000)
     ap.add_argument("--ema-decay", type=float, default=0.9995)
     ap.add_argument("--prediction-type", default="v", choices=["v", "epsilon"])
+    ap.add_argument("--sr-flatten", type=float, default=0.5,
+                    help="SR-band sampling: draw a map with weight (maps in its SR "
+                         "band) ** -x. 0 = uniform over maps, 1 = uniform over bands")
     ap.add_argument("--features", type=int, default=FEATURES_LATEST, choices=[1, 2, 3],
                     help="model generation. 2 adds the timing encoder, song-level "
                          "onset/loudness channels and window-density conditioning. "
@@ -291,8 +295,10 @@ def main() -> int:
     train_ds = WindowedDataset(
         reader, train_idx, window_frames=args.window_frames,
         random_window=True, augment=True, samples_per_epoch=args.samples_per_epoch,
-        map_profile=map_profile,
+        map_profile=map_profile, sr_flatten=args.sr_flatten,
     )
+    print(f"SR-band sampling (--sr-flatten {args.sr_flatten}): " + ", ".join(
+        f"{label} {100 * share:.0f}%" for (_, _, label), share in zip(SR_BANDS, train_ds.band_share)))
     val_ds = WindowedDataset(
         reader, val_idx, window_frames=args.window_frames,
         random_window=False, augment=False, map_profile=map_profile,
