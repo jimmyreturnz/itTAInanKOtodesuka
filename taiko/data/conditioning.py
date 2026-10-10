@@ -105,18 +105,40 @@ WINDOW_NPS_DROPOUT = 0.3
 # --------------------------------------------------------------------------- #
 # The map-wide profile replaces style and the per-window motif. Its motif part
 # travels in the old motif slot, computed over the whole map; the rest is this
-# vector: tech share and 1/8 share, each with a known flag, then the criteria
-# level one-hot (all zero = unspecified).
+# vector: tech share and 1/8 share, each with a known flag, the criteria level
+# one-hot (all zero = unspecified), then the divisor mask: which snaps the map
+# puts notes on, and a known flag. The mask tells the model when a song has no
+# ternary at all, which is where the snap flicker comes from.
 
-PROFILE_DIM = 4 + len(LEVELS)
+DIVISORS = (1, 2, 3, 4, 6, 8)
+# Finer and odd snaps fold into the family they subdivide; 1/5, 1/7 and 1/9
+# are left out (0.13% of 7*+ notes).
+DIVISOR_FOLD = {1: 1, 2: 2, 3: 3, 4: 4, 6: 6, 8: 8, 12: 6, 16: 8}
+DIVISOR_MIN_SHARE = 0.005    # a snap counts as used above 0.5% of notes ...
+DIVISOR_MIN_NOTES = 4        # ... and 4 notes, so one stray note does not open it
+
 TECH, TECH_KNOWN, SPEED, SPEED_KNOWN, LEVEL0 = 0, 1, 2, 3, 4
+DIV0 = LEVEL0 + len(LEVELS)
+DIV_KNOWN = DIV0 + len(DIVISORS)
+PROFILE_DIM = DIV_KNOWN + 1
 
 # Each part is unspecified this often in training, so generation may omit it.
 PROFILE_DROPOUT = 0.2
 
 
+def divisors_used(snap_counts: dict) -> set[int]:
+    """The DIVISORS a map puts notes on, from the pack's per-snap note counts."""
+    folded: dict[int, int] = {}
+    for d, n in snap_counts.items():
+        if int(d) in DIVISOR_FOLD:
+            folded[DIVISOR_FOLD[int(d)]] = folded.get(DIVISOR_FOLD[int(d)], 0) + n
+    total = sum(snap_counts.values())
+    return {d for d, n in folded.items()
+            if n >= DIVISOR_MIN_NOTES and n >= DIVISOR_MIN_SHARE * total}
+
+
 def profile_vector(tech_share: float | None = None, speed_share: float | None = None,
-                   level: str | None = None):
+                   level: str | None = None, divisors: set[int] | None = None):
     """[PROFILE_DIM] float32. None leaves that part unspecified."""
     v = np.zeros(PROFILE_DIM, dtype=np.float32)
     if tech_share is not None:
@@ -125,4 +147,15 @@ def profile_vector(tech_share: float | None = None, speed_share: float | None = 
         v[SPEED], v[SPEED_KNOWN] = min(max(float(speed_share), 0.0), 1.0), 1.0
     if level in LEVELS:
         v[LEVEL0 + LEVELS.index(level)] = 1.0
+    if divisors is not None:
+        for d in divisors:
+            v[DIV0 + DIVISORS.index(d)] = 1.0
+        v[DIV_KNOWN] = 1.0
     return v
+
+
+def record_profile(record: dict):
+    """A packed map's own profile vector; parts it does not carry stay unspecified."""
+    counts = record.get("snap_counts")
+    return profile_vector(record.get("tech_share"), record.get("snap_1_8"), record.get("level"),
+                          divisors_used(counts) if counts else None)

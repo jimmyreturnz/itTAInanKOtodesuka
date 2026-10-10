@@ -206,23 +206,33 @@ def decode_timing_points(packed: list[list[float]]) -> list[TimingPoint]:
 # --------------------------------------------------------------------------- #
 
 def write_note_times(shard_dir: str | Path, records: Sequence[dict],
-                     times: Sequence[Sequence[int]]) -> Path:
+                     times: Sequence[Sequence[int]],
+                     divisors: Sequence[Sequence[int]] | None = None) -> Path:
     """
     Store each record's hit times (ms), in index order, as one flat int32 array
     plus offsets. Keyed by position rather than beatmap ID because the index
     can hold one ID twice (a cut version kept the ranked map's ID), and keyed
     by ID one record's times silently became the other's.
+
+    `divisors`, parallel to `times`: each note's folded snap as an index into
+    conditioning.DIVISORS, -1 for none. The rhythm head's training labels.
     """
     lengths = np.array([len(t) for t in times], dtype=np.int64)
     flat = np.concatenate([np.asarray(t, dtype=np.int32) for t in times])         if len(times) else np.zeros(0, dtype=np.int32)
     path = Path(shard_dir) / NOTE_TIMES_FILENAME
+    extra = {}
+    if divisors is not None:
+        extra["divisors"] = np.concatenate([np.asarray(d, dtype=np.int8) for d in divisors])             if len(divisors) else np.zeros(0, dtype=np.int8)
     np.savez_compressed(path, beatmap_id=np.array([int(r["beatmap_id"]) for r in records]),
-                        offsets=np.concatenate([[0], np.cumsum(lengths)]), times=flat)
+                        offsets=np.concatenate([[0], np.cumsum(lengths)]), times=flat, **extra)
     return path
 
 
-def load_note_times(reader: "ShardReader") -> list[np.ndarray] | None:
-    """Per record, its real hit times (ms); None when the shards have none."""
+def load_note_times(reader: "ShardReader", with_divisors: bool = False):
+    """
+    Per record, its real hit times (ms); None when the shards have none.
+    with_divisors: (times, divisors) instead, divisors None if not packed.
+    """
     path = reader.dir / NOTE_TIMES_FILENAME
     if not path.exists():
         return None
@@ -232,7 +242,13 @@ def load_note_times(reader: "ShardReader") -> list[np.ndarray] | None:
         raise ValueError(f"{path} was built for another index; rebuild it "
                          f"(python scripts/build_note_times.py)")
     off, flat = data["offsets"], data["times"]
-    return [flat[off[k]:off[k + 1]] for k in range(len(ids))]
+    times = [flat[off[k]:off[k + 1]] for k in range(len(ids))]
+    if not with_divisors:
+        return times
+    if "divisors" not in data:
+        return times, None
+    div = data["divisors"]
+    return times, [div[off[k]:off[k + 1]] for k in range(len(ids))]
 
 
 class ShardWriter:

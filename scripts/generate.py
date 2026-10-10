@@ -43,7 +43,7 @@ from taiko.data.audio import MelExtractor
 from taiko.data.audio_activity import Activity, activity, activity_score, gate_notes
 from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
-    profile_vector, style_to_int,
+    divisors_used, profile_vector, style_to_int,
 )
 from taiko.data.decode import calibrate_threshold, decode_on_grid
 from taiko.data.frames import describe, frames_to_sec
@@ -121,13 +121,14 @@ def resolve_profile(args, parser: OsuTaikoParser):
     maps from the shard index. Anything not given stays unspecified.
     """
     from pack_dataset import dominant_bpm, infer_style_and_snaps
-    motif = tech = speed = None
+    motif = tech = speed = divisors = None
     if args.reference:
         bm = parser.parse_file(Path(args.reference))
         chart, _ = beatmap_to_tensors(bm)
         motif = map_motif(chart, dominant_bpm(bm))
         _, snaps = infer_style_and_snaps(bm)
         tech, speed = snaps["tech_share"], snaps["snap_1_8"]
+        divisors = divisors_used(snaps["snap_counts"])
         print(f"Profile measured from {Path(args.reference).name}:")
     elif args.preset:
         if args.preset not in PRESET_REFS:
@@ -136,15 +137,16 @@ def resolve_profile(args, parser: OsuTaikoParser):
         import json
         index = json.loads((args.shards / "index.json").read_text(encoding="utf-8"))
         p = preset_profile(args.preset, index["records"])
-        motif, tech, speed = p["profile_motif"], p["tech_share"], p["snap_1_8"]
+        motif, tech, speed, divisors = p["profile_motif"], p["tech_share"], p["snap_1_8"], p["divisors"]
         print(f"Profile preset {args.preset!r}, {len(PRESET_REFS[args.preset])} reference maps "
               f"(their mean: {p['difficulty']:.2f}*, {p['avg_nps']:.1f} avg nps):")
     level = NAMES[args.level][0] if args.level else None
     if motif is not None:
         print(describe_motif(motif))
-        print(f"  tech share {tech:.3f}, 1/8 share {speed:.3f}")
+        print(f"  tech share {tech:.3f}, 1/8 share {speed:.3f}, "
+              f"snaps {', '.join(f'1/{d}' for d in sorted(divisors))}")
     return (motif, None if motif is None else np.ones_like(motif),
-            profile_vector(tech, speed, level))
+            profile_vector(tech, speed, level, divisors))
 
 
 def resolve_timing(args, total_frames: int) -> tuple[list[TimingPoint], str]:

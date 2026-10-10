@@ -40,7 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from taiko.data.conditioning import N_STYLES, PROFILE_DIM, STYLE_NULL
+from taiko.data.conditioning import DIVISORS, N_STYLES, PROFILE_DIM, STYLE_NULL
 from taiko.data.motif import MOTIF_DIM
 from taiko.data.tensor_repr import N_TIMING_CHANNELS
 from taiko.model.s4_block import S4StyleBlock
@@ -307,6 +307,7 @@ class TaikoDiffusionUNet(nn.Module):
         timing_feature_channels: int = 0,
         density_context: bool = False,
         map_profile:    bool = False,
+        rhythm_head:    bool = False,
         use_checkpoint: bool = True,
         use_s4:         bool = True,
     ):
@@ -406,6 +407,14 @@ class TaikoDiffusionUNet(nn.Module):
         nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
 
+        # Rhythm head: per latent frame, which snaps (conditioning.DIVISORS)
+        # its notes sit on, read off the last decoder features. Trained as an
+        # auxiliary loss, or alone on a frozen U-Net as a probe
+        # (scripts/probe_rhythm.py). Generation never calls it.
+        self.rhythm_head = None
+        if rhythm_head:
+            self.add_rhythm_head()
+
     # ---------------------------------------------------------------- #
 
     def _timing_pyramid(self, timing: torch.Tensor, lengths: list[int]) -> list[torch.Tensor]:
@@ -443,9 +452,12 @@ class TaikoDiffusionUNet(nn.Module):
         window_known: torch.Tensor | None = None,
         map_nps_known: torch.Tensor | None = None,
         profile: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        want_rhythm: bool = False,
+    ):
         """
         Args:
+            want_rhythm:    also return the rhythm head's logits
+                            [B, len(DIVISORS), T_latent], as (prediction, logits).
             audio_features: one per level, already at that level's resolution.
             timing:         [B, 3, T_latent] beat grid on the latent grid.
             cond_emb:       a precomputed conditioning embedding, which lets the
@@ -516,7 +528,17 @@ class TaikoDiffusionUNet(nn.Module):
                 h = self.dec_up[lvl](h)
 
         h = _match_length(h, z.shape[-1])
-        return self.conv_out(F.silu(self.norm_out(h)))
+        out = self.conv_out(F.silu(self.norm_out(h)))
+        if want_rhythm:
+            return out, self.rhythm_head(h)
+        return out
+
+    def add_rhythm_head(self) -> nn.Module:
+        """A fresh rhythm head on the last decoder features (also for probes)."""
+        ch, groups = self.norm_out.num_channels, self.norm_out.num_groups
+        self.rhythm_head = nn.Sequential(Normalize(ch, groups), nn.SiLU(),
+                                         nn.Conv1d(ch, len(DIVISORS), 3, padding=1))
+        return self.rhythm_head
 
     def count_parameters(self) -> str:
         return f"{sum(p.numel() for p in self.parameters()) / 1e6:.1f}M"

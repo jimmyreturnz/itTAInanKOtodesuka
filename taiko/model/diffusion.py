@@ -35,10 +35,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from taiko.data.conditioning import (
-    CFG_DROPOUT, LEVEL0, MAP_NPS_DROPOUT, PROFILE_DIM, PROFILE_DROPOUT, SPEED,
+    CFG_DROPOUT, DIV0, LEVEL0, MAP_NPS_DROPOUT, PROFILE_DIM, PROFILE_DROPOUT, SPEED,
     STYLE_NULL, TECH, WINDOW_NPS_DROPOUT,
 )
 from taiko.data.motif import MOTIF_DIM
+from taiko.data.tensor_repr import CH_BIG_KAT, CH_KAT
 from taiko.model.audio_encoder import MelEncoder1D
 from taiko.model.autoencoder import AutoencoderConfig, ChartAutoencoder
 from taiko.model.model_config import DiffusionProfile, get_profile
@@ -142,6 +143,7 @@ class TaikoDiffusion(nn.Module):
         n_mels: int = 128,
         verbose: bool = True,
         features: int = FEATURES_LATEST,
+        rhythm_head: bool = False,
     ):
         super().__init__()
         if features not in (1, 2, 3):
@@ -154,6 +156,12 @@ class TaikoDiffusion(nn.Module):
         self.cfg_scale = cfg_scale
         self.z_channels = z_channels
         self.cfg_dropout = CFG_DROPOUT if cfg_dropout is None else cfg_dropout
+        # Colour-weighted loss: latent frames holding a kat weigh 1 + kat_weight.
+        # A training choice, not architecture, so the checkpoint does not carry
+        # it; train_diffusion.py sets it (--kat-weight).
+        self.kat_weight = 0.0
+        # Weight of the rhythm head's loss (train_diffusion.py --rhythm-weight).
+        self.rhythm_weight = 0.0
 
         # ---- frozen first stage ------------------------------------------ #
         if autoencoder is not None:
@@ -216,6 +224,7 @@ class TaikoDiffusion(nn.Module):
             timing_feature_channels=TIMING_FEATURE_CHANNELS if features >= 2 else 0,
             density_context=features >= 2,
             map_profile=features >= 3,
+            rhythm_head=rhythm_head,
             use_checkpoint=profile.use_checkpoint,
             use_s4=profile.use_s4,
         )
@@ -287,19 +296,23 @@ class TaikoDiffusion(nn.Module):
         motif_mask: torch.Tensor | None = None,
         window_nps: torch.Tensor | None = None,
         profile: torch.Tensor | None = None,
+        snap_labels: torch.Tensor | None = None,
+        t: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Training loss. Returns (loss, metrics) where metrics is a stacked tensor
         rather than a dict of floats, so DataParallel can gather it across GPUs
         -- a dict of Python floats silently keeps only the first replica's.
 
-        metrics: [loss, mae, mean_t, mask_ratio], each already batch-averaged.
+        metrics: [loss, mae, mean_t, mask_ratio, rhythm_bce], each already
+        batch-averaged; rhythm_bce is 0 without a rhythm head and labels.
         """
         B = chart.shape[0]
         device = chart.device
 
         z = self.encode(chart)
-        t = torch.randint(0, self.scheduler.timesteps, (B,), device=device).long()
+        if t is None:             # fixed only by probes that score per noise level
+            t = torch.randint(0, self.scheduler.timesteps, (B,), device=device).long()
         noise = torch.randn_like(z)
         z_t = self.scheduler.add_noise(z, t, noise)
         target = self.scheduler.target_for(z, noise, t)
@@ -328,15 +341,16 @@ class TaikoDiffusion(nn.Module):
             density = dict(window_nps=window_nps, window_known=win_known,
                            map_nps_known=map_known)
         if self.features >= 3 and profile is not None:
-            # Tech share, 1/8 share and level are each unspecified some of the
-            # time, value and known flag together.
-            keep = (torch.rand(B, 3, device=device) >= PROFILE_DROPOUT).to(profile.dtype)
+            # Tech share, 1/8 share, level and divisor mask are each
+            # unspecified some of the time, value and known flag together.
+            keep = (torch.rand(B, 4, device=device) >= PROFILE_DROPOUT).to(profile.dtype)
             per_dim = torch.ones_like(profile)
-            per_dim[:, TECH:SPEED] = keep[:, :1]
-            per_dim[:, SPEED:LEVEL0] = keep[:, 1:2]
-            per_dim[:, LEVEL0:] = keep[:, 2:]
+            for k, (lo, hi) in enumerate(((TECH, SPEED), (SPEED, LEVEL0), (LEVEL0, DIV0),
+                                          (DIV0, PROFILE_DIM))):
+                per_dim[:, lo:hi] = keep[:, k:k + 1]
             density["profile"] = profile * per_dim
 
+        want_rhythm = self.unet_model.rhythm_head is not None and snap_labels is not None
         prediction = self.unet_model(
             z_t, t, audio_features, timing_latent,
             difficulty=difficulty, style=style,
@@ -344,11 +358,20 @@ class TaikoDiffusion(nn.Module):
             motif=motif, motif_mask=motif_mask,
             drop_mask=drop_mask,
             timing_features=timing_features,
+            want_rhythm=want_rhythm,
             **density,
         )
+        if want_rhythm:
+            prediction, rhythm_logits = prediction
 
         # The latent mask marks frames whose chart frames were all padding.
-        mask = self._latent_mask(valid_mask, z.shape[-1]).unsqueeze(1)
+        mask = valid = self._latent_mask(valid_mask, z.shape[-1]).unsqueeze(1)
+        if self.kat_weight:
+            # Colour is what latent noise breaks first (measure_vae_margin.py:
+            # 0.83 colour flips per 100 hits at sigma 0.5), and kat is the
+            # minority colour, so frames that hold one count for more.
+            kat = chart[:, [CH_KAT, CH_BIG_KAT]].amax(dim=1)
+            mask = mask * (1.0 + self.kat_weight * self._latent_mask(kat, z.shape[-1]).unsqueeze(1))
 
         per_element = F.mse_loss(prediction, target, reduction="none")
         denom = mask.sum().clamp(min=1.0) * prediction.shape[1]
@@ -357,8 +380,17 @@ class TaikoDiffusion(nn.Module):
         with torch.no_grad():
             mae = ((prediction - target).abs() * mask).sum() / denom
 
+        rhythm_bce = torch.zeros((), device=device)
+        if want_rhythm:
+            # Which snaps each latent frame's notes sit on, multi-label.
+            labels = F.adaptive_max_pool1d(snap_labels.float(), z.shape[-1])
+            bce = F.binary_cross_entropy_with_logits(rhythm_logits.float(), labels,
+                                                     reduction="none")
+            rhythm_bce = (bce * valid).sum() / (valid.sum().clamp(min=1.0) * bce.shape[1])
+            loss = loss + self.rhythm_weight * rhythm_bce
+
         metrics = torch.stack([
-            loss.detach(), mae, t.float().mean(), mask.mean(),
+            loss.detach(), mae, t.float().mean(), valid.mean(), rhythm_bce.detach(),
         ])
         return loss, metrics
 
@@ -544,6 +576,7 @@ def load_diffusion(diffusion_ckpt, ae_ckpt, device, use_ema: bool = True,
         profile=ckpt.get("profile", "p1"),
         prediction_type=ckpt.get("prediction_type", "v"),
         features=int(ckpt.get("features", 1)),
+        rhythm_head=any(k.startswith("rhythm_head.") for k in ckpt["unet"]),
         verbose=verbose,
     )
     model.unet_model.load_state_dict(ckpt["unet"])

@@ -104,7 +104,8 @@ def lr_at(step: int, warmup: int, total: int, peak: float, floor: float = 1e-6) 
 
 
 BATCH_KEYS = ("chart", "mel", "timing", "difficulty", "style", "valid_mask",
-              "avg_nps", "peak_nps", "motif", "motif_mask", "window_nps", "profile")
+              "avg_nps", "peak_nps", "motif", "motif_mask", "window_nps", "profile",
+              "snap_labels")
 
 
 def batch_to(batch: dict, device: torch.device, non_blocking: bool = True) -> dict:
@@ -161,6 +162,11 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=2000)
     ap.add_argument("--ema-decay", type=float, default=0.9995)
     ap.add_argument("--prediction-type", default="v", choices=["v", "epsilon"])
+    ap.add_argument("--rhythm-weight", type=float, default=0.1,
+                    help="weight of the rhythm head's snap loss; 0 builds no head. "
+                         "A run resumes with the head it was started with")
+    ap.add_argument("--kat-weight", type=float, default=1.0,
+                    help="latent frames holding a kat weigh 1 + x in the loss (0 = off)")
     ap.add_argument("--sr-flatten", type=float, default=0.5,
                     help="SR-band sampling: draw a map with weight (maps in its SR "
                          "band) ** -x. 0 = uniform over maps, 1 = uniform over bands")
@@ -296,12 +302,14 @@ def main() -> int:
         reader, train_idx, window_frames=args.window_frames,
         random_window=True, augment=True, samples_per_epoch=args.samples_per_epoch,
         map_profile=map_profile, sr_flatten=args.sr_flatten,
+        rhythm_labels=args.rhythm_weight > 0,
     )
     print(f"SR-band sampling (--sr-flatten {args.sr_flatten}): " + ", ".join(
         f"{label} {100 * share:.0f}%" for (_, _, label), share in zip(SR_BANDS, train_ds.band_share)))
     val_ds = WindowedDataset(
         reader, val_idx, window_frames=args.window_frames,
         random_window=False, augment=False, map_profile=map_profile,
+        rhythm_labels=args.rhythm_weight > 0,
     )
 
     total_batch = batch_per_gpu * max(n_gpus, 1)
@@ -336,8 +344,11 @@ def main() -> int:
                                   # silently re-fetch the unmodified original
         prediction_type=args.prediction_type,
         features=args.features,
+        rhythm_head=args.rhythm_weight > 0,
     )
     model.first_stage.check_window(args.window_frames)
+    model.kat_weight = args.kat_weight
+    model.rhythm_weight = args.rhythm_weight
     model = model.to(device)
 
     inner = unwrap(model)
@@ -366,6 +377,12 @@ def main() -> int:
     # single resume, which over twenty resumes is days.
     step, start_epoch, best_val, batch_offset = 0, 0, float("inf"), 0
     warm_start_step = None
+    # The step the cosine schedule counts from. A widening warm start begins a
+    # new schedule there: the run it widens may have finished its own (the
+    # features-2 run ended at its 62,400-step horizon), and resuming that one
+    # would stop at once. Steps keep counting up, so checkpoint and eval-cache
+    # names never collide with the old run's.
+    schedule_origin = 0
     if args.resume:
         ckpt, source = load_checkpoint(args.resume, map_location=device)
         if ckpt is None:
@@ -405,9 +422,16 @@ def main() -> int:
                 # The epoch length changed (a different --samples-per-epoch or
                 # batch size); the offset no longer means anything.
                 start_epoch, batch_offset = start_epoch + 1, 0
+            schedule_origin = int(ckpt.get("schedule_origin", 0))
 
             saved_total = ckpt.get("total_steps")
-            if saved_total and args.total_steps is None and saved_total != total_steps:
+            if saved_features < inner.features:
+                # New schedule, new loss terms: nothing of the old run's
+                # epoch count, horizon or best val carries over.
+                schedule_origin, start_epoch, batch_offset = step, 0, 0
+                best_val = float("inf")
+                print(f"  new schedule from step {step}: {total_steps} steps")
+            elif saved_total and args.total_steps is None and saved_total != total_steps:
                 # The cosine schedule is defined by its horizon. Silently
                 # changing that horizon mid-run rewrites the learning rate for
                 # every remaining step, so the saved one wins unless overridden.
@@ -441,6 +465,7 @@ def main() -> int:
             "batch_in_epoch": state["batch_in_epoch"],
             "best_val": state["best_val"],
             "total_steps": total_steps,
+            "schedule_origin": schedule_origin,
             "profile": args.profile,
             "window_frames": args.window_frames,
             "prediction_type": args.prediction_type,
@@ -507,7 +532,7 @@ def main() -> int:
                 break
             done_in_epoch += 1
 
-            lr_now = lr_at(step, args.warmup, total_steps, lr)
+            lr_now = lr_at(step - schedule_origin, args.warmup, total_steps, lr)
             if warm_start_step is not None and args.rewarm > 0:
                 lr_now *= min(1.0, (step - warm_start_step + 1) / args.rewarm)
             for group in optimizer.param_groups:
@@ -518,7 +543,7 @@ def main() -> int:
                 # DataParallel returns one row per replica; averaging is what
                 # makes the reported numbers mean the same thing on 1 GPU and 2.
                 loss = loss.mean()
-                metrics = metrics.reshape(-1, 4).mean(0)
+                metrics = metrics.reshape(-1, 5).mean(0)
                 scaled = loss / args.grad_accum
 
             scaler.scale(scaled).backward()
@@ -544,7 +569,8 @@ def main() -> int:
                     growth = trend.compact()
                     print(f"epoch {epoch + 1:3d} step {step:7d}  "
                           f"loss {float(metrics[0]):.4f}  mae {float(metrics[1]):.4f}  "
-                          f"|g| {float(grad_norm):.2f}  lr {lr_now:.2e}  "
+                          + (f"rhythm {float(metrics[4]):.4f}  " if args.rhythm_weight else "")
+                          + f"|g| {float(grad_norm):.2f}  lr {lr_now:.2e}  "
                           f"{elapsed / 60:.1f}min  {memory_line(snapshot)}"
                           + (f" | {growth}" if growth else ""), flush=True)
                     alarm = trend.first_warning()

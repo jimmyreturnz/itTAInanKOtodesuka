@@ -115,6 +115,15 @@ Revised training plan, after the Phase 3 data work below:
 1. Rhythm-head probe on the frozen U-Net, about 1.5 GPU-h.
 2. Warm-start with the difficulty profile, level, divisor mask, rhythm head,
    SR-band sampling and a colour-weighted loss, about 15 GPU-h.
+
+   Built 2026-10-10, as Jimmy chose the designs: the divisor mask is a
+   per-map profile input (snaps the map puts notes on: 1/1 1/2 1/3 1/4 1/6
+   1/8, 1/12 folded into 1/6), the colour loss weighs latent frames holding a
+   kat 1 + `--kat-weight`, and the rhythm head predicts per latent frame
+   which snaps its notes sit on (`--rhythm-weight`, labels from the .osu's ms
+   in `note_times.npz`). `scripts/probe_rhythm.py` is step 1; the Kaggle
+   notebook runs it before stage 2 and then warm-starts features 3 for 20k
+   steps on a fresh schedule.
 3. Echo-channel fine-tune for repetition, about 8 GPU-h. Killed if bar
    recurrence within 15 s stays under 0.2.
 4. If the echo fails: a beat-warped time axis inside the diffusion design.

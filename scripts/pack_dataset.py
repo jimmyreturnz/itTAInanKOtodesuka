@@ -46,7 +46,7 @@ from taiko.data.conditioning import STYLE_NAMES
 from taiko.data import osu_db
 from taiko.data.frames import FRAME_MS, describe, ms_to_frame
 from taiko.data.osu_parser import OsuTaikoParser
-from taiko.data.profile import map_motif
+from taiko.data.profile import active_red_line, map_motif, note_divisor, snap_of
 from taiko.data.shards import ShardWriter, write_note_times
 from taiko.eval.criteria import level_of
 from taiko.data.tensor_repr import beatmap_to_tensors
@@ -72,11 +72,9 @@ MIN_DURATION_MS   = 20_000
 MAX_AUDIO_BYTES   = 150 * 1024 * 1024
 
 SNAP_TOLERANCE_MS      = 8.0
-SNAP_MATCH_MS          = 3.0     # 1 ms truncation + a fractional red line, with margin
 STREAM_MIN_CONSECUTIVE = 8
 SPEED_EFFECTIVE_BPM    = 270
 TECH_WEIRD_RATIO       = 0.12
-SNAP_DENOMS            = (1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16)
 PEAK_NPS_WINDOW_MS     = 5_000
 
 
@@ -227,34 +225,6 @@ def compute_peak_nps(bm, window_ms: int = PEAK_NPS_WINDOW_MS) -> float:
     return round(min(peak, 30.0), 3)
 
 
-def active_red_line(timing_points, time_ms):
-    active = None
-    for tp in timing_points:
-        if tp.time > time_ms:
-            break
-        if tp.uninherited and tp.beat_length > 0:
-            active = tp
-    return active
-
-
-def snap_of(note_time: int, timing_points) -> int | None:
-    """
-    The coarsest snap the note sits on, within SNAP_MATCH_MS. Not the closest:
-    osu! truncates a snapped note to whole ms, so a 1/4 note lands up to 1 ms
-    off its line and a finer grid (1/12, 1/16) can fit it better, which read
-    clean 1/4 streams as 13% tech (Tenkai e no Kippu, 447 notes).
-    """
-    tp = active_red_line(timing_points, note_time)
-    if tp is None:
-        return None
-    offset = (note_time - tp.exact_time) % tp.beat_length
-    for denom in SNAP_DENOMS:
-        grid = tp.beat_length / denom
-        if abs(offset - round(offset / grid) * grid) <= SNAP_MATCH_MS:
-            return denom
-    return None
-
-
 def dominant_bpm(bm) -> float:
     """BPM of the red line that governs the most notes, not simply the first."""
     reds = [tp for tp in bm.timing_points if tp.uninherited and tp.beat_length > 0]
@@ -272,7 +242,8 @@ def dominant_bpm(bm) -> float:
 
 def infer_style_and_snaps(bm) -> tuple[int, dict[str, float]]:
     hits = [n for n in bm.notes if not n.is_long]
-    empty = {"snap_1_4": 0.0, "snap_1_6": 0.0, "snap_1_8": 0.0, "tech_share": 0.0}
+    empty = {"snap_1_4": 0.0, "snap_1_6": 0.0, "snap_1_8": 0.0, "tech_share": 0.0,
+             "snap_counts": {}}
     if not hits or not bm.timing_points:
         return 0, empty
 
@@ -296,6 +267,7 @@ def infer_style_and_snaps(bm) -> tuple[int, dict[str, float]]:
         "snap_1_6": round(counts.get(6, 0) / total, 4),
         "snap_1_8": round(counts.get(8, 0) / total, 4),
         "tech_share": round(weird / total, 4),      # ternary and unusual snaps
+        "snap_counts": {str(d): n for d, n in sorted(counts.items())},
     }
 
     if weird / total >= TECH_WEIRD_RATIO:
@@ -636,6 +608,7 @@ def main() -> int:
     t0 = time.time()
     written = 0
     note_times: list[list[int]] = []
+    note_divs: list[list[int]] = []
     records: list[dict] = []
 
     def skip(c, reason):
@@ -717,11 +690,13 @@ def main() -> int:
             for bm, chart, record in pending:
                 writer.add_map(record, chart, bm.timing_points, key)
                 records.append(record)
-                note_times.append(sorted(n.time for n in bm.notes if not n.is_long))
+                hits = sorted(n.time for n in bm.notes if not n.is_long)
+                note_times.append(hits)
+                note_divs.append([note_divisor(t, bm.timing_points) for t in hits])
                 written += 1
 
         stats = writer.close()
-    write_note_times(args.out, records, note_times)
+    write_note_times(args.out, records, note_times, note_divs)
 
     # ---- every ranked taiko map osu!.db knows is accounted for ----------- #
     seen = {s["osu_file"] for s in skips} | {r["osu_file"] for r in records}

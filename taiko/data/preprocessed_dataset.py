@@ -41,15 +41,15 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from taiko.data.conditioning import (
-    MOTIF_DIM_DROPOUT, MOTIF_JITTER, PROFILE_DIM, SR_BANDS, STYLE_NULL,
-    normalise_avg_nps, normalise_difficulty, normalise_peak_nps, profile_vector, sr_band,
+    DIVISORS, MOTIF_DIM_DROPOUT, MOTIF_JITTER, PROFILE_DIM, SR_BANDS, STYLE_NULL,
+    normalise_avg_nps, normalise_difficulty, normalise_peak_nps, record_profile, sr_band,
 )
 from taiko.data.frames import FRAME_MS, assert_aligned
 from taiko.data.motif import (
     MOTIF_DIM, MOTIF_NAMES, beat_frames_from_timing, compute_motif, corrupt_motif,
     quantise_motif,
 )
-from taiko.data.shards import MEL_BINS, ShardReader
+from taiko.data.shards import MEL_BINS, ShardReader, load_note_times
 from taiko.data.tensor_repr import (
     HOLD_CHANNELS, N_CHART_CHANNELS, N_TIMING_CHANNELS, ONSET_CHANNELS, TM_COS,
     TM_SIN,
@@ -108,6 +108,9 @@ class WindowedDataset(Dataset):
                            weight (maps in its SR band) ** -sr_flatten: 0 is
                            uniform over maps, 1 is uniform over bands. Only
                            for random draws; evaluation order is unchanged.
+        rhythm_labels:     also return "snap_labels" [len(DIVISORS), W]: 1 on
+                           each note's frame in its snap's row, from the .osu's
+                           own ms (note_times.npz). The rhythm head's target.
     """
 
     def __init__(
@@ -127,6 +130,7 @@ class WindowedDataset(Dataset):
         seed:              int   = 0,
         map_profile:       bool  = False,
         sr_flatten:        float = 0.0,
+        rhythm_labels:     bool  = False,
     ):
         self.reader        = reader
         self.indices       = list(indices) if indices is not None else list(range(len(reader)))
@@ -146,6 +150,12 @@ class WindowedDataset(Dataset):
         w = counts[bands] ** -float(sr_flatten)
         self.draw_p = w / w.sum()
         self.band_share = np.bincount(bands, weights=self.draw_p, minlength=len(SR_BANDS))
+        self.notes = None
+        if rhythm_labels:
+            loaded = load_note_times(reader, with_divisors=True)
+            if loaded is None or loaded[1] is None:
+                raise ValueError("rhythm_labels needs note_times.npz with divisors; re-pack")
+            self.notes = loaded
 
         if not self.indices:
             raise ValueError("WindowedDataset got an empty split")
@@ -215,10 +225,18 @@ class WindowedDataset(Dataset):
         valid_mask = np.zeros(W, dtype=np.float32)
         valid_mask[:valid_len] = 1.0
 
+        snap = np.zeros((len(DIVISORS), W), dtype=np.float32)
+        if self.notes is not None:
+            times, divs = self.notes[0][idx], self.notes[1][idx]
+            frames = np.rint(times / FRAME_MS).astype(np.int64) - start
+            keep = (frames >= 0) & (frames < W) & (divs >= 0)
+            snap[divs[keep], frames[keep]] = 1.0
+
         rate = 1.0
         if self.augment and py_rng.random() < self.rate_p:
             rate = py_rng.uniform(*self.rate_range)
             mel, chart, timing, valid_mask = _rate_augment(mel, chart, timing, valid_mask, rate)
+            snap = _move_rows(snap, rate)
 
         if self.augment and py_rng.random() < self.freq_mask_p:
             bands = py_rng.randint(1, self.freq_mask_bands)
@@ -270,8 +288,8 @@ class WindowedDataset(Dataset):
             "peak_nps":    torch.tensor(normalise_peak_nps(peak_nps), dtype=torch.float32),
             "motif":       torch.from_numpy(motif),
             "motif_mask":  torch.from_numpy(motif_mask),
-            "profile":     torch.from_numpy(profile_vector(
-                record.get("tech_share"), record.get("snap_1_8"), record.get("level"))),
+            "profile":     torch.from_numpy(record_profile(record)),
+            "snap_labels": torch.from_numpy(snap),
             "local_nps":   torch.tensor(onsets / window_sec, dtype=torch.float32),
             "window_nps":  torch.tensor(normalise_avg_nps(onsets / window_sec),
                                         dtype=torch.float32),
@@ -292,6 +310,7 @@ class WindowedDataset(Dataset):
             "motif":      torch.zeros(MOTIF_DIM),
             "motif_mask": torch.zeros(MOTIF_DIM),
             "profile":    torch.zeros(PROFILE_DIM),
+            "snap_labels": torch.zeros(len(DIVISORS), W),
             "local_nps":  torch.tensor(0.0),
             "window_nps": torch.tensor(0.0),
             "map_index":  torch.tensor(-1, dtype=torch.long),
@@ -357,6 +376,18 @@ def _rate_augment(
         return np.ascontiguousarray(np.concatenate([arr, pad], axis=-1))
 
     return fit(mel), fit(chart), fit(timing), fit(valid)
+
+
+def _move_rows(arr: np.ndarray, rate: float) -> np.ndarray:
+    """Onset rows moved like _rate_augment moves the chart, back at width W."""
+    W = arr.shape[1]
+    new_w = max(32, int(round(W / rate)))
+    out = np.zeros_like(arr)
+    rows, frames = np.nonzero(arr > 0.5)
+    moved = np.round((frames + 0.5) * new_w / W - 0.5).astype(np.int64)
+    keep = moved < W
+    out[rows[keep], moved[keep]] = 1.0
+    return out
 
 
 def _move_chart_events(chart: np.ndarray, old_w: int, new_w: int) -> np.ndarray:

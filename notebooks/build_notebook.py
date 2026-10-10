@@ -613,7 +613,13 @@ GRAD_ACCUM = "1"                               # 32/GPU x 2 GPUs = effective 64
 # "Warm start: widening a features-1 checkpoint", step 0 reproduces the old
 # model exactly, and the learning rate ramps back up over --rewarm steps. Set
 # "1" only to keep training the old architecture unchanged.
-FEATURES = "2"
+#
+# 3 is the difficulty profile (ADR 0001): a features-2 checkpoint widens into
+# it the same way. The run also trains the rhythm head (--rhythm-weight), the
+# kat-weighted loss (--kat-weight) and SR-band sampling (--sr-flatten), all at
+# train_diffusion.py's defaults. The shards must be the 2026-10-10 re-pack:
+# training refuses older ones.
+FEATURES = "3"
 
 # What is left of the session, measured rather than guessed. SESSION_HOURS is
 # Kaggle's cap; the cells above have already spent part of it, and a hard-coded
@@ -632,7 +638,10 @@ DIFF_ARGS = [
     *BATCH_ARGS,
     "--grad-accum", GRAD_ACCUM,
     "--ranked-only",                           # D2; a no-op on ranked-only shards
-    "--epochs", "200",
+    # 64 x 20,000 windows / 64 per step = 20,000 steps, about 15 GPU-h at
+    # 2.7 s/step: the warm start's budget in RETRAIN_PLAN. A features-2 -> 3
+    # warm start begins its own schedule (train_diffusion.py, schedule_origin).
+    "--epochs", "64",
     "--samples-per-epoch", "20000",
     # Two, not four, on a four-core box. The loader was measured at ~1,200
     # windows/s on four workers against a demand of 25/s, so two is still an
@@ -689,6 +698,18 @@ if LEAK_CHECK_MINUTES and RESUMABLE["diffusion"]:
     print(f"Leak check: {LEAK_CHECK_MINUTES} min with --mem-debug")
     _run_streaming([sys.executable, "scripts/train_diffusion.py", *probe])
     shutil.rmtree(probe_dir, ignore_errors=True)
+
+# Rhythm-head probe (RETRAIN_PLAN, revised plan step 1): before the warm start
+# changes anything, train a head on the frozen checkpoint and measure whether
+# its features already know each note's snap. About 1.5 GPU-h; writes
+# probe_rhythm.json beside the checkpoints. Set to 0 once it has run.
+RHYTHM_PROBE_STEPS = 3000
+if RHYTHM_PROBE_STEPS and RESUMABLE["diffusion"]:
+    _run_streaming([sys.executable, "scripts/probe_rhythm.py",
+                    "--diffusion", str(CKPT / "diffusion" / "last.pt"),
+                    "--ae", str(AE_BEST), "--shards", str(SHARDS),
+                    "--steps", str(RHYTHM_PROBE_STEPS),
+                    "--out", str(CKPT / "probe_rhythm.json")])
 
 ok = supervise("scripts/train_diffusion.py", DIFF_ARGS,
                CKPT / "diffusion", session_hours_left(), "stage 2")
