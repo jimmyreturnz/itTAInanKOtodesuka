@@ -341,6 +341,27 @@ def test_split_is_by_song_not_by_map():
         print(f"  song-level split          ok  ({len(train_songs)}/{len(val_songs)} songs)")
 
 
+def test_packed_split_keeps_old_sides():
+    """
+    A re-pack must not move a song the old model trained on into val (or the
+    reverse), and a stored per-record split is what split_indices returns.
+    """
+    from types import SimpleNamespace
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from pack_dataset import assign_split
+    old = {"train_sets": {1}, "val_sets": {2}, "train_ids": {30}, "val_ids": {40}}
+    assert assign_split(1, [], old) == "train"
+    assert assign_split(2, [], old) == "val"
+    assert assign_split(-1, [30], old) == "train"     # old header with no set ID
+    assert assign_split(9, [40], old) == "val"
+    new = [assign_split(s, [], old) for s in range(1000, 3000)]
+    assert 0.03 < new.count("val") / len(new) < 0.07, new.count("val")
+
+    records = [{"split": s, "ranked": True} for s in ("train", "val", "train")]
+    assert split_indices(SimpleNamespace(records=records)) == ([0, 2], [1])
+    print("  packed split carried over ok")
+
+
 def test_ranked_only_filter():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         reader = _build(tmp, n_songs=10)

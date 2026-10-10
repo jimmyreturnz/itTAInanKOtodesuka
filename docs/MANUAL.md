@@ -71,35 +71,46 @@ export OSU_API_KEY=your_key_here
 ## 1. Pack the dataset (your PC)
 
 ```bash
-python scripts/pack_dataset.py --scan "D:/osu!/Songs" --ranked-only
+python scripts/pack_dataset.py --scan "D:/osu!/Songs"
 ```
 
-`--ranked-only` is the corpus decision from `DIRECTION.md` (D2): unranked maps
-include rate-ups, which pair one chart with differently-timed audio and are
-anti-signal for exactly the alignment Gate B measures, plus gimmick maps that
-star rating cannot filter out. Folders holding no ranked map are skipped before
-mel extraction, which is about a fifth of the packing time.
+Every pack is ranked-only (`DIRECTION.md` D2, `RETRAIN_PLAN.md` 10h). A
+difficulty counts only when the osu! API says it is ranked **and** the local
+`.osu`'s md5 is the ranked file's md5, because folders also hold rate edits and
+cut versions that keep the ranked BeatmapID. Its star rating is the one
+`D:/osu!/osu!.db` stores for that md5 (NM, plus DT and HT for rate
+augmentation), so refresh osu! after downloading maps. `--ranked-only` is
+still accepted and does nothing.
 
-Try a small run first — it takes a minute and shows you whether anything is
-wrong before you commit to a few hours:
+Try a small run first, into a scratch folder:
 
 ```bash
-python scripts/pack_dataset.py --scan "D:/osu!/Songs" --ranked-only --limit 200
+python scripts/pack_dataset.py --scan "D:/osu!/Songs" --limit 200 --out /tmp/trial --report /tmp/trial.json
 ```
 
 What it does:
 
 1. Finds every taiko-mode `.osu` under your Songs folder
-2. Extracts one mel spectrogram per song folder into `data/processed/mel_cache/`
-3. Parses every difficulty, derives star rating, NPS, style and snap ratios
-4. Writes three files to `data/processed/shards/`
+2. Pass 0: keeps one md5-verified ranked file per beatmap ID
+3. Extracts one mel per audio file (the AudioFilename of that verified `.osu`)
+   into `data/processed/mel_cache/`
+4. Parses every kept difficulty: chart (as long as the song, outro included),
+   NPS, style, snap ratios, and the train/val side of its beatmapset
+5. Writes `mels.dat`, `charts.npz`, `index.json` and `note_times.npz` to
+   `data/processed/shards/`, and every file it skipped, with the reason, to
+   `data/processed/pack_report.json`
 
-**It is resumable.** The mel cache is per song, so if you interrupt it (or your
-PC sleeps), re-running picks up where it stopped. Re-running with no `--scan`
-reuses the cached file list:
+**The split carries over.** A beatmapset on the train side of the index being
+replaced stays train and its val stays val, so a warm-started model is never
+scored on songs it learned. New sets go to val by a stable hash (5%). Pass
+`--keep-split-from old/index.json` if the old shards were moved.
+
+**It is resumable.** The mel cache is per audio file, so if you interrupt it,
+re-running picks up where it stopped. Re-running with no `--scan` reuses the
+cached file list:
 
 ```bash
-python scripts/pack_dataset.py --ranked-only
+python scripts/pack_dataset.py
 ```
 
 Expect roughly 2-5 hours for 13k maps, almost all of it in mel extraction.

@@ -37,6 +37,9 @@ class DbBeatmap:
     unplayed: bool
     status: int = 0
     taiko_stars: dict[int, float] = field(default_factory=dict)   # mods -> SR, NM/DT/HT
+    beatmap_id: int = 0
+    set_id: int = 0
+    mode: int = 0
 
 
 class _Reader:
@@ -119,7 +122,9 @@ def read(path: str | Path) -> dict[str, DbBeatmap]:
                     reader.skip(pair_size)
         reader.skip(4 + 4 + 4)  # drain time, total time, preview time
         reader.skip(reader.int() * 17)  # timing points: double, double, bool
-        reader.skip(4 + 4 + 4 + 4 + 2 + 4 + 1)  # ids, grades, local offset, stack leniency, mode
+        beatmap_id, set_id = reader.int(), reader.int()
+        reader.skip(4 + 4 + 2 + 4)  # thread id, grades, local offset, stack leniency
+        mode = reader.byte()
         reader.skip_string()  # source
         reader.skip_string()  # tags
         reader.skip(2)        # online offset
@@ -131,7 +136,8 @@ def read(path: str | Path) -> dict[str, DbBeatmap]:
         if version < SINGLE_DIFFICULTY_VERSION:
             reader.skip(2)
         reader.skip(4 + 1)    # last modification, mania scroll speed
-        beatmaps[md5] = DbBeatmap(md5, folder, osu_file, unplayed, status=status, taiko_stars=stars)
+        beatmaps[md5] = DbBeatmap(md5, folder, osu_file, unplayed, status=status, taiko_stars=stars,
+                                  beatmap_id=beatmap_id, set_id=set_id, mode=mode)
     return beatmaps
 
 

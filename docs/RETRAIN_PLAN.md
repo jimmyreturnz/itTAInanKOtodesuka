@@ -49,6 +49,7 @@ python scripts/sweep_family_switch.py --probs-cache outputs/eval_cache_v2
 | ee12b3b | `generate.py --level Kantan..Hell Oni`: ranked median SR, OD and HP, plus `criteria.enforce` |
 | b36285c | `taiko/eval/mapset.py`: set-level ranking checks. Decoder now truncates to whole ms like osu! does, Grid uses exact fractional red-line offsets, no notes before the first red line, `fix_chart` |
 | d877d24 | Two low-difficulty tells from round 3 are now checks: Kantan 1/1 runs in the song's own beat, triplet-only notes in Kantan/Futsuu |
+| (this) | Re-pack (10h, 9, 10e): md5-verified ranked, osu!.db SR (NM/DT/HT), one record per beatmap ID, audio from the verified .osu, split per beatmapset carried over from the old index, outros in the chart, `pack_report.json`. 11,096 maps / 2,829 songs, 10,557 train / 539 val. Old eval cache moved to `outputs/eval_cache_v2_oldindex`; the baseline must be re-run on the new index |
 
 ### Baseline (best.pt, step 58968; `evaluate.py --per-band 10 --seeds 3`, 60 maps)
 - Onset F1 0.686. Exact snap 0.955, against a ceiling of 0.998.
@@ -146,7 +147,7 @@ Recommended: **warm-start**.
   the eval pool and the criteria checks.
 
 ### Next, in order (Phase 3 below)
-1. **Re-pack (item 10h)**, which also covers items 9, 10e and the audio fix:
+1. ~~**Re-pack (item 10h)**~~ done 2026-10-10, which also covers items 9, 10e and the audio fix:
    - ranked = API ranked and the md5 matches;
    - SR from osu!.db by md5;
    - one record per beatmap ID;

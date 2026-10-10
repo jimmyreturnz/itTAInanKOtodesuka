@@ -376,7 +376,17 @@ def split_indices(
     would measure memorisation of songs the model has already heard rather than
     generalisation to new ones -- and would report a val loss far better than
     the real one.
+
+    Shards packed since 10h carry each record's side, decided per beatmapset at
+    pack time (`pack_dataset.assign_split`); that is used as-is, and
+    `val_ratio`/`seed` only apply to older shards.
     """
+    if reader.records and "split" in reader.records[0]:
+        keep = [i for i, r in enumerate(reader.records)
+                if not ranked_only or r.get("ranked", False)]
+        return ([i for i in keep if reader.records[i]["split"] != "val"],
+                [i for i in keep if reader.records[i]["split"] == "val"])
+
     by_song: dict[str, list[int]] = {}
     for idx, record in enumerate(reader.records):
         if ranked_only and not record.get("ranked", False):
