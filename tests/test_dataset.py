@@ -71,6 +71,8 @@ def _build(tmp: str, n_songs: int = 4, diffs_per_song: int = 3, length: int = 40
                         "avg_nps": 4.0 + d,
                         "peak_nps": 8.0 + d,
                         "ranked": s % 2 == 0,
+                        "profile_motif": [0.5] * MOTIF_DIM,
+                        "tech_share": 0.1, "snap_1_8": 0.02, "level": "Oni",
                     },
                     chart,
                     [TimingPoint(time=0, beat_length=400.0, meter=4, uninherited=True)],
@@ -371,6 +373,21 @@ def test_rate_sr_follows_the_maps_own_curve():
     assert 3.9 < rate_sr(rec, 0.9) < 5.0
     assert rate_sr({"difficulty": 5.0}, 1.1) == 5.0          # pre-10h shards
     print("  rate SR on the map's curve ok")
+
+
+def test_map_profile_replaces_style_and_window_motif():
+    """features 3: the motif slot is the map's own profile, style is null."""
+    from taiko.data.conditioning import TECH, profile_vector
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        reader = _build(tmp)
+        ds = WindowedDataset(reader, window_frames=W, augment=False,
+                             samples_per_epoch=4, map_profile=True)
+        s = ds[0]
+        assert int(s["style"]) == STYLE_NULL
+        assert torch.allclose(s["motif"], torch.full((MOTIF_DIM,), 0.5), atol=0.08), s["motif"]
+        assert torch.equal(s["profile"], torch.from_numpy(profile_vector(0.1, 0.02, "Oni")))
+        assert abs(float(s["profile"][TECH]) - 0.1) < 1e-6
+        print("  map profile conditioning  ok")
 
 
 def test_ranked_only_filter():

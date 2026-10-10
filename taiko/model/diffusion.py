@@ -35,7 +35,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from taiko.data.conditioning import (
-    CFG_DROPOUT, MAP_NPS_DROPOUT, STYLE_NULL, WINDOW_NPS_DROPOUT,
+    CFG_DROPOUT, LEVEL0, MAP_NPS_DROPOUT, PROFILE_DIM, PROFILE_DROPOUT, SPEED,
+    STYLE_NULL, TECH, WINDOW_NPS_DROPOUT,
 )
 from taiko.data.motif import MOTIF_DIM
 from taiko.model.audio_encoder import MelEncoder1D
@@ -49,7 +50,10 @@ from taiko.model.unet import TaikoDiffusionUNet
 # pooled phasor. 2 adds TimingEncoder, song-level onset/loudness channels and
 # window-density conditioning. A generation-1 checkpoint can be widened into
 # generation 2 without losing what it learned -- see taiko/train/warm_start.py.
-FEATURES_LATEST = 2
+# 3 is the difficulty profile (ADR 0001): the motif slot carries the map-wide
+# motif, style is always null, and tech share, 1/8 share and the criteria level
+# enter through one appended projection. 2 widens into 3 the same way.
+FEATURES_LATEST = 3
 TIMING_FEATURE_CHANNELS = 32
 
 
@@ -140,7 +144,7 @@ class TaikoDiffusion(nn.Module):
         features: int = FEATURES_LATEST,
     ):
         super().__init__()
-        if features not in (1, 2):
+        if features not in (1, 2, 3):
             raise ValueError(f"unknown features generation {features}")
         self.features = features
 
@@ -211,6 +215,7 @@ class TaikoDiffusion(nn.Module):
             audio_channels=self.wave_model.out_channels,
             timing_feature_channels=TIMING_FEATURE_CHANNELS if features >= 2 else 0,
             density_context=features >= 2,
+            map_profile=features >= 3,
             use_checkpoint=profile.use_checkpoint,
             use_s4=profile.use_s4,
         )
@@ -281,6 +286,7 @@ class TaikoDiffusion(nn.Module):
         motif: torch.Tensor | None = None,
         motif_mask: torch.Tensor | None = None,
         window_nps: torch.Tensor | None = None,
+        profile: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Training loss. Returns (loss, metrics) where metrics is a stacked tensor
@@ -321,6 +327,15 @@ class TaikoDiffusion(nn.Module):
                 peak_nps = peak_nps * map_known.to(peak_nps.dtype)
             density = dict(window_nps=window_nps, window_known=win_known,
                            map_nps_known=map_known)
+        if self.features >= 3 and profile is not None:
+            # Tech share, 1/8 share and level are each unspecified some of the
+            # time, value and known flag together.
+            keep = (torch.rand(B, 3, device=device) >= PROFILE_DROPOUT).to(profile.dtype)
+            per_dim = torch.ones_like(profile)
+            per_dim[:, TECH:SPEED] = keep[:, :1]
+            per_dim[:, SPEED:LEVEL0] = keep[:, 1:2]
+            per_dim[:, LEVEL0:] = keep[:, 2:]
+            density["profile"] = profile * per_dim
 
         prediction = self.unet_model(
             z_t, t, audio_features, timing_latent,
@@ -406,6 +421,7 @@ class TaikoDiffusion(nn.Module):
         peak_nps: float | torch.Tensor | None = None,
         motif: torch.Tensor | None = None,
         motif_mask: torch.Tensor | None = None,
+        profile=None,
         ddim_steps: int = 50,
         cfg_scale: float | None = None,
         eta: float = 0.0,
@@ -462,6 +478,10 @@ class TaikoDiffusion(nn.Module):
                 map_nps_known=torch.full((B,), 0.0 if avg_nps is None else 1.0,
                                          device=device),
             )
+
+        if self.features >= 3 and profile is not None:
+            density["profile"] = torch.as_tensor(profile, device=device, dtype=dtype
+                                                 ).reshape(1, PROFILE_DIM).expand(B, -1)
 
         # Both conditioning embeddings are built once. They do not depend on the
         # timestep, so recomputing them 50 times is pure waste.

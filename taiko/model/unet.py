@@ -40,7 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from taiko.data.conditioning import N_STYLES, STYLE_NULL
+from taiko.data.conditioning import N_STYLES, PROFILE_DIM, STYLE_NULL
 from taiko.data.motif import MOTIF_DIM
 from taiko.data.tensor_repr import N_TIMING_CHANNELS
 from taiko.model.s4_block import S4StyleBlock
@@ -83,7 +83,8 @@ class ConditionEmbedding(nn.Module):
     a train/inference skew waiting to happen.
     """
 
-    def __init__(self, dim: int, n_styles: int = N_STYLES, context: bool = False):
+    def __init__(self, dim: int, n_styles: int = N_STYLES, context: bool = False,
+                 profile: bool = False):
         super().__init__()
 
         d_scalar = max(16, dim // 8)
@@ -116,6 +117,15 @@ class ConditionEmbedding(nn.Module):
         else:
             self.ctx_proj = None
 
+        # Difficulty profile (features >= 3, ADR 0001): tech share, 1/8 share
+        # and the criteria level, with their known flags. Appended after the
+        # density context for the same reason.
+        if profile:
+            self.profile_proj = nn.Linear(PROFILE_DIM, d_scalar)
+            total += d_scalar
+        else:
+            self.profile_proj = None
+
         self.out_proj = nn.Sequential(nn.SiLU(), nn.Linear(total, dim))
 
         # The learned unconditional embedding. Guidance extrapolates away from
@@ -135,9 +145,12 @@ class ConditionEmbedding(nn.Module):
         window_nps: torch.Tensor | None = None,
         window_known: torch.Tensor | None = None,
         map_nps_known: torch.Tensor | None = None,
+        profile: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
+            profile:       [B, PROFILE_DIM] from `conditioning.profile_vector`.
+                           Absent means every part unspecified.
             window_nps:    [B] this window's normalised note density.
             window_known:  [B] 1 where window_nps is a real request, 0 where it
                            is unspecified. Absent means unspecified.
@@ -174,6 +187,10 @@ class ConditionEmbedding(nn.Module):
             wnps = scalar(window_nps) * known
             mknown = ones if map_nps_known is None else scalar(map_nps_known)
             parts.append(self.ctx_proj(torch.cat([wnps, known, mknown], dim=-1)))
+        if self.profile_proj is not None:
+            if profile is None:
+                profile = torch.zeros(B, PROFILE_DIM, device=device, dtype=difficulty.dtype)
+            parts.append(self.profile_proj(profile.to(difficulty.dtype)))
         emb = self.out_proj(torch.cat(parts, dim=-1))
 
         if drop_mask is not None:
@@ -289,6 +306,7 @@ class TaikoDiffusionUNet(nn.Module):
         timing_channels: int = N_TIMING_CHANNELS,
         timing_feature_channels: int = 0,
         density_context: bool = False,
+        map_profile:    bool = False,
         use_checkpoint: bool = True,
         use_s4:         bool = True,
     ):
@@ -319,7 +337,7 @@ class TaikoDiffusionUNet(nn.Module):
 
         self.time_emb = TimestepEmbedding(d_model=128, dim=emb_dim)
         self.cond_emb = ConditionEmbedding(dim=emb_dim, n_styles=n_styles,
-                                           context=density_context)
+                                           context=density_context, profile=map_profile)
 
         self.conv_in = nn.Conv1d(z_channels, base_channels, 3, padding=1)
 
@@ -424,6 +442,7 @@ class TaikoDiffusionUNet(nn.Module):
         window_nps: torch.Tensor | None = None,
         window_known: torch.Tensor | None = None,
         map_nps_known: torch.Tensor | None = None,
+        profile: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -448,7 +467,7 @@ class TaikoDiffusionUNet(nn.Module):
             cond_emb = self.cond_emb(
                 difficulty, style, avg_nps, peak_nps, motif, motif_mask, drop_mask,
                 window_nps=window_nps, window_known=window_known,
-                map_nps_known=map_nps_known,
+                map_nps_known=map_nps_known, profile=profile,
             )
         emb = self.time_emb(t) + cond_emb
 

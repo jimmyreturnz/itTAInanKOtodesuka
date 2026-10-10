@@ -103,7 +103,7 @@ def lr_at(step: int, warmup: int, total: int, peak: float, floor: float = 1e-6) 
 
 
 BATCH_KEYS = ("chart", "mel", "timing", "difficulty", "style", "valid_mask",
-              "avg_nps", "peak_nps", "motif", "motif_mask", "window_nps")
+              "avg_nps", "peak_nps", "motif", "motif_mask", "window_nps", "profile")
 
 
 def batch_to(batch: dict, device: torch.device, non_blocking: bool = True) -> dict:
@@ -160,7 +160,7 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=2000)
     ap.add_argument("--ema-decay", type=float, default=0.9995)
     ap.add_argument("--prediction-type", default="v", choices=["v", "epsilon"])
-    ap.add_argument("--features", type=int, default=FEATURES_LATEST, choices=[1, 2],
+    ap.add_argument("--features", type=int, default=FEATURES_LATEST, choices=[1, 2, 3],
                     help="model generation. 2 adds the timing encoder, song-level "
                          "onset/loudness channels and window-density conditioning. "
                          "Resuming a generation-1 checkpoint at 2 widens it in "
@@ -283,13 +283,19 @@ def main() -> int:
     # generation can ask for a realistic density instead of zero.
     nps_prior = fit_nps_prior(reader.records[i] for i in train_idx)
 
+    map_profile = args.features >= 3
+    if map_profile and "profile_motif" not in reader.records[0]:
+        print("ERROR: --features 3 needs the difficulty profile in the shards; "
+              "re-pack them (python scripts/pack_dataset.py)")
+        return 1
     train_ds = WindowedDataset(
         reader, train_idx, window_frames=args.window_frames,
         random_window=True, augment=True, samples_per_epoch=args.samples_per_epoch,
+        map_profile=map_profile,
     )
     val_ds = WindowedDataset(
         reader, val_idx, window_frames=args.window_frames,
-        random_window=False, augment=False,
+        random_window=False, augment=False, map_profile=map_profile,
     )
 
     total_batch = batch_per_gpu * max(n_gpus, 1)

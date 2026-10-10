@@ -26,6 +26,7 @@ from taiko.data.motif import MOTIF_DIM
 from taiko.data.tensor_repr import timing_stream_from_bpm
 from taiko.model.autoencoder import AutoencoderConfig, ChartAutoencoder
 from taiko.model.diffusion import EMA, TaikoDiffusion
+from taiko.data.conditioning import profile_vector
 from taiko.model.timing_encoder import HARMONICS, timing_features
 from taiko.train.warm_start import warm_start
 
@@ -57,6 +58,8 @@ def _unet_out(model: TaikoDiffusion, mel, timing, z, t):
         extra = dict(timing_features=model.encode_timing(timing),
                      window_nps=torch.zeros(B), window_known=torch.zeros(B),
                      map_nps_known=torch.ones(B))
+    if model.features >= 3:
+        extra["profile"] = torch.from_numpy(np.stack([profile_vector(0.12, 0.05, "Oni")] * B))
     audio = model.wave_model(mel)
     tlat = model.downsample_timing(timing, z.shape[-1])
     return model.unet_model(z, t, audio, tlat, **cond, **extra)
@@ -115,6 +118,34 @@ def test_widened_model_reproduces_the_old_one():
     assert new_ema.step == ema.step
     print(f"  warm start reproduces the old model ok  (max diff {diff:.2e}, "
           f"{len(report.widened)} widened, {carried} Adam states carried)")
+
+
+def test_profile_widening_reproduces_features_2():
+    """
+    features 2 -> 3 (ADR 0001): the profile projection is new and the
+    conditioning out_proj gains zero columns, so a real profile changes nothing
+    until training moves them.
+    """
+    torch.manual_seed(0)
+    ae = ChartAutoencoder(AutoencoderConfig())
+    old = _model(2, ae, seed=1).eval()
+    with torch.no_grad():
+        for p in old.trainable_parameters():
+            p.add_(torch.randn_like(p) * 0.05)
+    ckpt = {"unet": old.unet_model.state_dict(), "wave": old.wave_model.state_dict(),
+            "timing": old.timing_model.state_dict(), "step": 1}
+    new = _model(3, ae, seed=2).eval()
+    report = warm_start(new, ckpt)
+    assert "unet.cond_emb.out_proj.1.weight" in report.widened, report.widened
+    assert any("profile_proj" in n for n in report.fresh)
+
+    mel, timing = _inputs()
+    z = torch.randn(2, 16, W // ae.compression)
+    t = torch.tensor([10, 700])
+    with torch.no_grad():
+        diff = (_unet_out(old, mel, timing, z, t) - _unet_out(new, mel, timing, z, t)).abs().max().item()
+    assert diff < 1e-5, f"features 3 differs from features 2 by {diff}"
+    print(f"  features 2 -> 3 reproduces the old model ok  (max diff {diff:.2e})")
 
 
 def test_timing_features_keep_the_beat_through_latent_resolution():

@@ -34,6 +34,7 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
 import torch
@@ -42,7 +43,7 @@ from taiko.data.audio import MelExtractor
 from taiko.data.audio_activity import Activity, activity, activity_score, gate_notes
 from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
-    style_to_int,
+    profile_vector, style_to_int,
 )
 from taiko.data.decode import calibrate_threshold, decode_on_grid
 from taiko.data.frames import describe, frames_to_sec
@@ -52,6 +53,7 @@ from taiko.data.motif import (
     get_preset,
 )
 from taiko.data.nps_prior import load_prior, lookup
+from taiko.data.profile import PRESET_REFS, map_motif, preset_profile
 from taiko.data.osu_parser import OsuTaikoParser, TimingPoint
 from taiko.data.osu_writer import OsuTaikoSerializer
 from taiko.eval.criteria import NAMES, check, enforce
@@ -110,6 +112,39 @@ def resolve_motif(args, parser: OsuTaikoParser) -> tuple[np.ndarray | None, np.n
     # Nothing requested. An all-zero mask means "unspecified", which is not the
     # same as asking for a chart with zero of everything.
     return None, None
+
+
+def resolve_profile(args, parser: OsuTaikoParser):
+    """
+    features >= 3 (ADR 0001): (motif, motif_mask, profile vector). --reference
+    measures one map the way the pack does; --preset averages its reference
+    maps from the shard index. Anything not given stays unspecified.
+    """
+    from pack_dataset import dominant_bpm, infer_style_and_snaps
+    motif = tech = speed = None
+    if args.reference:
+        bm = parser.parse_file(Path(args.reference))
+        chart, _ = beatmap_to_tensors(bm)
+        motif = map_motif(chart, dominant_bpm(bm))
+        _, snaps = infer_style_and_snaps(bm)
+        tech, speed = snaps["tech_share"], snaps["snap_1_8"]
+        print(f"Profile measured from {Path(args.reference).name}:")
+    elif args.preset:
+        if args.preset not in PRESET_REFS:
+            raise SystemExit(f"--preset {args.preset} is not a profile preset; "
+                             f"choose from {sorted(PRESET_REFS)}")
+        import json
+        index = json.loads((args.shards / "index.json").read_text(encoding="utf-8"))
+        p = preset_profile(args.preset, index["records"])
+        motif, tech, speed = p["profile_motif"], p["tech_share"], p["snap_1_8"]
+        print(f"Profile preset {args.preset!r}, {len(PRESET_REFS[args.preset])} reference maps "
+              f"(their mean: {p['difficulty']:.2f}*, {p['avg_nps']:.1f} avg nps):")
+    level = NAMES[args.level][0] if args.level else None
+    if motif is not None:
+        print(describe_motif(motif))
+        print(f"  tech share {tech:.3f}, 1/8 share {speed:.3f}")
+    return (motif, None if motif is None else np.ones_like(motif),
+            profile_vector(tech, speed, level))
 
 
 def resolve_timing(args, total_frames: int) -> tuple[list[TimingPoint], str]:
@@ -200,8 +235,11 @@ def main() -> int:
                          "given its ranked median SR, OD and HP unless --difficulty is set")
     ap.add_argument("--style", default=None,
                     choices=["standard", "stream", "speed", "tech"])
-    ap.add_argument("--preset", default=None, choices=sorted(PRESETS),
-                    help="named motif preset")
+    ap.add_argument("--preset", default=None, choices=sorted(set(PRESETS) | set(PRESET_REFS)),
+                    help="features 3: a profile averaged over reference maps "
+                         f"({', '.join(sorted(PRESET_REFS))}); older models: a motif preset")
+    ap.add_argument("--shards", type=Path, default=Path("data/processed/shards"),
+                    help="where --preset finds its reference maps (features 3)")
     ap.add_argument("--reference", default=None,
                     help="an .osu file to copy the style of")
     ap.add_argument("--motif", type=float, nargs="+", default=None,
@@ -295,8 +333,15 @@ def main() -> int:
 
     # ---- conditioning -------------------------------------------------- #
     parser = OsuTaikoParser()
-    motif, motif_mask = resolve_motif(args, parser)
-    style = style_to_int(args.style) if args.style else STYLE_NULL
+    profile = None
+    if model.features >= 3:
+        motif, motif_mask, profile = resolve_profile(args, parser)
+        if args.style or args.motif:
+            print("  (--style and --motif are not inputs of a features-3 model; ignored)")
+        style = STYLE_NULL
+    else:
+        motif, motif_mask = resolve_motif(args, parser)
+        style = style_to_int(args.style) if args.style else STYLE_NULL
     avg_nps, peak_nps, density_source = resolve_density(args, ckpt, model.features)
 
     win_nps = None
@@ -331,6 +376,7 @@ def main() -> int:
         peak_nps=normalise_peak_nps(peak_nps) if peak_nps is not None else None,
         motif=motif,
         motif_mask=motif_mask,
+        profile=profile,
         window_nps=win_nps,
         window_frames=window,
         overlap_frames=overlap,

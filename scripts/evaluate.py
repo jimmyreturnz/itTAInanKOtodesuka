@@ -63,9 +63,10 @@ import torch
 
 from taiko.data.audio_activity import ON_GRID_MS, activity, activity_score, silence_rate
 from taiko.data.conditioning import (
-    STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
+    normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
 )
 from taiko.data.decode import calibrate_threshold, decode_on_grid
+from taiko.data.profile import record_conditioning
 from taiko.data.frames import FRAME_MS, describe
 from taiko.data.grid import Grid
 from taiko.data.motif import beat_frames_from_timing, compute_motif
@@ -615,10 +616,10 @@ def main() -> int:
             return generate_song(
                 model, mel=mel, timing=timing_tensor,
                 difficulty=normalise_difficulty(requested_sr),
-                style=int(record.get("style", STYLE_NULL)),
                 avg_nps=normalise_avg_nps(requested_nps) if requested_nps else None,
                 peak_nps=normalise_peak_nps(float(record.get("peak_nps", 0.0))) or None,
-                motif=motif, motif_mask=motif_mask,
+                **{**record_conditioning(record, model.features),
+                   **({"motif": motif, "motif_mask": motif_mask} if motif is not None else {})},
                 window_frames=window, overlap_frames=window // 2,
                 ddim_steps=args.steps, cfg_scale=args.cfg_scale,
                 progress=False,

@@ -48,9 +48,10 @@ import torch
 from evaluate import SR_BANDS, load_model
 from pack_dataset import DEFAULT_SCAN_CACHE, safe_name
 from taiko.data import osu_db
-from taiko.data.conditioning import (STYLE_NULL, normalise_avg_nps, normalise_difficulty,
+from taiko.data.conditioning import (normalise_avg_nps, normalise_difficulty,
                                      normalise_peak_nps)
 from taiko.data.decode import decode_on_grid
+from taiko.data.profile import record_conditioning
 from taiko.data.grid import Grid
 from taiko.data.osu_parser import OsuTaikoParser, TaikoBeatmap
 from taiko.data.osu_writer import OsuTaikoSerializer
@@ -121,7 +122,7 @@ def ai_chart(model, threshold, window, reader, idx, rec, points, device, seed) -
     probs = generate_song(
         model, mel=mel, timing=timing,
         difficulty=normalise_difficulty(float(rec.get("difficulty", 5.0))),
-        style=int(rec.get("style", STYLE_NULL)),
+        **record_conditioning(rec, model.features),
         avg_nps=normalise_avg_nps(nps) if nps else None,
         peak_nps=normalise_peak_nps(float(rec.get("peak_nps", 0.0))) or None,
         window_frames=window, overlap_frames=window // 2, progress=False,

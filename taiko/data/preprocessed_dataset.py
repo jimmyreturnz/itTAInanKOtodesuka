@@ -41,12 +41,13 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from taiko.data.conditioning import (
-    MOTIF_DIM_DROPOUT, MOTIF_JITTER, STYLE_NULL,
-    normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
+    MOTIF_DIM_DROPOUT, MOTIF_JITTER, PROFILE_DIM, STYLE_NULL,
+    normalise_avg_nps, normalise_difficulty, normalise_peak_nps, profile_vector,
 )
 from taiko.data.frames import FRAME_MS, assert_aligned
 from taiko.data.motif import (
-    MOTIF_DIM, beat_frames_from_timing, compute_motif, corrupt_motif,
+    MOTIF_DIM, MOTIF_NAMES, beat_frames_from_timing, compute_motif, corrupt_motif,
+    quantise_motif,
 )
 from taiko.data.shards import MEL_BINS, ShardReader
 from taiko.data.tensor_repr import (
@@ -101,6 +102,8 @@ class WindowedDataset(Dataset):
         motif_dropout:     per-dimension motif dropout. See taiko/data/motif.py
                            -- this is what stops the model reading the answer
                            off its own conditioning vector.
+        map_profile:       features >= 3 (ADR 0001): the motif slot carries the
+                           map-wide motif and style is always null.
     """
 
     def __init__(
@@ -118,6 +121,7 @@ class WindowedDataset(Dataset):
         freq_mask_p:       float = 0.15,
         freq_mask_bands:   int   = 12,
         seed:              int   = 0,
+        map_profile:       bool  = False,
     ):
         self.reader        = reader
         self.indices       = list(indices) if indices is not None else list(range(len(reader)))
@@ -131,6 +135,7 @@ class WindowedDataset(Dataset):
         self.freq_mask_p   = freq_mask_p
         self.freq_mask_bands = freq_mask_bands
         self.seed          = seed
+        self.map_profile   = map_profile
 
         if not self.indices:
             raise ValueError("WindowedDataset got an empty split")
@@ -218,7 +223,7 @@ class WindowedDataset(Dataset):
         # told the model a 1.1x window was as dense as the 1.0x one.
         avg_nps    = float(record.get("avg_nps", 0.0)) * rate
         peak_nps   = float(record.get("peak_nps", 0.0)) * rate
-        style      = int(record.get("style", STYLE_NULL))
+        style      = STYLE_NULL if self.map_profile else int(record.get("style", STYLE_NULL))
 
         if self.augment:
             # Small jitter so the model does not treat these as exact lookups.
@@ -228,8 +233,12 @@ class WindowedDataset(Dataset):
 
         # The motif is measured on the window the model must generate, so it is
         # corrupted before the model ever sees it.
-        beat_frames = beat_frames_from_timing(timing)
-        motif = compute_motif(chart, beat_frames, quantise=True)
+        if self.map_profile:
+            motif = np.asarray(record["profile_motif"], dtype=np.float32).copy()
+            motif[MOTIF_NAMES.index("note_density")] *= rate     # denser when faster, like NPS
+            motif = quantise_motif(motif)
+        else:
+            motif = compute_motif(chart, beat_frames_from_timing(timing), quantise=True)
         if self.augment and self.motif_dropout > 0:
             motif, motif_mask = corrupt_motif(
                 motif, rng, dim_dropout=self.motif_dropout, jitter=self.motif_jitter
@@ -251,6 +260,8 @@ class WindowedDataset(Dataset):
             "peak_nps":    torch.tensor(normalise_peak_nps(peak_nps), dtype=torch.float32),
             "motif":       torch.from_numpy(motif),
             "motif_mask":  torch.from_numpy(motif_mask),
+            "profile":     torch.from_numpy(profile_vector(
+                record.get("tech_share"), record.get("snap_1_8"), record.get("level"))),
             "local_nps":   torch.tensor(onsets / window_sec, dtype=torch.float32),
             "window_nps":  torch.tensor(normalise_avg_nps(onsets / window_sec),
                                         dtype=torch.float32),
@@ -270,6 +281,7 @@ class WindowedDataset(Dataset):
             "peak_nps":   torch.tensor(0.0),
             "motif":      torch.zeros(MOTIF_DIM),
             "motif_mask": torch.zeros(MOTIF_DIM),
+            "profile":    torch.zeros(PROFILE_DIM),
             "local_nps":  torch.tensor(0.0),
             "window_nps": torch.tensor(0.0),
             "map_index":  torch.tensor(-1, dtype=torch.long),

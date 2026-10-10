@@ -16,6 +16,10 @@ dedicated extra index that means "no style requested".
 
 from __future__ import annotations
 
+import numpy as np
+
+from taiko.eval.criteria import LEVELS
+
 # --------------------------------------------------------------------------- #
 # Style
 # --------------------------------------------------------------------------- #
@@ -84,3 +88,31 @@ MOTIF_JITTER      = 0.05
 # is what lets generation leave either one out without asking for zero.
 MAP_NPS_DROPOUT    = 0.2
 WINDOW_NPS_DROPOUT = 0.3
+
+
+# --------------------------------------------------------------------------- #
+# Difficulty profile (features >= 3, ADR 0001)
+# --------------------------------------------------------------------------- #
+# The map-wide profile replaces style and the per-window motif. Its motif part
+# travels in the old motif slot, computed over the whole map; the rest is this
+# vector: tech share and 1/8 share, each with a known flag, then the criteria
+# level one-hot (all zero = unspecified).
+
+PROFILE_DIM = 4 + len(LEVELS)
+TECH, TECH_KNOWN, SPEED, SPEED_KNOWN, LEVEL0 = 0, 1, 2, 3, 4
+
+# Each part is unspecified this often in training, so generation may omit it.
+PROFILE_DROPOUT = 0.2
+
+
+def profile_vector(tech_share: float | None = None, speed_share: float | None = None,
+                   level: str | None = None):
+    """[PROFILE_DIM] float32. None leaves that part unspecified."""
+    v = np.zeros(PROFILE_DIM, dtype=np.float32)
+    if tech_share is not None:
+        v[TECH], v[TECH_KNOWN] = min(max(float(tech_share), 0.0), 1.0), 1.0
+    if speed_share is not None:
+        v[SPEED], v[SPEED_KNOWN] = min(max(float(speed_share), 0.0), 1.0), 1.0
+    if level in LEVELS:
+        v[LEVEL0 + LEVELS.index(level)] = 1.0
+    return v

@@ -413,9 +413,10 @@ python scripts/train_timing.py --shards data/processed/shards --out checkpoints/
 | Flag | What it does |
 |---|---|
 | `--difficulty 5.5` | target star rating |
-| `--preset stream` | named style: `simple`, `standard`, `stream`, `speed`, `tech`, `big_heavy` |
-| `--style stream` | the coarse 4-class label from training |
-| `--reference "map.osu"` | copy the style of an existing map |
+| `--preset deathstream` | features 3: a difficulty profile averaged over reference maps (`deathstream`, `speed`, `burst`, `tech`; `taiko/data/profile.py`). Older models: a motif preset |
+| `--style stream` | older models only: the coarse 4-class label from training |
+| `--reference "map.osu"` | copy the profile (features 3) or motif of an existing map |
+| `--level Oni` | also a profile input on features-3 models |
 | `--avg-nps 7` | target notes per second |
 | `--cfg-scale 4.0` | how hard to push toward what you asked for |
 
@@ -429,6 +430,13 @@ python scripts/generate.py --audio song.mp3 --difficulty 6 \
 It extracts the rhythmic fingerprint of that map — its snap distribution, colour
 change rate, burst density, big-note rate — and asks for a chart with the same
 character.
+
+On a features-3 model (ADR 0001) style and the per-window motif are gone. The
+model reads a map-wide difficulty profile: the motif over the whole map, its
+tech share (ternary and unusual snaps) and 1/8 share, and the criteria level.
+`--reference` measures all of these the way the pack does; `--preset` averages
+them over its reference maps in the shard index. SR and density still come from
+`--difficulty` / `--avg-nps` as before.
 
 ### When output is wrong
 

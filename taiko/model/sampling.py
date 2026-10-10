@@ -92,6 +92,7 @@ def generate_song_latent(
     peak_nps: float | None = None,
     motif: torch.Tensor | np.ndarray | None = None,
     motif_mask: torch.Tensor | np.ndarray | None = None,
+    profile: np.ndarray | None = None,
     window_nps: float | Sequence[float] | None = None,
     window_frames: int = 1536,
     overlap_frames: int = 768,
@@ -189,6 +190,9 @@ def generate_song_latent(
             wknown = torch.ones(n_win, device=device)
         mknown = torch.full((n_win,), 0.0 if avg_nps is None else 1.0, device=device)
         density = dict(window_nps=wnps_t, window_known=wknown, map_nps_known=mknown)
+    if features >= 3 and profile is not None:
+        density["profile"] = torch.as_tensor(np.asarray(profile), device=device,
+                                             dtype=dtype).reshape(1, -1).expand(n_win, -1)
 
     cond_emb = model.unet_model.cond_emb(
         diff_t, style_t, anps_t, pnps_t, motif_t, mask_t, **density,

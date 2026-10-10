@@ -46,7 +46,9 @@ from taiko.data.conditioning import STYLE_NAMES
 from taiko.data import osu_db
 from taiko.data.frames import FRAME_MS, describe, ms_to_frame
 from taiko.data.osu_parser import OsuTaikoParser
+from taiko.data.profile import map_motif
 from taiko.data.shards import ShardWriter, write_note_times
+from taiko.eval.criteria import level_of
 from taiko.data.tensor_repr import beatmap_to_tensors
 
 try:
@@ -70,6 +72,7 @@ MIN_DURATION_MS   = 20_000
 MAX_AUDIO_BYTES   = 150 * 1024 * 1024
 
 SNAP_TOLERANCE_MS      = 8.0
+SNAP_MATCH_MS          = 3.0     # 1 ms truncation + a fractional red line, with margin
 STREAM_MIN_CONSECUTIVE = 8
 SPEED_EFFECTIVE_BPM    = 270
 TECH_WEIRD_RATIO       = 0.12
@@ -235,17 +238,21 @@ def active_red_line(timing_points, time_ms):
 
 
 def snap_of(note_time: int, timing_points) -> int | None:
+    """
+    The coarsest snap the note sits on, within SNAP_MATCH_MS. Not the closest:
+    osu! truncates a snapped note to whole ms, so a 1/4 note lands up to 1 ms
+    off its line and a finer grid (1/12, 1/16) can fit it better, which read
+    clean 1/4 streams as 13% tech (Tenkai e no Kippu, 447 notes).
+    """
     tp = active_red_line(timing_points, note_time)
     if tp is None:
         return None
-    offset = (note_time - tp.time) % tp.beat_length
-    best, best_error = None, SNAP_TOLERANCE_MS
+    offset = (note_time - tp.exact_time) % tp.beat_length
     for denom in SNAP_DENOMS:
         grid = tp.beat_length / denom
-        error = abs(offset - round(offset / grid) * grid)
-        if error < best_error:
-            best, best_error = denom, error
-    return best
+        if abs(offset - round(offset / grid) * grid) <= SNAP_MATCH_MS:
+            return denom
+    return None
 
 
 def dominant_bpm(bm) -> float:
@@ -265,7 +272,7 @@ def dominant_bpm(bm) -> float:
 
 def infer_style_and_snaps(bm) -> tuple[int, dict[str, float]]:
     hits = [n for n in bm.notes if not n.is_long]
-    empty = {"snap_1_4": 0.0, "snap_1_6": 0.0, "snap_1_8": 0.0}
+    empty = {"snap_1_4": 0.0, "snap_1_6": 0.0, "snap_1_8": 0.0, "tech_share": 0.0}
     if not hits or not bm.timing_points:
         return 0, empty
 
@@ -288,6 +295,7 @@ def infer_style_and_snaps(bm) -> tuple[int, dict[str, float]]:
         "snap_1_4": round(counts.get(4, 0) / total, 4),
         "snap_1_6": round(counts.get(6, 0) / total, 4),
         "snap_1_8": round(counts.get(8, 0) / total, 4),
+        "tech_share": round(weird / total, 4),      # ternary and unusual snaps
     }
 
     if weird / total >= TECH_WEIRD_RATIO:
@@ -695,6 +703,8 @@ def main() -> int:
                     "beatmap_id":  c["beatmap_id"],
                     "beatmapset_id": c["beatmapset_id"],
                     "md5":         c["md5"],
+                    "level":       level_of(bm.version, stars[osu_db.NM]),
+                    "profile_motif": map_motif(chart, dominant_bpm(bm)).tolist(),
                     "folder":      c["path"].parent.name,
                     "osu_file":    c["path"].name,
                     **snaps,
