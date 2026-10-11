@@ -95,6 +95,32 @@ This is the incumbent for `select_checkpoint.py` from now on.
   - Phrases sometimes start on the wrong beat (#4). Nothing measures this.
   - #6 (7*+) "every problem, on an exponential scale": Rin uses ternary,
     so the mask allows it, and the model used 4x the human's.
+- Round 5 (2026-10-11, step 72072, snap mask + `place_finishers`, played):
+  6/6. His notes:
+  - Long runs of one colour. Measured on the benchmark: share of notes in
+    same-colour runs of 6+, model / ranked: Oni 2.2 / 0.3%, Inner 5.5 /
+    1.0%, 7*+ 7.0 / 1.4%. Matches ranked below Oni.
+  - #3 second half offsync: from a 180 -> 204 BPM change on, the model's
+    raw peaks sit 40-60 ms early (~1/4 beat) and decode snaps them to the
+    off-1/4 lines. The timing stream and the packed chart are right there.
+    Not general: over the 10 benchmark maps with a tempo change, F1 0.70
+    before it and 0.73 after.
+  - #6 XNOR XNOR XNOR (7.56*, 173 red lines, 59 tempo changes) "fails
+    horribly", worst at the end. Two failures: slow-motion lines (16-65
+    BPM, a red line on nearly every note) taken as the grid, F1 ~0.5 there;
+    and the mapper's breaks filled (270 notes where the human has 0, 4492
+    notes against 3295). 3.0% of training maps have over 20 tempo changes.
+  - Both "second half offsync" notes (round 4 #2, round 5 #3) were past
+    the benchmark's 120 s (`--max-frames 6000`). `evaluate.py` now reports
+    notes in the ranked chart's breaks and same-colour runs, overall and by
+    band.
+  - Full songs (`--max-frames 45000`, 1 seed, mask on): F1 0.720 (120 s,
+    3 seeds: 0.726). By position, F1 0-60 s 0.746, 60-120 0.754, 120-180
+    0.749, 180-240 0.683 (27 maps), 240+ 0.786 (14): no late-song decay, so
+    the "second half" failures are the songs' own (a tempo change, gimmick
+    lines). Breaks are 1.7% of benchmark time; 0.6% of the model's notes
+    land in them. Same-colour runs 6+: Oni 2.5 / 0.3%, Inner 4.6 / 1.1%,
+    7*+ 8.1 / 1.9%.
 - Every round uses 6 new never-played songs (`outputs/blind_ab/used.json`).
 
 ### Features 3, step 72072 (2026-10-11, `outputs/eval/features3_step72072*.json`)

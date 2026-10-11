@@ -73,7 +73,7 @@ from taiko.data.motif import beat_frames_from_timing, compute_motif
 from taiko.data.osu_parser import TimingPoint
 from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
 from taiko.data.repair import repair
-from taiko.eval.criteria import place_finishers
+from taiko.eval.criteria import _beat, place_finishers
 from taiko.data.shards import ShardReader, decode_timing_points, load_note_times
 from taiko.data.tensor_repr import build_timing_stream, tensor_to_beatmap
 from taiko.data.timing_refine import apply_timing_refinement
@@ -190,6 +190,51 @@ def violation_counts(play) -> dict:
             "zero_length_longs": play.zero_length_longs}
 
 
+# A break: a gap in the ranked chart of at least 4 beats and 2 s. Blind A/B
+# round 5 #6 put 270 notes into a 30 s section the mapper left empty.
+BREAK_BEATS, BREAK_MS = 4, 2000
+
+
+def breaks(notes, grid: Grid) -> list[tuple[float, float]]:
+    """The ranked chart's breaks, less one beat at each end."""
+    objs = sorted(notes, key=lambda n: n.time)
+    out = []
+    for a, b in zip(objs, objs[1:]):
+        end = a.end_time if a.is_long else a.time
+        beat = grid.section_at(float(end)).ms_per_beat
+        if b.time - end >= max(BREAK_BEATS * beat, BREAK_MS):
+            out.append((end + beat, b.time - beat))
+    return out
+
+
+def break_note_rate(notes, spans) -> float:
+    """Share of the chart's hits that fall inside the ranked chart's breaks."""
+    hits = [n.time for n in notes if not n.is_long]
+    inside = sum(any(lo < t < hi for lo, hi in spans) for t in hits)
+    return inside / max(len(hits), 1)
+
+
+def mono_run_rate(notes, grid: Grid, run: int = 6) -> float:
+    """
+    Share of hits in same-colour runs of `run` or more, a run being hits at
+    most a folded 1/2 beat apart. Round 5: the model's colour runs ran long;
+    at Oni and above 2-7% of its notes against ranked 0.3-1.4%.
+    """
+    hits = [n for n in sorted(notes, key=lambda n: n.time) if not n.is_long]
+    if not hits:
+        return 0.0
+    lengths, cur = [], 1
+    for a, b in zip(hits, hits[1:]):
+        same = ("kat" in a.note_type) == ("kat" in b.note_type)
+        if same and b.time - a.time <= _beat(grid, a.time) / 2 + 1:
+            cur += 1
+        else:
+            lengths.append(cur)
+            cur = 1
+    lengths.append(cur)
+    return sum(n for n in lengths if n >= run) / len(hits)
+
+
 def hit_times(bm) -> list[int]:
     return [n.time for n in bm.notes if not n.is_long]
 
@@ -207,7 +252,8 @@ def exact_snap_fields(pre: str, gen_ms, real_ms, grid: Grid, per_divisor: bool) 
     return row
 
 
-def score_variants(variants: dict, reference, act, grid: Grid, span, real_ms=None) -> dict:
+def score_variants(variants: dict, reference, act, grid: Grid, span, real_ms=None,
+                   break_spans=()) -> dict:
     """
     Flat metrics for one generated sample, every variant. `real_ms` is the
     .osu's own hit times (note_times.npz); without it there is no exact snap.
@@ -238,6 +284,8 @@ def score_variants(variants: dict, reference, act, grid: Grid, span, real_ms=Non
                 "quiet_note_rate": act_score.quiet_note_rate,
                 "onset_miss_rate": act_score.strong_onset_miss_rate,
                 "silence_rate": silence_rate(bm.notes, act),
+                "break_note_rate": break_note_rate(bm.notes, break_spans),
+                "mono_run_rate": mono_run_rate(bm.notes, grid),
             })
     # The old measure, kept so the new numbers can be read against the handover.
     raw = variants["legacy_raw"]
@@ -340,6 +388,9 @@ def group(rows: list[dict], key: str, bands) -> dict:
                                 / max(np.sum([r["reference_notes"] for r in sel]), 1)),
             "quiet_note_rate": float(np.mean([r["quiet_note_rate"] for r in sel])),
             "onset_miss_rate": float(np.mean([r["onset_miss_rate"] for r in sel])),
+            "break_note_rate": nanmean([r.get("break_note_rate", float("nan")) for r in sel]),
+            "mono_run_rate": nanmean([r.get("mono_run_rate", float("nan")) for r in sel]),
+            "ref_mono_run_rate": nanmean([r.get("ref_mono_run_rate", float("nan")) for r in sel]),
         }
     return out
 
@@ -421,17 +472,23 @@ def report(summary: dict, args) -> bool:
           f"{summary['ref_silence_rate']:>7.3f}   share of hits near the song's own floor")
     print(f"  {'missed strong onsets':<24s}{summary['onset_miss_rate']:>7.3f}   "
           f"{summary['ref_onset_miss_rate']:>7.3f}   share of loud on-grid attacks left empty")
+    print(f"  {'notes in breaks':<24s}{summary['break_note_rate']:>7.3f}   "
+          f"{0.0:>7.3f}   share of hits inside the ranked chart's breaks "
+          f"({summary['break_share']:.1%} of the time)")
+    print(f"  {'same-colour runs 6+':<24s}{summary['mono_run_rate']:>7.3f}   "
+          f"{summary['ref_mono_run_rate']:>7.3f}   share of hits in one-colour runs of 6+")
     if args.grid_probe:
         print(f"  {'grid follow':<24s}{summary['grid_follow']:>7.3f}   "
               f"(1 = follows the given grid, 0 = ignores it)")
 
     for name, table in summary["groups"].items():
-        print(f"\n  by {name:<18s} maps   F1     exact  snap   unplay  notes  quiet  miss")
+        print(f"\n  by {name:<18s} maps   F1     exact  snap   unplay  notes  quiet  miss  break  mono (ranked)")
         for label, g in table.items():
             print(f"  {label:<21s}{g['maps']:>4d}  {g['onset_f1']:.3f}  {g['exact_snap']:.3f}  "
                   f"{g['snap_validity']:.3f}  "
                   f"{g['unplayability']:.4f}  {g['note_ratio']:.2f}   {g['quiet_note_rate']:.2f}   "
-                  f"{g['onset_miss_rate']:.2f}")
+                  f"{g['onset_miss_rate']:.2f}   {g['break_note_rate']:.3f}  "
+                  f"{g['mono_run_rate']:.3f} ({g['ref_mono_run_rate']:.3f})")
 
     if args.harness:
         cols = ("onset_f1", "pattern_kl", "nps_rel_error", "quiet_note_rate",
@@ -641,6 +698,7 @@ def main() -> int:
         # 20 ms frame times rather than lines (exact snap ~0.3, gaps off-snap).
         ceiling = decode_on_grid(reference_chart, points, threshold=0.5)
         add_feel(feel_pool, band, "ranked", ceiling.notes, grid)
+        break_spans = breaks(ceiling.notes, grid)
 
         per_seed = []
         for seed in range(args.seeds):
@@ -649,7 +707,7 @@ def main() -> int:
                                        divisors_used(record["snap_counts"])
                                        if args.mask_divisors and record.get("snap_counts") else None)
             add_feel(feel_pool, band, "model", variants[SHIPPED].notes, grid)
-            scored = score_variants(variants, reference, act, grid, span, real_ms)
+            scored = score_variants(variants, reference, act, grid, span, real_ms, break_spans)
             if args.harness:
                 scored.update(harness_rows(probs, points, grid, threshold, requested_nps,
                                            act, reference, span))
@@ -677,6 +735,8 @@ def main() -> int:
             "ref_quiet_note_rate": ref_act.quiet_note_rate,
             "ref_silence_rate": silence_rate(ceiling.notes, act),
             "ref_onset_miss_rate": ref_act.strong_onset_miss_rate,
+            "ref_mono_run_rate": mono_run_rate(ceiling.notes, grid),
+            "break_share": sum(hi - lo for lo, hi in break_spans) / max(span[1] - span[0], 1),
             "grid_follow": (grid_follow_fraction(sample, points, frames, threshold)
                             if args.grid_probe else float("nan")),
         })
