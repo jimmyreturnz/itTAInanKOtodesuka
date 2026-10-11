@@ -314,6 +314,30 @@ def _with_colour(n: TaikoNote, colour: str) -> TaikoNote:
     return replace(n, note_type=t.replace("kat", "don") if colour == "d" else t.replace("don", "kat"))
 
 
+def place_finishers(notes: list[TaikoNote], grid) -> tuple[list[TaikoNote], int]:
+    """
+    Shrink the finishers the model puts where mappers rarely do: off the 1/2
+    grid, or mid 1/2 stream off the beat. Not ranking rules -- 27-41% of
+    ranked Inner/Hell Oni maps have one -- but the model does it 1.3-5x as
+    often (blind A/B round 4: "weak beats and mid stream"). Off the 1/2 grid:
+    ranked 0.8-4.9% of finishers by level, the model 4.5-8.6%. Of mid-stream
+    finishers both put 64-82% on the beat, so the off-beat rest is the only
+    part metre can tell apart. ponytail: metre only; the audio's accents would
+    say which finishers are meant.
+    """
+    out, shrunk = sorted(notes, key=lambda n: n.time), 0
+    for k, n in enumerate(out):
+        if n.is_long or not _is_big(n):
+            continue
+        first, last, spacing = _pattern_place(out, k)
+        strength = _strength(n, grid)
+        if strength > 2 or (not first and not last and strength > 1
+                            and spacing <= _beat(grid, n.time) / 2 + EPS_MS):
+            out[k] = replace(n, note_type=n.note_type.replace("big_", ""))
+            shrunk += 1
+    return out, shrunk
+
+
 def enforce(notes: list[TaikoNote], grid, level: str) -> tuple[list[TaikoNote], Counter]:
     """
     Fix every problem and warning `check` raises about the notes, and count

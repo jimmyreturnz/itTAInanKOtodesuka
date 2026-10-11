@@ -45,7 +45,7 @@ from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
     divisors_used, profile_vector, style_to_int,
 )
-from taiko.data.decode import calibrate_threshold, decode_on_grid
+from taiko.data.decode import calibrate_threshold, decode_divisors, decode_on_grid
 from taiko.data.frames import describe, frames_to_sec
 from taiko.data.grid import Grid
 from taiko.data.motif import (
@@ -56,7 +56,7 @@ from taiko.data.nps_prior import load_prior, lookup
 from taiko.data.profile import PRESET_REFS, map_motif, preset_profile
 from taiko.data.osu_parser import OsuTaikoParser, TimingPoint
 from taiko.data.osu_writer import OsuTaikoSerializer
-from taiko.eval.criteria import NAMES, check, enforce
+from taiko.eval.criteria import NAMES, check, enforce, place_finishers
 from taiko.eval.mapset import Chart, chart_findings, fix_chart
 from taiko.data.repair import repair
 from taiko.data.tensor_repr import (
@@ -146,7 +146,7 @@ def resolve_profile(args, parser: OsuTaikoParser):
         print(f"  tech share {tech:.3f}, 1/8 share {speed:.3f}, "
               f"snaps {', '.join(f'1/{d}' for d in sorted(divisors))}")
     return (motif, None if motif is None else np.ones_like(motif),
-            profile_vector(tech, speed, level, divisors))
+            profile_vector(tech, speed, level, divisors), divisors)
 
 
 def resolve_timing(args, total_frames: int) -> tuple[list[TimingPoint], str]:
@@ -335,9 +335,9 @@ def main() -> int:
 
     # ---- conditioning -------------------------------------------------- #
     parser = OsuTaikoParser()
-    profile = None
+    profile = divisors = None
     if model.features >= 3:
-        motif, motif_mask, profile = resolve_profile(args, parser)
+        motif, motif_mask, profile, divisors = resolve_profile(args, parser)
         if args.style or args.motif:
             print("  (--style and --motif are not inputs of a features-3 model; ignored)")
         style = STYLE_NULL
@@ -400,13 +400,15 @@ def main() -> int:
     )
     if args.decode == "grid":
         # Every note on a legal subdivision of its own section's tempo.
-        bm = decode_on_grid(chart, points, threshold=threshold, meter=args.meter, **meta)
+        # Only the profile's snaps: left to the model, ternary leaked into binary songs.
+        snaps = decode_divisors(divisors)
+        bm = decode_on_grid(chart, points, threshold=threshold, divisors=snaps, meter=args.meter, **meta)
         if args.density_lock and avg_nps:
-            hit_th, got = calibrate_threshold(chart, points, avg_nps, threshold=threshold)
+            hit_th, got = calibrate_threshold(chart, points, avg_nps, threshold=threshold, divisors=snaps)
             print(f"\nDensity lock: hit threshold {threshold} -> {hit_th:.3f}, "
                   f"{got:.2f} nps for {avg_nps:.2f} requested")
             bm = decode_on_grid(chart, points, threshold=threshold, hit_threshold=hit_th,
-                                meter=args.meter, **meta)
+                                divisors=snaps, meter=args.meter, **meta)
     else:
         bm = tensor_to_beatmap(
             chart, bpm=grid.sections[0].bpm, offset_ms=grid.sections[0].offset_ms,
@@ -419,6 +421,8 @@ def main() -> int:
     if not args.no_repair and bm.notes:
         fixes = repair(bm, grid)
         print(f"\nPlayability repair: {fixes.summary()}")
+        bm.notes, shrunk = place_finishers(bm.notes, grid)
+        print(f"Finishers shrunk off the 1/2 grid or mid-stream: {shrunk}")
 
     if args.level and bm.notes:
         # After repair, which can change note types. The quiet gate below only

@@ -81,7 +81,40 @@ This is the incumbent for `select_checkpoint.py` from now on.
   - The Futsuu had 1/6 out of nowhere. Fixed, d877d24.
   - Kat and finisher placement don't match the song.
   - At Oni and above, the snaps follow noise.
+- Round 4 (2026-10-11, features 3, step 72072, played): 6/6. His notes:
+  - Snaps placed wrong break the pattern: a good 1/4 stream suddenly goes
+    "1/5". The model put ternary into binary songs (#2 Not Okay: 1/3 of the
+    notes after 1:00, human none; #3 MOAI MONEY: 39 ternary, human none).
+    Fixed: decode only on the map's snaps (below).
+  - #3 Muzukashii had a long 1/2 stream: 101 notes at its 100 BPM, human 53.
+    Not a ranking rule (the wiki sets no 1/2 limit at Muzukashii, and the
+    rest rule counted at the folded tempo flags 27.5% of ranked low-BPM
+    Muzukashiis). Over 39 benchmark Muzukashiis the model's longest 1/2 run
+    is p90 37 against ranked 28: inside the ranked range, so no cap.
+  - Finishers on weak beats and mid-stream. Fixed by metre (below).
+  - Phrases sometimes start on the wrong beat (#4). Nothing measures this.
+  - #6 (7*+) "every problem, on an exponential scale": Rin uses ternary,
+    so the mask allows it, and the model used 4x the human's.
 - Every round uses 6 new never-played songs (`outputs/blind_ab/used.json`).
+
+### Features 3, step 72072 (2026-10-11, `outputs/eval/features3_step72072*.json`)
+Same command as the baseline. Kept by `select_checkpoint.py`.
+- F1 0.707 (seed sd 0.012), exact snap 0.970. By divisor: 1/1 0.980,
+  1/2 0.975, 1/3 **0.539** (596 notes, worse), 1/4 0.908, 1/6 0.572,
+  1/8 0.328. 7*+ exact 0.888.
+- Density up: realised 6.23 nps against 5.69 reference (baseline 5.86).
+- Rhythm probe (fresh head, frozen model), AP at t=250 against the
+  step-62400 model: 1/3 0.111 -> 0.394, 1/8 0.123 -> 0.428, 1/6 flat
+  (142 positives). The model knows ternary; decode lost it.
+- **Decode on the map's own snaps** (`decode_divisors`, now in
+  generate/blind_ab; `evaluate.py --mask-divisors`): F1 0.726, exact snap
+  0.981, 1/1 0.991, 1/2 0.989, 1/3 0.562, 1/4 0.947, 1/6 0.588, 7*+ 0.915.
+  Unplayability 0.0002 (all in kantan), repair 0.1% -> 0.6% of notes.
+- **`place_finishers`**: off the 1/2 grid ranked 0.8-4.9% of finishers,
+  model 4.5-8.6% -> 0. Mid 1/2 stream, model -> ranked: Muzukashii 7.6 /
+  3.8%, Oni 7.9 / 8.1, Inner 16.8 / 12.9, Hell 13.0 / 11.4. As a check it
+  flagged 27-41% of ranked Inner/Hell maps, so it is a polish pass, not a
+  rule.
 
 **What is left is in the model, not the decoder:**
 - Snap flicker: 13.9 fast-snap changes per 100 hits at 5.5*+, against

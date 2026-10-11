@@ -48,9 +48,9 @@ import torch
 from evaluate import SR_BANDS, load_model
 from pack_dataset import DEFAULT_SCAN_CACHE, safe_name
 from taiko.data import osu_db
-from taiko.data.conditioning import (normalise_avg_nps, normalise_difficulty,
+from taiko.data.conditioning import (divisors_used, normalise_avg_nps, normalise_difficulty,
                                      normalise_peak_nps)
-from taiko.data.decode import decode_on_grid
+from taiko.data.decode import decode_divisors, decode_on_grid
 from taiko.data.profile import record_conditioning
 from taiko.data.grid import Grid
 from taiko.data.osu_parser import OsuTaikoParser, TaikoBeatmap
@@ -59,7 +59,7 @@ from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
 from taiko.data.repair import repair
 from taiko.data.shards import ShardReader, decode_timing_points
 from taiko.data.tensor_repr import build_timing_stream
-from taiko.eval.criteria import enforce, level_of
+from taiko.eval.criteria import enforce, level_of, place_finishers
 from taiko.eval.mapset import fix_chart
 from taiko.model.sampling import generate_song
 
@@ -128,8 +128,11 @@ def ai_chart(model, threshold, window, reader, idx, rec, points, device, seed) -
         window_frames=window, overlap_frames=window // 2, progress=False,
         generator=torch.Generator(device=device).manual_seed(seed),
     )[0].cpu().numpy()
-    chart = decode_on_grid(probs, points, threshold=threshold)
+    counts = rec.get("snap_counts")
+    chart = decode_on_grid(probs, points, threshold=threshold,
+                           divisors=decode_divisors(divisors_used(counts) if counts else None))
     repair(chart, Grid(points))
+    chart.notes, _ = place_finishers(chart.notes, Grid(points))
     # As generate.py --level ships it: the level the ranked map is held to.
     level = level_of(rec.get("version", ""), float(rec.get("difficulty", 5.0)))
     notes, _ = enforce(chart.notes, Grid(points), level)

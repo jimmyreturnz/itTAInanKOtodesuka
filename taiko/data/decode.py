@@ -56,6 +56,18 @@ from taiko.data.tensor_repr import (
 # the same onset. Values are multipliers on the onset probability.
 SNAP_PRIOR = {1: 1.0, 2: 1.0, 4: 1.0, 3: 0.9, 6: 0.85, 8: 0.8, 12: 0.7}
 
+
+def decode_divisors(used: set[int] | None) -> tuple[int, ...]:
+    """
+    The snaps decode may place notes on, from the divisors a map uses
+    (`conditioning.divisors_used`, 1/12 folded into 1/6). The model reads
+    them only as conditioning, and still put ternary into binary songs.
+    """
+    if not used:
+        return tuple(SNAP_PRIOR)
+    keep = set(used) | {1} | ({12} if 6 in used else set())
+    return tuple(d for d in SNAP_PRIOR if d in keep)
+
 def osu_ms(line_ms: float) -> int:
     """
     A grid line's time as osu! stores a note on it: truncated, not rounded.

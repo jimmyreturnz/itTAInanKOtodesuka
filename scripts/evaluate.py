@@ -63,9 +63,9 @@ import torch
 
 from taiko.data.audio_activity import ON_GRID_MS, activity, activity_score, silence_rate
 from taiko.data.conditioning import (
-    SR_BANDS, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
+    SR_BANDS, divisors_used, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
 )
-from taiko.data.decode import calibrate_threshold, decode_on_grid
+from taiko.data.decode import calibrate_threshold, decode_divisors, decode_on_grid
 from taiko.data.profile import record_conditioning
 from taiko.data.frames import FRAME_MS, describe
 from taiko.data.grid import Grid
@@ -73,6 +73,7 @@ from taiko.data.motif import beat_frames_from_timing, compute_motif
 from taiko.data.osu_parser import TimingPoint
 from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
 from taiko.data.repair import repair
+from taiko.eval.criteria import place_finishers
 from taiko.data.shards import ShardReader, decode_timing_points, load_note_times
 from taiko.data.tensor_repr import build_timing_stream, tensor_to_beatmap
 from taiko.data.timing_refine import apply_timing_refinement
@@ -134,15 +135,16 @@ def dominant_tempo(points: list[TimingPoint]) -> tuple[float, float, int]:
 
 
 def decode_variants(probs: np.ndarray, points, grid: Grid, threshold: float,
-                    bpm: float, offset: float, meter: int) -> dict:
+                    bpm: float, offset: float, meter: int, divisors=None) -> dict:
     legacy_raw = tensor_to_beatmap(probs, bpm=bpm, offset_ms=offset, threshold=threshold,
                                    meter=meter, timing_points=points)
     legacy_final = copy.deepcopy(legacy_raw)
     if legacy_final.notes:
         apply_timing_refinement(legacy_final, timing_points=points, verbose=False)
-    grid_raw = decode_on_grid(probs, points, threshold=threshold)
+    grid_raw = decode_on_grid(probs, points, threshold=threshold, divisors=decode_divisors(divisors))
     grid_final = copy.deepcopy(grid_raw)
     fixes = repair(grid_final, grid)
+    grid_final.notes, _ = place_finishers(grid_final.notes, grid)
     return {"legacy_raw": legacy_raw, "legacy_final": legacy_final,
             "grid_raw": grid_raw, "grid_final": grid_final, "_repair": fixes}
 
@@ -509,6 +511,8 @@ def main() -> int:
                          "a big gap between this and the default run means the "
                          "model is reading the answer off its conditioning.")
     ap.add_argument("--no-ema", action="store_true")
+    ap.add_argument("--mask-divisors", action="store_true",
+                    help="decode only on the snaps the reference map uses")
     ap.add_argument("--grid-probe", action="store_true",
                     help="also generate against a grid shifted by 1/3 beat and "
                          "measure whether the notes follow it (one extra sample per map)")
@@ -641,7 +645,9 @@ def main() -> int:
         per_seed = []
         for seed in range(args.seeds):
             probs = sample(timing, seed)
-            variants = decode_variants(probs, points, grid, threshold, bpm, offset, meter)
+            variants = decode_variants(probs, points, grid, threshold, bpm, offset, meter,
+                                       divisors_used(record["snap_counts"])
+                                       if args.mask_divisors and record.get("snap_counts") else None)
             add_feel(feel_pool, band, "model", variants[SHIPPED].notes, grid)
             scored = score_variants(variants, reference, act, grid, span, real_ms)
             if args.harness:
