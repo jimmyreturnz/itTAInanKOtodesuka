@@ -106,10 +106,12 @@ This is the incumbent for `select_checkpoint.py` from now on.
     Not general: over the 10 benchmark maps with a tempo change, F1 0.70
     before it and 0.73 after.
   - #6 XNOR XNOR XNOR (7.56*, 173 red lines, 59 tempo changes) "fails
-    horribly", worst at the end. Two failures: slow-motion lines (16-65
-    BPM, a red line on nearly every note) taken as the grid, F1 ~0.5 there;
-    and the mapper's breaks filled (270 notes where the human has 0, 4492
-    notes against 3295). 3.0% of training maps have over 20 tempo changes.
+    horribly", worst at the end, where the song's real tempo changes every
+    few notes (16-65 BPM lines, one on nearly every note; not a gimmick map,
+    Jimmy: these lines are the music's timing, so no decode rule may treat
+    them as scroll effects). F1 ~0.5 there. It also filled the mapper's
+    breaks (270 notes where the human has 0; 4492 notes against 3295).
+    3.0% of training maps have over 20 tempo changes.
   - Both "second half offsync" notes (round 4 #2, round 5 #3) were past
     the benchmark's 120 s (`--max-frames 6000`). `evaluate.py` now reports
     notes in the ranked chart's breaks and same-colour runs, overall and by
@@ -121,6 +123,12 @@ This is the incumbent for `select_checkpoint.py` from now on.
     lines). Breaks are 1.7% of benchmark time; 0.6% of the model's notes
     land in them. Same-colour runs 6+: Oni 2.5 / 0.3%, Inner 4.6 / 1.1%,
     7*+ 8.1 / 1.9%.
+  - **`polish`** = `place_finishers` + `split_colour_runs` (Oni and up, no
+    same-colour run over 5; the weakest-beat note changes colour), after
+    repair in generate, blind_ab and evaluate. 120 s, 3 seeds, mask on:
+    runs 6+ Oni 2.2 -> 0.1%, Inner 5.5 -> 0, 7*+ 7.0 -> 0 (ranked 0.3-1.4%);
+    pattern KL 0.258 -> 0.245, colour JS 0.021 -> 0.018; F1 and don ratio
+    unchanged. Limits 6-9 barely move it: the excess is runs of exactly 6.
 - Every round uses 6 new never-played songs (`outputs/blind_ab/used.json`).
 
 ### Features 3, step 72072 (2026-10-11, `outputs/eval/features3_step72072*.json`)

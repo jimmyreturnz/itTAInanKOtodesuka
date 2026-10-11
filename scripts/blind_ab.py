@@ -59,7 +59,7 @@ from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
 from taiko.data.repair import repair
 from taiko.data.shards import ShardReader, decode_timing_points
 from taiko.data.tensor_repr import build_timing_stream
-from taiko.eval.criteria import enforce, level_of, place_finishers
+from taiko.eval.criteria import enforce, level_of, polish
 from taiko.eval.mapset import fix_chart
 from taiko.model.sampling import generate_song
 
@@ -132,9 +132,9 @@ def ai_chart(model, threshold, window, reader, idx, rec, points, device, seed) -
     chart = decode_on_grid(probs, points, threshold=threshold,
                            divisors=decode_divisors(divisors_used(counts) if counts else None))
     repair(chart, Grid(points))
-    chart.notes, _ = place_finishers(chart.notes, Grid(points))
     # As generate.py --level ships it: the level the ranked map is held to.
     level = level_of(rec.get("version", ""), float(rec.get("difficulty", 5.0)))
+    chart.notes, _ = polish(chart.notes, Grid(points), level)
     notes, _ = enforce(chart.notes, Grid(points), level)
     notes, _ = fix_chart(notes, points)
     return notes

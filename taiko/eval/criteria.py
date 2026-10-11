@@ -338,6 +338,51 @@ def place_finishers(notes: list[TaikoNote], grid) -> tuple[list[TaikoNote], int]
     return out, shrunk
 
 
+def split_colour_runs(notes: list[TaikoNote], grid, longest: int) -> tuple[list[TaikoNote], int]:
+    """
+    Recolour notes so no same-colour run -- hits at most a folded 1/2 beat
+    apart -- is longer than `longest`. Of each too-long stretch, the note on
+    the weakest beat among its first `longest` + 1 changes colour, the way
+    `enforce` splits a run. Not a ranking rule: ranked maps have such runs,
+    the model has 4-5x as many (blind A/B round 5).
+    """
+    out = sorted(notes, key=lambda n: n.time)
+    flipped, start = 0, 0
+    hits = [k for k, n in enumerate(out) if not n.is_long]
+    for i in range(1, len(hits) + 1):
+        a = out[hits[i - 1]]
+        b = out[hits[i]] if i < len(hits) else None
+        if (b is not None and _colour(a) == _colour(b)
+                and b.time - a.time <= _beat(grid, a.time) / 2 + EPS_MS):
+            if i - start + 1 > longest:
+                # the run reaches longest + 1: split it at its weakest note
+                victim = max(range(start + 1, i + 1), key=lambda j: (_strength(out[hits[j]], grid), j))
+                n = out[hits[victim]]
+                out[hits[victim]] = _with_colour(n, "d" if _colour(n) == "k" else "k")
+                flipped += 1
+                start = victim + 1 if victim < i else i
+            continue
+        start = i
+    return out, flipped
+
+
+# Longest same-colour run kept, by level. Measured on the benchmark (60
+# maps): share of notes in runs of 6+, model / ranked, Oni 2.5 / 0.4%,
+# Inner 5.7 / 1.1%, 7*+ 6.9 / 1.5%; the excess is mostly runs of exactly 6,
+# so a limit of 6 barely moves it. 5 takes it to 0 and recolours 0.4-1.1%
+# of notes. Below Oni the model already sits at or under ranked.
+COLOUR_RUN_LIMIT = {"Oni": 5, "Inner Oni": 5, "Hell Oni": 5}
+
+
+def polish(notes: list[TaikoNote], grid, level: str | None) -> tuple[list[TaikoNote], Counter]:
+    """The style passes every shipped chart gets after repair: finishers, then colour runs."""
+    fixes: Counter = Counter()
+    notes, fixes["finishers shrunk"] = place_finishers(notes, grid)
+    if level in COLOUR_RUN_LIMIT:
+        notes, fixes["recoloured: same-colour run"] = split_colour_runs(notes, grid, COLOUR_RUN_LIMIT[level])
+    return notes, fixes
+
+
 def enforce(notes: list[TaikoNote], grid, level: str) -> tuple[list[TaikoNote], Counter]:
     """
     Fix every problem and warning `check` raises about the notes, and count

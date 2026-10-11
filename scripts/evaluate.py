@@ -73,7 +73,7 @@ from taiko.data.motif import beat_frames_from_timing, compute_motif
 from taiko.data.osu_parser import TimingPoint
 from taiko.data.preprocessed_dataset import WINDOW_FRAMES_DEFAULT, split_indices
 from taiko.data.repair import repair
-from taiko.eval.criteria import _beat, place_finishers
+from taiko.eval.criteria import _beat, level_of, polish
 from taiko.data.shards import ShardReader, decode_timing_points, load_note_times
 from taiko.data.tensor_repr import build_timing_stream, tensor_to_beatmap
 from taiko.data.timing_refine import apply_timing_refinement
@@ -135,7 +135,7 @@ def dominant_tempo(points: list[TimingPoint]) -> tuple[float, float, int]:
 
 
 def decode_variants(probs: np.ndarray, points, grid: Grid, threshold: float,
-                    bpm: float, offset: float, meter: int, divisors=None) -> dict:
+                    bpm: float, offset: float, meter: int, divisors=None, level=None) -> dict:
     legacy_raw = tensor_to_beatmap(probs, bpm=bpm, offset_ms=offset, threshold=threshold,
                                    meter=meter, timing_points=points)
     legacy_final = copy.deepcopy(legacy_raw)
@@ -144,7 +144,7 @@ def decode_variants(probs: np.ndarray, points, grid: Grid, threshold: float,
     grid_raw = decode_on_grid(probs, points, threshold=threshold, divisors=decode_divisors(divisors))
     grid_final = copy.deepcopy(grid_raw)
     fixes = repair(grid_final, grid)
-    grid_final.notes, _ = place_finishers(grid_final.notes, grid)
+    grid_final.notes, _ = polish(grid_final.notes, grid, level)
     return {"legacy_raw": legacy_raw, "legacy_final": legacy_final,
             "grid_raw": grid_raw, "grid_final": grid_final, "_repair": fixes}
 
@@ -705,7 +705,8 @@ def main() -> int:
             probs = sample(timing, seed)
             variants = decode_variants(probs, points, grid, threshold, bpm, offset, meter,
                                        divisors_used(record["snap_counts"])
-                                       if args.mask_divisors and record.get("snap_counts") else None)
+                                       if args.mask_divisors and record.get("snap_counts") else None,
+                                       level_of(record.get("version", ""), requested_sr))
             add_feel(feel_pool, band, "model", variants[SHIPPED].notes, grid)
             scored = score_variants(variants, reference, act, grid, span, real_ms, break_spans)
             if args.harness:

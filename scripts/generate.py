@@ -56,7 +56,7 @@ from taiko.data.nps_prior import load_prior, lookup
 from taiko.data.profile import PRESET_REFS, map_motif, preset_profile
 from taiko.data.osu_parser import OsuTaikoParser, TimingPoint
 from taiko.data.osu_writer import OsuTaikoSerializer
-from taiko.eval.criteria import NAMES, check, enforce, place_finishers
+from taiko.eval.criteria import NAMES, check, enforce, level_for_sr, polish
 from taiko.eval.mapset import Chart, chart_findings, fix_chart
 from taiko.data.repair import repair
 from taiko.data.tensor_repr import (
@@ -421,8 +421,9 @@ def main() -> int:
     if not args.no_repair and bm.notes:
         fixes = repair(bm, grid)
         print(f"\nPlayability repair: {fixes.summary()}")
-        bm.notes, shrunk = place_finishers(bm.notes, grid)
-        print(f"Finishers shrunk off the 1/2 grid or mid-stream: {shrunk}")
+        level = NAMES[args.level][0] if args.level else level_for_sr(args.difficulty)
+        bm.notes, polished = polish(bm.notes, grid, level)
+        print(f"Polish ({level}): {dict(polished)}")
 
     if args.level and bm.notes:
         # After repair, which can change note types. The quiet gate below only
