@@ -94,6 +94,19 @@ def unwrap(model: nn.Module) -> TaikoDiffusion:
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
+# --fit-hours: steps skipped (loader spin-up, CUDA warm-up) and then timed
+# before the horizon is set, all inside any warmup worth having; and the share
+# of the time left that goes to steps rather than validation and saves.
+FIT_SKIP_STEPS = 20
+FIT_AFTER_STEPS = 200
+FIT_STEP_SHARE = 0.92
+
+
+def fitted_horizon(done: int, per_step_s: float, elapsed_s: float, budget_s: float) -> int:
+    """Schedule steps so the cosine ends as the budget does, `done` steps in, `elapsed_s` spent."""
+    return done + int(max(budget_s - elapsed_s, 0.0) * FIT_STEP_SHARE / per_step_s)
+
+
 def lr_at(step: int, warmup: int, total: int, peak: float, floor: float = 1e-6) -> float:
     if step < warmup:
         return peak * (step + 1) / max(warmup, 1)
@@ -239,6 +252,11 @@ def main() -> int:
                          "so a resume cannot silently reshape the schedule")
     ap.add_argument("--max-hours", type=float, default=None,
                     help="stop cleanly before a session limit, saving first")
+    ap.add_argument("--fit-hours", action="store_true",
+                    help="on a run that starts a new schedule, time the first "
+                         f"{FIT_AFTER_STEPS} steps and set the cosine horizon so it "
+                         "ends as --max-hours runs out, for a GPU whose step time "
+                         "is not known in advance")
     ap.add_argument("--fp16", action="store_true", default=True)
     ap.add_argument("--fp32", dest="fp16", action="store_false")
     ap.add_argument("--single-gpu", action="store_true")
@@ -496,6 +514,12 @@ def main() -> int:
     print()
 
     t0 = time.time()
+    # Only a run that begins its schedule fits it; a resume keeps the saved one.
+    # ponytail: an OOM restart before the fit resumes with the unfitted horizon.
+    fit_from = (step + FIT_SKIP_STEPS
+                if args.fit_hours and args.max_hours and step == schedule_origin else None)
+    fit_at = fit_from + FIT_AFTER_STEPS if fit_from is not None else None
+    fit_t = None
     trend = MemoryTrend()
     mem_debug = MemDebug() if args.mem_debug else None
     model.train()
@@ -566,6 +590,16 @@ def main() -> int:
 
                 state["step"] = step
                 state["batch_in_epoch"] = done_in_epoch
+
+                if step == fit_from:
+                    fit_t = time.time()
+                if step == fit_at:
+                    per_step = (time.time() - fit_t) / FIT_AFTER_STEPS
+                    total_steps = fitted_horizon(step - schedule_origin, per_step,
+                                                 time.time() - t0, args.max_hours * 3600)
+                    print(f"  --fit-hours: {per_step:.2f} s/step, schedule set to "
+                          f"{total_steps} steps (ends near step {schedule_origin + total_steps})",
+                          flush=True)
 
                 if step % args.log_every == 0:
                     elapsed = time.time() - t0

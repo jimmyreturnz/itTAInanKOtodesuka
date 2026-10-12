@@ -202,8 +202,11 @@ features measured on that clip, U-Net attention + S4 over all of it).
   0.86 GiB. Memory is no constraint on a T4.
 - Warm start from step 82368: a checkpoint saved at another window length
   starts a new schedule (`train_diffusion.py`, like the features widening).
-  Notebook: 8/GPU, 7 epochs = 8,750 steps, `--warmup 500`; leak check and
-  rhythm probe off. T4 step time not yet measured.
+  Notebook: 8/GPU, `--warmup 500`, leak check and rhythm probe off,
+  `SESSION_HOURS` 11.26 (the week's quota). T4 step time at 9536 frames is
+  unmeasured, so `--fit-hours` times steps 20-220 and sets the cosine horizon
+  to end with `--max-hours`. On the 1650 (6 min budget) it predicted the end
+  at step 83310; the clock stopped the run at 83304 with lr at its floor.
 - Two padding bugs that whole-song windows would have made common, fixed:
   training padded the mel past a song's end with 0 (about median loudness;
   -1 is silence, now `shards.MEL_SILENCE`) and kept the beat grid running

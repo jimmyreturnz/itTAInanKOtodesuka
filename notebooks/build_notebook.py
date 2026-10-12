@@ -202,7 +202,7 @@ AE_BEST = CKPT / "autoencoder" / "best.pt"
 # fixed number of hours: the setup cells above cost time, a restarted stage
 # costs more, and a stage that believes it has 10.5 hours when the session has
 # 4 left is stopped mid-step by Kaggle rather than stopping itself and saving.
-SESSION_HOURS = 12.0
+SESSION_HOURS = 11.26                  # this week's GPU quota left (Kaggle's cap is 12)
 SESSION_RESERVE_HOURS = 0.5
 SESSION_START = time.time()
 
@@ -646,10 +646,13 @@ DIFF_ARGS = [
     *BATCH_ARGS,
     "--grad-accum", GRAD_ACCUM,
     "--ranked-only",                           # D2; a no-op on ranked-only shards
-    # 7 x 20,000 songs / 16 per step = 8,750 steps: about one session if a
-    # step costs ~4.3 s (not yet measured on the T4s). A checkpoint saved at
+    # The T4 step time at 9536 frames is unmeasured, so the schedule is sized
+    # by the clock: --fit-hours times steps 20-220 and sets the cosine horizon
+    # to end as the session's --max-hours runs out. 30 epochs (37,500 steps)
+    # is only a ceiling the clock stops well before. A checkpoint saved at
     # another window length begins its own schedule (train_diffusion.py).
-    "--epochs", "7",
+    "--fit-hours",
+    "--epochs", "30",
     "--samples-per-epoch", "20000",
     # Two, not four, on a four-core box. The loader was measured at ~1,200
     # windows/s on four workers against a demand of 25/s, so two is still an
