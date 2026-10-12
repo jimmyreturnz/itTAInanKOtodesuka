@@ -80,8 +80,6 @@ def main() -> int:
     for idx in map(int, chosen):
         record = reader.records[idx]
         frames = min(reader.chart_length(idx), reader.mel_length(idx))
-        if frames < window:
-            continue
         song_ms = frames * FRAME_MS
         points = decode_timing_points(record["timing_points"])
         mel = torch.from_numpy(reader.mel_window(idx, 0, frames)).unsqueeze(0)

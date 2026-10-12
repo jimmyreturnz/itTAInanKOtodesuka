@@ -602,8 +602,15 @@ code("""
 # Small batches leave these models launch-overhead bound, so per_gpu_batch is a
 # floor that fits anywhere rather than a recommendation, and checkpointing
 # trades compute for memory that is sitting unused.
-BATCH_ARGS = ["--batch-size", "32", "--no-grad-checkpoint"]
-GRAD_ACCUM = "1"                               # 32/GPU x 2 GPUs = effective 64
+#
+# Whole-song windows (2026-10-12): 9536 frames = 190.7 s, MuG-Diffusion's
+# sample length, so the model sees where a song's hard and easy sections
+# sit (blind round 6). On a GTX 1650 a 190 s step at batch 4 costs 2.4x a
+# 30 s one for 6.2x the audio, at 0.86 GiB. 8/GPU holds about 1.6x the
+# frames of the old 32/GPU step; if it OOMs, 4/GPU with GRAD_ACCUM "2".
+WINDOW_FRAMES = "9536"
+BATCH_ARGS = ["--batch-size", "8", "--no-grad-checkpoint"]
+GRAD_ACCUM = "1"                               # 8/GPU x 2 GPUs = 16 whole songs
 
 # Model generation. 2 feeds the beat grid through a learned timing encoder
 # (average pooling had erased it at common taiko tempos -- 4% of the signal
@@ -634,14 +641,15 @@ DIFF_ARGS = [
     "--profile", PROFILE,
     "--features", FEATURES,
     "--rewarm", "500",
-    "--window-frames", "1536",
+    "--warmup", "500",                         # of 8,750 steps; the default 2,000 is 23% of them
+    "--window-frames", WINDOW_FRAMES,
     *BATCH_ARGS,
     "--grad-accum", GRAD_ACCUM,
     "--ranked-only",                           # D2; a no-op on ranked-only shards
-    # 64 x 20,000 windows / 64 per step = 20,000 steps, about 15 GPU-h at
-    # 2.7 s/step: the warm start's budget in RETRAIN_PLAN. A features-2 -> 3
-    # warm start begins its own schedule (train_diffusion.py, schedule_origin).
-    "--epochs", "64",
+    # 7 x 20,000 songs / 16 per step = 8,750 steps: about one session if a
+    # step costs ~4.3 s (not yet measured on the T4s). A checkpoint saved at
+    # another window length begins its own schedule (train_diffusion.py).
+    "--epochs", "7",
     "--samples-per-epoch", "20000",
     # Two, not four, on a four-core box. The loader was measured at ~1,200
     # windows/s on four workers against a demand of 25/s, so two is still an
@@ -686,7 +694,7 @@ if RESUMABLE["diffusion"]:
 # (Python objects, live CPU tensors, pinned memory, or allocator
 # fragmentation) in about 15 minutes, and writes to its own folder so the real
 # checkpoints are only read. Set to 0 once a run has shown memory flat.
-LEAK_CHECK_MINUTES = 15
+LEAK_CHECK_MINUTES = 0                          # the step-82368 run stayed flat
 if LEAK_CHECK_MINUTES and RESUMABLE["diffusion"]:
     import shutil
     probe_dir = Path("/kaggle/working/leak_check")
@@ -703,7 +711,7 @@ if LEAK_CHECK_MINUTES and RESUMABLE["diffusion"]:
 # changes anything, train a head on the frozen checkpoint and measure whether
 # its features already know each note's snap. About 1.5 GPU-h; writes
 # probe_rhythm.json beside the checkpoints. Set to 0 once it has run.
-RHYTHM_PROBE_STEPS = 3000
+RHYTHM_PROBE_STEPS = 0                          # ran 2026-10-11: probe_rhythm.json
 if RHYTHM_PROBE_STEPS and RESUMABLE["diffusion"]:
     _run_streaming([sys.executable, "scripts/probe_rhythm.py",
                     "--diffusion", str(CKPT / "diffusion" / "last.pt"),

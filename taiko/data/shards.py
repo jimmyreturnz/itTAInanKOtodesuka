@@ -77,6 +77,10 @@ from taiko.data.tensor_repr import (
 )
 
 MEL_BINS      = 128
+# Silence on the normalised mel scale (audio.py: [-1, 1], -1 = top_db below the
+# clip's peak). 0 is about the median loudness of a song, so padding with it
+# showed the model loud, featureless audio past every song's end.
+MEL_SILENCE   = -1.0
 MEL_FILENAME   = "mels.dat"
 CHART_FILENAME = "charts.npz"
 INDEX_FILENAME = "index.json"
@@ -566,10 +570,10 @@ class ShardReader:
 
     def mel_window(self, idx: int, start: int, width: int) -> np.ndarray:
         """
-        [128, width] float32 mel window, zero-padded past the end of the audio.
+        [128, width] float32 mel window, padded with silence past the end of the audio.
         """
         offset, length = self.mel_spans[self.records[idx]["mel_key"]]
-        out = np.zeros((width, MEL_BINS), dtype=np.float32)
+        out = np.full((width, MEL_BINS), MEL_SILENCE, dtype=np.float32)
 
         lo = max(start, 0)
         hi = min(start + width, length)

@@ -16,7 +16,7 @@ import numpy as np
 
 from taiko.data.osu_parser import TimingPoint
 from taiko.data.shards import (
-    MEL_BINS, ShardReader, ShardWriter, decode_chart_window, encode_chart,
+    MEL_BINS, MEL_SILENCE, ShardReader, ShardWriter, decode_chart_window, encode_chart,
 )
 from taiko.data.tensor_repr import (
     CH_DENDEN, CH_DON, CH_KAT, CH_ROLL, N_CHART_CHANNELS, build_timing_stream,
@@ -117,7 +117,7 @@ def test_full_pack_round_trip():
 
         # Past the end of the audio must be silence, not garbage or a wrap.
         tail = r.mel_window(0, 3400, 400)
-        assert np.allclose(tail[:, 100:], 0.0), "no zero padding past end of audio"
+        assert np.allclose(tail[:, 100:], MEL_SILENCE), "no silence padding past end of audio"
         assert np.allclose(tail[:, :100], mel[:, 3400:3500], atol=1e-3)
 
         timing = r.timing_window(0, 250, 300)

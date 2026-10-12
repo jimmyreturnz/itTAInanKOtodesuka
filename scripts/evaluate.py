@@ -635,8 +635,6 @@ def main() -> int:
         idx = int(idx)
         record = reader.records[idx]
         frames = min(reader.chart_length(idx), reader.mel_length(idx), args.max_frames)
-        if frames < window:
-            continue
 
         points = decode_timing_points(record["timing_points"])
         bpm, offset, meter = dominant_tempo(points)

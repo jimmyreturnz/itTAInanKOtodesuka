@@ -425,7 +425,14 @@ def main() -> int:
             schedule_origin = int(ckpt.get("schedule_origin", 0))
 
             saved_total = ckpt.get("total_steps")
-            if saved_features < inner.features:
+            saved_window = int(ckpt.get("window_frames", args.window_frames))
+            rewindow = saved_window != args.window_frames
+            if rewindow:
+                # Same weights, longer (or shorter) windows: the old run's
+                # horizon is spent and its val loss is over other windows.
+                print(f"Warm start: {saved_window}-frame windows -> {args.window_frames}")
+                warm_start_step = step                 # the lr ramps back up over --rewarm
+            if saved_features < inner.features or rewindow:
                 # New schedule, new loss terms: nothing of the old run's
                 # epoch count, horizon or best val carries over.
                 schedule_origin, start_epoch, batch_offset = step, 0, 0

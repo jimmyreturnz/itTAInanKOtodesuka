@@ -129,6 +129,15 @@ This is the incumbent for `select_checkpoint.py` from now on.
     runs 6+ Oni 2.2 -> 0.1%, Inner 5.5 -> 0, 7*+ 7.0 -> 0 (ranked 0.3-1.4%);
     pattern KL 0.258 -> 0.245, colour JS 0.021 -> 0.018; F1 and don ratio
     unchanged. Limits 6-9 barely move it: the excess is runs of exactly 6.
+- Round 6 (2026-10-12, step 82368, played): 6/6. Jimmy: blind rounds no
+  longer tell him anything; he knows the AI chart regardless. His notes:
+  - #1 "1/4 in a Kantan": the ranked map is a guest Futsuu at 1.56*, 110 BPM,
+    with 9 notes on 1/4. The criteria fold 110 BPM to 220, so a 1/4 counts as
+    a 1/2 and the chart is legal as written. Rule unchanged; Jimmy's call.
+  - #2-#4 structure fine, some obvious beats omitted.
+  - #5, #6: the hard part mapped easy and the easy part hard, dense over a
+    quiet passage. Measured below: a section-density problem, and the
+    30.7 s window is the cause.
 - Every round uses 6 new never-played songs (`outputs/blind_ab/used.json`).
 
 ### Features 3, step 72072 (2026-10-11, `outputs/eval/features3_step72072*.json`)
@@ -157,6 +166,51 @@ Same command as the baseline. Kept by `select_checkpoint.py`.
   100, and the 30% of extra notes make the rest.
 - Finisher and colour placement.
 - No pattern repetition, a 30.7 s window limit.
+
+### Step 82368 and section density (2026-10-12)
+The 20k-step features-3 warm start ended at step 82368. Against step 72072
+on the same command (60 maps x 3 seeds), unmasked: F1 0.707 -> 0.709, exact
+snap 0.970 -> 0.972, 1/3 0.539 -> 0.611, 1/6 0.572 -> 0.609, 1/8 0.328 ->
+0.380, raw too-fast 0.40 -> 0.34. Masked: F1 0.728, 1/3 0.641. Kept by
+`select_checkpoint.py`. Its too-fast gate fails *every* masked run (72072
+too) because the mask raises the pre-repair count; judge masked runs after
+repair if that gate is ever needed on them.
+
+`scripts/measure_section_density.py`: 4-bar sections on the map's red lines,
+Spearman of the model's section NPS against the ranked map's, and "swap",
+the share of the ranked top/bottom-third sections the model put in the
+opposite third. 60 held-out maps, whole songs, three ways of giving the
+model `window_nps`:
+
+| window_nps | rho | swap | 7*+ rho | 7*+ swap |
+|---|---|---|---|---|
+| unknown (as eval / blind_ab run) | 0.660 | 5.9% | 0.762 | 3.5% |
+| oracle (the ranked chart's window density) | 0.721 | 4.7% | 0.828 | 1.3% |
+| auto (`generate.py --window-density auto`) | 0.638 | 6.8% | 0.704 | 4.1% |
+
+Round 6 #5 / #6 themselves: unknown 0.66 / 0.57, oracle 0.84 / 0.80, swap 0.
+The model obeys the density input; nothing in a 30.7 s window tells it which
+section of the song is the hard one. The flux heuristic is worse than none.
+Notes on silence: model 0.8%, ranked 0.6%, so "dense over silence" is
+quiet-but-busy sections mapped hard, the same swap.
+
+**Decision (Jimmy): retrain on whole-song windows, as MuG-Diffusion does**
+(one sample = the first 190 s of a song, `max_audio_frame` 32768 at its hop,
+features measured on that clip, U-Net attention + S4 over all of it).
+- `--window-frames 9536` (190.7 s). On the 1650, p1 features 3 at batch 4:
+  30.7 s 188 ms/step 0.72 GiB, 92 s 280 ms 0.75 GiB, 190.7 s 442 ms
+  0.86 GiB. Memory is no constraint on a T4.
+- Warm start from step 82368: a checkpoint saved at another window length
+  starts a new schedule (`train_diffusion.py`, like the features widening).
+  Notebook: 8/GPU, 7 epochs = 8,750 steps, `--warmup 500`; leak check and
+  rhythm probe off. T4 step time not yet measured.
+- Two padding bugs that whole-song windows would have made common, fixed:
+  training padded the mel past a song's end with 0 (about median loudness;
+  -1 is silence, now `shards.MEL_SILENCE`) and kept the beat grid running
+  there; generation of a song shorter than its window kept the padded
+  latent at 0 every step. Both now see silence, no grid, and noise.
+- Songs shorter than the window are no longer skipped by evaluate and the
+  measure scripts.
 
 ### Architecture verdict (2026-10-02, after this handoff): evolve first
 A debate between keeping the diffusion model and a reset to one discrete

@@ -49,7 +49,7 @@ from taiko.data.motif import (
     MOTIF_DIM, MOTIF_NAMES, beat_frames_from_timing, compute_motif, corrupt_motif,
     quantise_motif,
 )
-from taiko.data.shards import MEL_BINS, ShardReader, load_note_times
+from taiko.data.shards import MEL_BINS, MEL_SILENCE, ShardReader, load_note_times
 from taiko.data.tensor_repr import (
     HOLD_CHANNELS, N_CHART_CHANNELS, N_TIMING_CHANNELS, ONSET_CHANNELS, TM_COS,
     TM_SIN,
@@ -220,6 +220,9 @@ class WindowedDataset(Dataset):
         mel    = reader.mel_window(idx,    start, W)
         chart  = reader.chart_window(idx,  start, W)
         timing = reader.timing_window(idx, start, W)
+        # Past the end of the audio there is no song: silent mel (mel_window)
+        # and no beat grid, as generation pads a song shorter than its window.
+        timing[:, max(0, min(W, mel_len - start)):] = 0.0
 
         valid_len  = max(0, min(W, chart_len - start))
         valid_mask = np.zeros(W, dtype=np.float32)
@@ -299,7 +302,7 @@ class WindowedDataset(Dataset):
     def _empty(self) -> dict:
         W = self.window_frames
         return {
-            "mel":        torch.zeros(MEL_BINS, W),
+            "mel":        torch.full((MEL_BINS, W), MEL_SILENCE),
             "chart":      torch.zeros(N_CHART_CHANNELS, W),
             "timing":     torch.zeros(N_TIMING_CHANNELS, W),
             "valid_mask": torch.zeros(W),
@@ -369,13 +372,13 @@ def _rate_augment(
 
     valid  = resample(valid_mask[None, :], "nearest")[0]
 
-    def fit(arr: np.ndarray) -> np.ndarray:
+    def fit(arr: np.ndarray, fill: float = 0.0) -> np.ndarray:
         if arr.shape[-1] >= W:
             return np.ascontiguousarray(arr[..., :W])
-        pad = np.zeros(arr.shape[:-1] + (W - arr.shape[-1],), dtype=arr.dtype)
+        pad = np.full(arr.shape[:-1] + (W - arr.shape[-1],), fill, dtype=arr.dtype)
         return np.ascontiguousarray(np.concatenate([arr, pad], axis=-1))
 
-    return fit(mel), fit(chart), fit(timing), fit(valid)
+    return fit(mel, MEL_SILENCE), fit(chart), fit(timing), fit(valid)
 
 
 def _move_rows(arr: np.ndarray, rate: float) -> np.ndarray:

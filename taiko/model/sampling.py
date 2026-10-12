@@ -30,6 +30,7 @@ import numpy as np
 import torch
 
 from taiko.data.conditioning import STYLE_NULL
+from taiko.data.shards import MEL_SILENCE
 from taiko.data.motif import MOTIF_DIM
 
 
@@ -146,6 +147,17 @@ def generate_song_latent(
     mel = mel.to(device=device, dtype=dtype)
     timing = timing.to(device=device, dtype=dtype)
 
+    # A song shorter than one window is generated as one full window -- silent
+    # mel and noise latent past its end, as training pads it -- and cropped
+    # after. Leaving the canvas at the song's length kept the window's tail at
+    # a zero latent every step, which no training window ever looks like. With
+    # whole-song windows that is most songs.
+    song_latent = mel.shape[-1] // compression
+    if mel.shape[-1] < window_frames:
+        pad = window_frames - mel.shape[-1]
+        mel = torch.nn.functional.pad(mel, (0, pad), value=MEL_SILENCE)
+        timing = torch.nn.functional.pad(timing, (0, pad), value=0.0)
+
     total_frames = mel.shape[-1]
     windows = plan_windows(total_frames, window_frames, overlap_frames)
     n_win = len(windows)
@@ -212,7 +224,7 @@ def generate_song_latent(
         return piece
 
     # -1 is silence on the normalised mel scale; 0 would be mid-loudness.
-    mel_w = torch.cat([window_slice(mel, s, -1.0) for s, _ in windows], dim=0)
+    mel_w = torch.cat([window_slice(mel, s, MEL_SILENCE) for s, _ in windows], dim=0)
     tim_w = torch.cat([window_slice(timing, s, 0.0) for s, _ in windows], dim=0)
 
     audio_levels: list[list[torch.Tensor]] = []
@@ -302,7 +314,7 @@ def generate_song_latent(
         if progress and (i % 10 == 0 or i == len(sequence) - 1):
             print(f"    step {i + 1}/{len(sequence)}")
 
-    return z
+    return z[:, :, :song_latent]
 
 
 @torch.no_grad()
