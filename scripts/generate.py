@@ -40,7 +40,8 @@ import numpy as np
 import torch
 
 from taiko.data.audio import MelExtractor
-from taiko.data.audio_activity import Activity, activity, activity_score, gate_notes
+from taiko.data.audio_activity import (Activity, activity, activity_score, gate_notes,
+                                       window_densities)
 from taiko.data.conditioning import (
     STYLE_NULL, normalise_avg_nps, normalise_difficulty, normalise_peak_nps,
     divisors_used, profile_vector, style_to_int,
@@ -208,20 +209,6 @@ def resolve_density(args, ckpt: dict, features: int) -> tuple[float | None, floa
     )
 
 
-def window_densities(mel: np.ndarray, avg_nps: float, windows, act: Activity) -> list[float]:
-    """
-    Per-window density targets that rise and fall with the music: the map's
-    average scaled by how busy each window's audio is relative to the song.
-    Clipped so no window is asked for less than 30% or more than 160% of it.
-    """
-    song = float(act.flux.mean()) + 1e-6
-    out = []
-    for start, end in windows:
-        busy = float(act.flux[start:end].mean()) / song
-        out.append(normalise_avg_nps(avg_nps * float(np.clip(busy, 0.3, 1.6))))
-    return out
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate an osu!taiko map from audio")
     ap.add_argument("--audio", required=True, type=Path)
@@ -353,7 +340,7 @@ def main() -> int:
         elif avg_nps is None:
             print("  (--window-density auto needs a map density; ignored)")
         else:
-            win_nps = window_densities(mel, avg_nps, plan_windows(total_frames, window, overlap), act)
+            win_nps = window_densities(avg_nps, plan_windows(total_frames, window, overlap), act)
 
     print(f"\nGenerating:")
     print(f"  difficulty  {args.difficulty}*")

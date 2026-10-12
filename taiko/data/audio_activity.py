@@ -102,6 +102,21 @@ def activity_score(notes: Sequence[TaikoNote], act: Activity, grid: Grid,
     return ActivityScore(quiet_rate, miss_rate, len(onset_ms), missed)
 
 
+def window_densities(avg_nps: float, windows, act: Activity) -> list[float]:
+    """
+    Per-window density targets that rise and fall with the music: the map's
+    average scaled by how busy each window's audio is relative to the song.
+    Clipped so no window is asked for less than 30% or more than 160% of it.
+    """
+    from taiko.data.conditioning import normalise_avg_nps
+    song = float(act.flux.mean()) + 1e-6
+    out = []
+    for start, end in windows:
+        busy = float(act.flux[start:end].mean()) / song
+        out.append(normalise_avg_nps(avg_nps * float(np.clip(busy, 0.3, 1.6))))
+    return out
+
+
 def gate_notes(notes: Sequence[TaikoNote], act: Activity,
                grid: Grid) -> tuple[list[TaikoNote], list[TaikoNote]]:
     """
